@@ -1,0 +1,35 @@
+{
+  "name": "uws-ai-sales-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "AI Sales Calling Agent platform for Universal Web Solutions (UWS) - lead discovery, website analysis, explainable lead scoring, permitted outreach, CRM pipeline and reporting.",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning --env-file-if-exists=.env src/server/index.ts",
+    "dev": "node --disable-warning=ExperimentalWarning --watch --env-file-if-exists=.env src/server/index.ts",
+    "test": "node --disable-warning=ExperimentalWarning --test \"tests/**/*.test.ts\"",
+    "test:coverage": "node --disable-warning=ExperimentalWarning --test --experimental-test-coverage \"tests/**/*.test.ts\"",
+    "typecheck": "tsc --noEmit",
+    "migrate": "node --disable-warning=ExperimentalWarning --env-file-if-exists=.env src/cli/migrate.ts",
+    "setup": "node --disable-warning=ExperimentalWarning --env-file-if-exists=.env src/cli/setup.ts",
+    "seed:demo": "node --disable-warning=ExperimentalWarning --env-file-if-exists=.env src/cli/seed-demo.ts",
+    "backup": "node --disable-warning=ExperimentalWarning --env-file-if-exists=.env src/cli/backup.ts",
+    "restore": "node --disable-warning=ExperimentalWarning --env-file-if-exists=.env src/cli/restore.ts",
+    "doctor": "node --disable-warning=ExperimentalWarning --env-file-if-exists=.env src/cli/doctor.ts"
+  },
+  "dependencies": {
+    "exceljs": "^4.4.0",
+    "express": "^5.1.0",
+    "express-rate-limit": "^8.0.0",
+    "helmet": "^8.1.0",
+    "zod": "^4.1.12"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.5",
+    "@types/node": "^24.10.1",
+    "typescript": "^5.9.3"
+  }
+}
