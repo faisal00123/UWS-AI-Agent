@@ -99,6 +99,11 @@
 | Unconfigured webhooks 404 (an unconfigured instance advertises nothing) | ✅ | webhook test |
 | SMTP: plaintext to non-loopback hosts refused (no credential-in-the-clear) | ✅ | SMTP adapter tests |
 | Provider auth/token errors never leak the token | ✅ | adapter tests |
+| SIP gateway control auth: timing-safe bearer comparison; wrong/missing token = 401, and verification is **inert unless `TELEPHONY_PROVIDER=cloudyvoice`** (a Twilio-mode instance accepts no gateway traffic) | ✅ | `adapters-cloudyvoice.test.ts` |
+| SIP gateway events: HMAC-SHA256 over the **raw** body (`SIP_GATEWAY_EVENT_SECRET`, timing-safe, hex case-insensitive); tampered/re-serialised/unsigned = 401 with the payload never recorded; idempotent on replay | ✅ | `gateway.test.ts` (apply/replay/tamper/orphan) |
+| Gateway media WebSocket: same 5 gates as Twilio (bridge enabled, speech+AI ports, signed expiring token, call in ledger, single stream → 401/404/409/503); unknown upgrade paths 404 via shared fallback | ✅ | `gateway.test.ts` upgrade gating |
+| No carrier value in the backend (no SIP host/port/codec/CLI/credential in `backend/src`); gateway secrets appear only as env **names** in doctor/dashboard output, never values | ✅ | doctor gateway section prints names only; `deploy/sip/*.sample` hold placeholders |
+| Gateway answer path serves disclosure + `hangup` for unattributable calls and **never** requests recording | ✅ | `gateway.test.ts` answer-route tests |
 
 ## 9. Data integrity & recovery
 

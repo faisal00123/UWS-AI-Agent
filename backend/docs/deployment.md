@@ -90,6 +90,31 @@ Target topology (as requested by the owner):
 * Live outreach still requires the owner's **GO LIVE** action (verified
   telephony onboarding + typed confirmation + fresh re-authentication).
 
+## SIP gateway (CloudyVoice) — a third host, when onboarding lands
+
+CloudyVoice is a SIP carrier (no HTTP call-placement API), so calling through
+it adds **one gateway process** to this topology — not a new backend and not a
+change to the two-host deploy above:
+
+```
+  Vercel SPA ──/api/*──► backend ──control/events/media──► gateway (VPS) ──SIP/RTP──► CloudyVoice ──► PSTN
+```
+
+* The backend needs **no new egress besides** `SIP_GATEWAY_BASE_URL` (ideally
+  loopback — gateway on the same host) and the gateway needs HTTPS/WSS to the
+  backend's `PUBLIC_BASE_URL` (answer fetch, signed events, media WS).
+* The gateway host is provisioned from `deploy/sip/*.sample` (placeholders
+  filled **on the VPS only**) — see `deploy/sip/README.md` for the step list
+  and the firewall table.
+* Sequence when the carrier values arrive: Phase-1 engine spike → fill
+  samples → free `/v1/health` probe → `npm run doctor` gateway block clean →
+  owner-approved test call → only then consider live mode. Until the test call
+  succeeds the status stays **CloudyVoice NOT connected**
+  (`docs/cloudyvoice-integration.md`).
+* `TELEPHONY_PROVIDER=twilio` remains fully supported: switching back restores
+  the previous two-host behaviour byte-for-byte (tests assert the historical
+  webhook URLs are unchanged).
+
 ## Why deployment is currently blocked (honest status)
 
 Verified in this environment, never worked around:
