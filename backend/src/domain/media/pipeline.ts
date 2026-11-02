@@ -70,9 +70,20 @@ interface SegmentRow {
   language: string | null;
 }
 
-/** Map a conversation language to an STT/TTS language hint. */
-function speechLang(lang: ConversationLang): SpeechLanguage {
-  return lang === 'ur' ? 'ur' : 'en';
+/**
+ * Map a conversation language to an STT/TTS language hint.
+ *
+ *  - 'ur' and 'roman_ur' -> 'ur': Roman Urdu is a WRITING scheme; the audio
+ *    of a Roman-Urdu conversation is Urdu speech, so STT is hinted 'ur' (the
+ *    Roman-Urdu text is then handled by the conversation layer).
+ *  - 'en' -> 'en'.
+ *  - 'mixed' / 'unknown' -> undefined: no hint, the provider auto-detects.
+ *    Guessing a language the caller did not declare would corrupt the hint.
+ */
+function speechLang(lang: ConversationLang): SpeechLanguage | undefined {
+  if (lang === 'ur' || lang === 'roman_ur') return 'ur';
+  if (lang === 'en') return 'en';
+  return undefined;
 }
 
 function loadConversation(db: DB, conversationId: string): ConversationRow {
@@ -171,7 +182,7 @@ export async function ingestProspectAudio(
   db: DB,
   deps: MediaDeps,
   conversationId: string,
-  input: { audio: Uint8Array; mimeType?: string; filename?: string },
+  input: { audio: Uint8Array; mimeType?: string; filename?: string; signal?: AbortSignal },
 ): Promise<ProspectTurn> {
   const conversation = loadConversation(db, conversationId);
   if (conversation.ended_at) {
@@ -180,11 +191,13 @@ export async function ingestProspectAudio(
   if (!deps.speech) {
     throw new AppError('provider_unavailable', 'No speech provider is configured — audio cannot be transcribed.');
   }
+  const language = speechLang(conversation.language);
   const { text } = await deps.speech.transcribe({
     audio: input.audio,
     ...(input.mimeType !== undefined ? { mimeType: input.mimeType } : {}),
     ...(input.filename !== undefined ? { filename: input.filename } : {}),
-    language: speechLang(conversation.language),
+    ...(language !== undefined ? { language } : {}),
+    ...(input.signal ? { signal: input.signal } : {}),
   });
   const trimmed = text.trim();
   if (!trimmed) {
@@ -289,7 +302,7 @@ export async function generateAgentReply(
   cfg: Config,
   deps: MediaDeps,
   conversationId: string,
-  opts: { speechFormat?: 'mp3' | 'pcm' } = {},
+  opts: { speechFormat?: 'mp3' | 'pcm'; signal?: AbortSignal } = {},
 ): Promise<AgentTurn> {
   const conversation = loadConversation(db, conversationId);
   if (conversation.ended_at) throw new AppError('conflict', 'Conversation has already ended');
@@ -331,10 +344,12 @@ export async function generateAgentReply(
   let contentType: string | null = null;
   let sampleRate: number | null = null;
   if (deps.speech && deps.speech.status().state !== 'unconfigured') {
+    const language = speechLang(conversation.language);
     const synthesized = await deps.speech.synthesize({
       text: reply,
-      language: speechLang(conversation.language),
+      ...(language !== undefined ? { language } : {}),
       ...(opts.speechFormat ? { format: opts.speechFormat } : {}),
+      ...(opts.signal ? { signal: opts.signal } : {}),
     });
     audio = synthesized.audio;
     contentType = synthesized.contentType;

@@ -412,6 +412,74 @@ describe('Phase 11B: onboarding, guardrails, unsuppression, media, health', () =
     assert.equal(segs.c, 0, 'failed operations leave no phantom segments');
   });
 
+  test('STT/TTS language hints: ur + roman_ur -> ur, en -> en, mixed/unknown -> no hint', async () => {
+    // A recording fake SpeechPort: captures exactly what the pipeline asks
+    // for (language hint + cancellation signal). No network, no fabrication.
+    interface Seen {
+      language?: string;
+      signal?: AbortSignal;
+      format?: string;
+    }
+    const seenTranscribe: Seen[] = [];
+    const seenSynthesize: Seen[] = [];
+    const fakeSpeech = {
+      key: 'fake',
+      label: 'recording fake',
+      status: () => ({ key: 'speech', label: 'fake', implementation: 'fake', state: 'configured' as const, features: [] }),
+      transcribe: async (input: { language?: string; signal?: AbortSignal }) => {
+        seenTranscribe.push({ ...(input.language !== undefined ? { language: input.language } : {}), ...(input.signal ? { signal: input.signal } : {}) });
+        return { text: 'salam' };
+      },
+      synthesize: async (input: { language?: string; format?: string; signal?: AbortSignal }) => {
+        seenSynthesize.push({
+          ...(input.language !== undefined ? { language: input.language } : {}),
+          ...(input.format !== undefined ? { format: input.format } : {}),
+          ...(input.signal ? { signal: input.signal } : {}),
+        });
+        return { audio: new Uint8Array([1, 2, 3]), contentType: 'audio/wav' };
+      },
+    };
+    const deps = {
+      speech: fakeSpeech as unknown as import('../../src/adapters/types.ts').SpeechPort,
+      ai: registry.ai,
+    };
+
+    const cases: { lang: string; sttHint: string | undefined }[] = [
+      { lang: 'ur', sttHint: 'ur' },
+      { lang: 'roman_ur', sttHint: 'ur' }, // Roman Urdu audio IS Urdu speech
+      { lang: 'en', sttHint: 'en' },
+      { lang: 'mixed', sttHint: undefined }, // auto-detect, never guess
+      { lang: 'unknown', sttHint: undefined },
+    ];
+
+    for (const c of cases) {
+      const bizId = makeLead(`030011122${String(cases.indexOf(c) + 10).padStart(2, '0')}`);
+      const conversationId = startConversation(db, cfg, {
+        businessId: bizId,
+        language: c.lang as 'ur' | 'roman_ur' | 'en' | 'mixed' | 'unknown',
+      });
+      const controller = new AbortController();
+      await ingestProspectAudio(db, deps, conversationId, {
+        audio: new Uint8Array([1, 2, 3]),
+        signal: controller.signal,
+      });
+      const seen = seenTranscribe[seenTranscribe.length - 1]!;
+      assert.equal(seen.language, c.sttHint, `conversation ${c.lang} -> STT hint ${String(c.sttHint)}`);
+      assert.equal(seen.signal, controller.signal, 'the caller cancellation signal must reach the provider');
+
+      await generateAgentReply(db, cfg, deps, conversationId, { speechFormat: 'pcm' });
+      const tts = seenSynthesize[seenSynthesize.length - 1]!;
+      assert.equal(tts.language, c.sttHint, `conversation ${c.lang} -> TTS language ${String(c.sttHint)}`);
+      assert.equal(tts.format, 'pcm', 'the duplex format request must reach the provider');
+      await finishConversation(db, conversationId);
+    }
+
+    // The hint values are only ever 'ur'/'en' or absent — nothing else leaks.
+    for (const s of [...seenTranscribe, ...seenSynthesize]) {
+      assert.ok(s.language === undefined || s.language === 'ur' || s.language === 'en');
+    }
+  });
+
   test('an opt-out expressed on the call suppresses the lead (append-only)', async () => {
     const bizId = makeLead('03001112208');
     const conversationId = startConversation(db, cfg, { businessId: bizId });

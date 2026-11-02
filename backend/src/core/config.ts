@@ -106,6 +106,10 @@ const EnvSchema = z.object({
   STT_API_KEY: z.string().default(''),
   TTS_PROVIDER: z.string().default(''),
   TTS_API_KEY: z.string().default(''),
+  // Speech model overrides (non-secret). Defaults live in the adapter
+  // (whisper-1 / tts-1) — both verified present on the configured key.
+  STT_MODEL: z.string().default(''),
+  TTS_MODEL: z.string().default(''),
 
   // Speech voice/language defaults (Phase 11A). Non-secret configuration.
   /** Default STT language hint: 'en' or 'ur'. */
@@ -213,10 +217,17 @@ function providerStatus(
   required: string[],
   features: string[],
   requiredSetup: string[],
+  /**
+   * Env vars that count as "the provider is named" for this integration.
+   * Defaults to the generic `${KEY}_PROVIDER`; integrations whose provider
+   * vars are spelled differently (speech: STT_PROVIDER / TTS_PROVIDER) pass
+   * their own so a fully-working setup is never reported as `partial`.
+   */
+  namedFrom: string[] = [`${key.toUpperCase()}_PROVIDER`],
 ): ProviderStatus {
   const present = required.filter((f) => (env[f] ?? '').trim() !== '');
   const missing = required.filter((f) => !present.includes(f));
-  const named = (env[`${key.toUpperCase()}_PROVIDER`] ?? '').trim();
+  const named = namedFrom.map((v) => (env[v] ?? '').trim()).find((v) => v !== '') ?? '';
   let state: IntegrationState;
   if (missing.length === 0 && named !== '') state = 'configured';
   else if (present.length === 0) state = 'unconfigured';
@@ -302,13 +313,33 @@ export function loadConfig(env: Env = process.env): Config {
       ['conversation turns', 'qualification extraction'],
       ['Model provider API key'],
     ),
+    // Speech key requirement is provider-aware: OpenAI speech shares the
+    // AI platform key (same vendor/host), so a setup with any of
+    // STT_API_KEY / TTS_API_KEY / AI_API_KEY is credentialled. The required
+    // key VAR is named after whichever credential actually exists, so
+    //  - shared-key setups report `configured` (not a bogus `partial`),
+    //  - a key with no provider still reports `partial` (something IS set),
+    //  - no key anywhere lists STT_API_KEY as missing.
+    // The provider NAME comes from STT_PROVIDER/TTS_PROVIDER — the generic
+    // `SPEECH_PROVIDER` var does not exist (would always be `partial`),
+    // hence `namedFrom`.
     providerStatus(
       'speech',
       'Speech (STT/TTS)',
       env,
-      ['STT_PROVIDER', 'STT_API_KEY'],
+      [
+        'STT_PROVIDER',
+        (env['STT_API_KEY'] ?? '').trim() !== ''
+          ? 'STT_API_KEY'
+          : (env['TTS_API_KEY'] ?? '').trim() !== ''
+            ? 'TTS_API_KEY'
+            : (env['AI_API_KEY'] ?? '').trim() !== ''
+              ? 'AI_API_KEY'
+              : 'STT_API_KEY',
+      ],
       ['transcription', 'voice synthesis'],
-      ['Speech provider API key'],
+      ['STT/TTS provider (openai)', 'speech key (STT_API_KEY/TTS_API_KEY) or shared AI_API_KEY'],
+      ['STT_PROVIDER', 'TTS_PROVIDER'],
     ),
     providerStatus(
       'email',

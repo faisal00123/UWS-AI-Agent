@@ -227,6 +227,57 @@ describe('speech dispatch + language', () => {
   test('openai speech without a key yields null', () => {
     assert.equal(createSpeechAdapter({ STT_PROVIDER: 'openai' }), null);
   });
+
+  test('openai speech falls back to the shared AI key (same vendor) and wires models', async () => {
+    // No dedicated speech key: the OpenAI platform key already used for the
+    // conversation model doubles as the speech credential.
+    const port = createSpeechAdapter({ STT_PROVIDER: 'openai', AI_API_KEY: 'ai-platform-key' });
+    assert.ok(port, 'AI_API_KEY alone must configure speech (same vendor/host)');
+    assert.equal(port.status().state, 'configured');
+
+    // Both keys present: the dedicated one is primary, AI key is the fallback.
+    const both = createSpeechAdapter({
+      STT_PROVIDER: 'openai',
+      STT_API_KEY: 'dedicated',
+      AI_API_KEY: 'shared',
+    }) as unknown as { status(): { state: string } };
+    assert.ok(both);
+    assert.equal(both.status().state, 'configured');
+
+    // Model overrides from env reach the adapter (verified by the request it builds).
+    const calls: { url: string; init: RequestInit }[] = [];
+    const fetchImpl: FetchLike = async (url, init) => {
+      calls.push({ url, init });
+      return new Response(JSON.stringify({ text: 'ok' }), { status: 200 });
+    };
+    const modelled = createSpeechAdapter(
+      {
+        STT_PROVIDER: 'openai',
+        AI_API_KEY: 'ai-platform-key',
+        STT_MODEL: 'gpt-4o-mini-transcribe',
+        TTS_MODEL: 'gpt-4o-mini-tts',
+      },
+      { fetchImpl },
+    );
+    assert.ok(modelled);
+    await modelled.transcribe({ audio: new Uint8Array([1]) });
+    const sent = Buffer.from(calls[0]!.init.body as Uint8Array).toString('latin1');
+    assert.ok(sent.includes('gpt-4o-mini-transcribe'), 'STT_MODEL must reach the multipart body');
+    assert.ok(!sent.includes('whisper-1'), 'an explicit model override replaces the default');
+  });
+
+  test('openai speech keeps default models when STT_MODEL/TTS_MODEL are unset', async () => {
+    const calls: { url: string; init: RequestInit }[] = [];
+    const fetchImpl: FetchLike = async (url, init) => {
+      calls.push({ url, init });
+      return new Response(JSON.stringify({ text: 'ok' }), { status: 200 });
+    };
+    const port = createSpeechAdapter({ STT_PROVIDER: 'openai', AI_API_KEY: 'k' }, { fetchImpl });
+    assert.ok(port);
+    await port.transcribe({ audio: new Uint8Array([1]) });
+    const sent = Buffer.from(calls[0]!.init.body as Uint8Array).toString('latin1');
+    assert.ok(sent.includes('whisper-1'), 'default STT model is whisper-1');
+  });
 });
 
 describe('other dispatch modules', () => {

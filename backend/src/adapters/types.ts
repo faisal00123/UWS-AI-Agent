@@ -162,6 +162,12 @@ export interface SpeechPort extends Pingable {
     filename?: string;
     /** Language the audio is spoken in (drives STT language hints). */
     language?: SpeechLanguage;
+    /**
+     * Optional cancellation: an aborted signal makes the call reject promptly
+     * (the duplex bridge aborts in-flight work when a call ends so a late
+     * transcript can never be written after teardown).
+     */
+    signal?: AbortSignal;
   }): Promise<{ text: string }>;
   synthesize(input: {
     text: string;
@@ -175,6 +181,8 @@ export interface SpeechPort extends Pingable {
      * and the caller decides (never guesses) what to do with the bytes.
      */
     format?: 'mp3' | 'pcm';
+    /** Optional cancellation (see `transcribe.signal`). */
+    signal?: AbortSignal;
   }): Promise<{ audio: Uint8Array; contentType: string; sampleRate?: number }>;
 }
 

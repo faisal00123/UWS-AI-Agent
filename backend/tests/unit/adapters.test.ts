@@ -229,6 +229,233 @@ describe('openai-compatible adapters', () => {
   });
 });
 
+// ------------------------------------------------- completed speech (STT/TTS) ---
+
+/** Multi-reply fake fetch: each call consumes the next reply (last repeats). */
+function seqFetch(
+  replies: { status?: number; body?: unknown; headers?: Record<string, string>; raw?: Uint8Array }[],
+): { fetchImpl: FetchLike; calls: { url: string; init: RequestInit }[] } {
+  const calls: { url: string; init: RequestInit }[] = [];
+  const fetchImpl: FetchLike = async (url, init) => {
+    const i = calls.length;
+    calls.push({ url, init });
+    const reply = replies[Math.min(i, replies.length - 1)]!;
+    const body = reply.raw ? Buffer.from(reply.raw) : typeof reply.body === 'string' ? reply.body : JSON.stringify(reply.body ?? {});
+    return new Response(body, {
+      status: reply.status ?? 200,
+      headers: reply.headers ?? { 'content-type': reply.raw ? 'application/octet-stream' : 'application/json' },
+    });
+  };
+  return { fetchImpl, calls };
+}
+
+describe('openai speech adapter (completed STT/TTS)', () => {
+  test('transcribe sends an ISO-639-1 language hint only for known languages', async () => {
+    const ur = seqFetch([{ body: { text: 'salam' } }]);
+    await createOpenAISpeechAdapter({ apiKey: 'k', fetchImpl: ur.fetchImpl }).transcribe({
+      audio: new Uint8Array([1]),
+      language: 'ur',
+    });
+    const urBody = Buffer.from(ur.calls[0]!.init.body as Uint8Array).toString('latin1');
+    assert.ok(urBody.includes('name="language"'), 'ur hint must be sent');
+    assert.ok(urBody.includes('\r\n\r\nur\r\n'), 'hint value must be ur');
+
+    const mixed = seqFetch([{ body: { text: 'hello' } }]);
+    await createOpenAISpeechAdapter({ apiKey: 'k', fetchImpl: mixed.fetchImpl }).transcribe({
+      audio: new Uint8Array([1]),
+      language: undefined,
+    });
+    const mixedBody = Buffer.from(mixed.calls[0]!.init.body as Uint8Array).toString('latin1');
+    assert.ok(!mixedBody.includes('name="language"'), 'no hint for mixed/unknown — provider auto-detects');
+  });
+
+  test('transcribe derives a filename from the mime type when none is given', async () => {
+    const { fetchImpl, calls } = seqFetch([{ body: { text: 'ok' } }]);
+    await createOpenAISpeechAdapter({ apiKey: 'k', fetchImpl }).transcribe({
+      audio: new Uint8Array([1]),
+      mimeType: 'audio/wav',
+    });
+    const sent = Buffer.from(calls[0]!.init.body as Uint8Array).toString('latin1');
+    assert.ok(sent.includes('filename="audio.wav"'), 'extension must follow the mime type');
+  });
+
+  test('transcribe refuses empty audio before any network call', async () => {
+    const { fetchImpl, calls } = seqFetch([{ body: { text: 'x' } }]);
+    const speech = createOpenAISpeechAdapter({ apiKey: 'k', fetchImpl });
+    await assert.rejects(
+      () => speech.transcribe({ audio: new Uint8Array(0) }),
+      (err: unknown) => err instanceof AdapterError && err.code === 'provider_error',
+    );
+    assert.equal(calls.length, 0, 'no request may be sent for empty audio');
+  });
+
+  test('synthesize refuses empty text before any network call', async () => {
+    const { fetchImpl, calls } = seqFetch([{ raw: new Uint8Array([1, 2, 3]) }]);
+    const speech = createOpenAISpeechAdapter({ apiKey: 'k', fetchImpl });
+    await assert.rejects(
+      () => speech.synthesize({ text: '   ' }),
+      (err: unknown) => err instanceof AdapterError && err.code === 'provider_error',
+    );
+    assert.equal(calls.length, 0, 'no request may be sent for empty text');
+  });
+
+  test('synthesize classifies bytes by CONTENT, not by the response header', async () => {
+    // Provider claims application/json but sends a RIFF container: content wins.
+    const riff = seqFetch([
+      { raw: Uint8Array.from([0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x41, 0x56, 0x45]), headers: { 'content-type': 'application/json' } },
+    ]);
+    const wav = await createOpenAISpeechAdapter({ apiKey: 'k', fetchImpl: riff.fetchImpl }).synthesize({ text: 'hi' });
+    assert.equal(wav.contentType, 'audio/wav');
+
+    // ID3-tagged bytes -> mpeg even when the header is missing/wrong.
+    const id3 = seqFetch([{ raw: Uint8Array.from([0x49, 0x44, 0x33, 3, 0, 0, 0, 0, 0, 0]) }]);
+    const mp3 = await createOpenAISpeechAdapter({ apiKey: 'k', fetchImpl: id3.fetchImpl }).synthesize({ text: 'hi' });
+    assert.equal(mp3.contentType, 'audio/mpeg');
+
+    // pcm requested + unrecognised bytes -> raw s16le @24 kHz (documented rate).
+    const pcm = seqFetch([{ raw: Uint8Array.from([0x00, 0x01, 0x02, 0x03]) }]);
+    const raw = await createOpenAISpeechAdapter({ apiKey: 'k', fetchImpl: pcm.fetchImpl }).synthesize({
+      text: 'hi',
+      format: 'pcm',
+    });
+    assert.equal(raw.contentType, 'audio/pcm');
+    assert.equal(raw.sampleRate, 24_000);
+
+    // mp3 requested (default) with frame-sync bytes -> mpeg, never mislabelled pcm.
+    const sync = seqFetch([{ raw: Uint8Array.from([0xff, 0xfb, 0x90, 0x00]) }]);
+    const framed = await createOpenAISpeechAdapter({ apiKey: 'k', fetchImpl: sync.fetchImpl }).synthesize({ text: 'hi' });
+    assert.equal(framed.contentType, 'audio/mpeg');
+    assert.equal(framed.sampleRate, undefined);
+  });
+
+  test('synthesize sends pcm as response_format and no format field for mp3', async () => {
+    const pcm = seqFetch([{ raw: new Uint8Array([1, 2, 3, 4]) }]);
+    await createOpenAISpeechAdapter({ apiKey: 'k', fetchImpl: pcm.fetchImpl }).synthesize({ text: 'hi', format: 'pcm' });
+    const pcmReq = JSON.parse(String(pcm.calls[0]!.init.body)) as Record<string, unknown>;
+    assert.equal(pcmReq['response_format'], 'pcm');
+
+    const mp3 = seqFetch([{ raw: new Uint8Array([1, 2, 3, 4]) }]);
+    await createOpenAISpeechAdapter({ apiKey: 'k', fetchImpl: mp3.fetchImpl }).synthesize({ text: 'hi' });
+    const mp3Req = JSON.parse(String(mp3.calls[0]!.init.body)) as Record<string, unknown>;
+    assert.equal(mp3Req['response_format'], undefined, 'default request must not force a format');
+  });
+
+  test('401 on the dedicated key fails over ONCE to the shared key and stays sticky', async () => {
+    const seq = seqFetch([
+      { status: 401, body: { error: { message: 'Incorrect API key provided: deadbeef****************************c0de' } } },
+      { body: { text: 'recovered' } },
+      { body: { text: 'sticky' } },
+    ]);
+    const speech = createOpenAISpeechAdapter({ apiKey: 'dedicated-key', fallbackApiKey: 'shared-key', fetchImpl: seq.fetchImpl });
+
+    const first = await speech.transcribe({ audio: new Uint8Array([1]) });
+    assert.equal(first.text, 'recovered');
+    assert.equal(seq.calls.length, 2, 'exactly one retry with the fallback');
+    assert.equal(authHeader(seq.calls[0]!.init), 'Bearer dedicated-key');
+    assert.equal(authHeader(seq.calls[1]!.init), 'Bearer shared-key');
+
+    // Sticky: the next call goes straight to the working key.
+    await speech.transcribe({ audio: new Uint8Array([1]) });
+    assert.equal(seq.calls.length, 3, 'no doomed first attempt once the fallback is known good');
+    assert.equal(authHeader(seq.calls[2]!.init), 'Bearer shared-key');
+
+    // The provider's error body (which echoes a masked key) never reaches us.
+    assert.equal(speech.status().state, 'configured');
+  });
+
+  test('401 on BOTH keys surfaces an honest error that contains no key material', async () => {
+    const seq = seqFetch([
+      { status: 401, body: { error: { message: 'Incorrect API key provided: aaaa1111****************************9999' } } },
+      { status: 401, body: { error: { message: 'Incorrect API key provided: bbbb2222****************************8888' } } },
+    ]);
+    const speech = createOpenAISpeechAdapter({ apiKey: 'key-one', fallbackApiKey: 'key-two', fetchImpl: seq.fetchImpl });
+    await assert.rejects(
+      () => speech.transcribe({ audio: new Uint8Array([1]) }),
+      (err: unknown) => {
+        assert.ok(err instanceof AdapterError);
+        assert.equal(err.providerStatus, 401);
+        const msg = err.message + String(speech.status().lastError ?? '');
+        assert.ok(!msg.includes('aaaa1111'), 'provider body must not leak into our errors');
+        assert.ok(!msg.includes('bbbb2222'), 'provider body must not leak into our errors');
+        assert.ok(!msg.includes('key-one') && !msg.includes('key-two'), 'our keys must never appear');
+        return true;
+      },
+    );
+    assert.equal(speech.status().state, 'error', 'auth failure is reported honestly');
+  });
+
+  test('synthesize classifies 401/403/429/5xx without echoing the provider body', async () => {
+    const cases: { status: number; code: string; retryable: boolean }[] = [
+      { status: 401, code: 'provider_error', retryable: false },
+      { status: 403, code: 'provider_error', retryable: false },
+      { status: 429, code: 'rate_limited', retryable: true },
+      { status: 503, code: 'provider_error', retryable: true },
+      { status: 400, code: 'provider_error', retryable: false },
+    ];
+    for (const c of cases) {
+      const seq = seqFetch([
+        { status: c.status, body: { error: { message: `sekrit-echo-${c.status}` } } },
+        { status: c.status, body: { error: { message: `sekrit-echo-${c.status}` } } },
+      ]);
+      const speech = createOpenAISpeechAdapter({ apiKey: 'k', fallbackApiKey: 'k2', fetchImpl: seq.fetchImpl });
+      await assert.rejects(
+        () => speech.synthesize({ text: 'hello' }),
+        (err: unknown) => {
+          assert.ok(err instanceof AdapterError, `status ${c.status}`);
+          assert.equal(err.code, c.code, `status ${c.status} -> ${c.code}`);
+          assert.equal(err.retryable, c.retryable, `status ${c.status} retryable`);
+          assert.ok(!err.message.includes('sekrit-echo'), 'status mapping must not echo the body');
+          return true;
+        },
+      );
+    }
+  });
+
+  test('cancellation rejects promptly as non-retryable and is not a timeout', async () => {
+    const controller = new AbortController();
+    const fetchImpl: FetchLike = (_url, init) =>
+      new Promise((_resolve, reject) => {
+        init.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')));
+      });
+    const speech = createOpenAISpeechAdapter({ apiKey: 'k', fetchImpl });
+    const pending = speech.transcribe({ audio: new Uint8Array([1]), signal: controller.signal });
+    controller.abort();
+    await assert.rejects(
+      () => pending,
+      (err: unknown) => {
+        assert.ok(err instanceof AdapterError);
+        assert.match(err.message, /cancelled/);
+        assert.equal(err.retryable, false, 'a deliberate cancel must never be retried');
+        return true;
+      },
+    );
+  });
+
+  test('ping uses the same key fallback and reports which path it used', async () => {
+    const seq = seqFetch([
+      { status: 401, body: { error: { message: 'Incorrect API key provided' } } },
+      { body: { data: [{ id: 'whisper-1' }, { id: 'tts-1' }] } },
+    ]);
+    const speech = createOpenAISpeechAdapter({ apiKey: 'dedicated', fallbackApiKey: 'shared', fetchImpl: seq.fetchImpl });
+    const res = await speech.ping!();
+    assert.equal(res.ok, true);
+    assert.equal(seq.calls.length, 2);
+    assert.ok(res.detail?.includes('2 models'));
+    assert.ok(res.detail?.includes('AI_API_KEY'), 'honest about using the shared key (variable name only)');
+    assert.ok(!res.detail?.includes('dedicated') && !res.detail?.includes('Bearer'), 'never key values');
+    assert.equal(speech.status().state, 'configured');
+  });
+
+  test('ping with no credentials fails honestly and performs no I/O', async () => {
+    const { fetchImpl, calls } = seqFetch([{ body: { data: [] } }]);
+    const speech = createOpenAISpeechAdapter({ apiKey: '', fetchImpl });
+    const res = await speech.ping!();
+    assert.equal(res.ok, false);
+    assert.equal(calls.length, 0, 'unconfigured means zero network I/O');
+    assert.equal(speech.status().state, 'unconfigured');
+  });
+});
+
 describe('smtp adapter', () => {
   interface FakeSmtp {
     port: number;

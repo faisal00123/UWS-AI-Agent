@@ -317,6 +317,13 @@ export function createDuplexSession(opts: DuplexSessionOptions): DuplexSession {
   let draining = false;
   let maxCallTimer: ReturnType<typeof setTimeout> | null = null;
   const pending: Uint8Array[] = [];
+  /**
+   * Per-session cancellation: aborted the moment the call ends so any
+   * in-flight STT/TTS HTTP call rejects immediately — a late transcript or
+   * reply can never be written/played after teardown (the transcript must
+   * reflect the call as it actually ended).
+   */
+  const sessionAbort = new AbortController();
 
   function log(level: 'info' | 'warn' | 'error', msg: string, fields: Record<string, unknown> = {}): void {
     logger[level](msg, { callSid, conversationId, ...fields });
@@ -325,6 +332,9 @@ export function createDuplexSession(opts: DuplexSessionOptions): DuplexSession {
   async function end(reason: string): Promise<void> {
     if (ended) return;
     ended = true;
+    // Cancel in-flight speech work first: after this point no STT/TTS result
+    // may land in the transcript or the player.
+    if (!sessionAbort.signal.aborted) sessionAbort.abort();
     if (maxCallTimer) {
       clearTimeout(maxCallTimer);
       maxCallTimer = null;
@@ -396,9 +406,13 @@ export function createDuplexSession(opts: DuplexSessionOptions): DuplexSession {
         audio: ulawToWavForStt(audio),
         mimeType: 'audio/wav',
         filename: 'live-turn.wav',
+        signal: sessionAbort.signal,
       });
       // 2. engine turn (disclosure + turn ceiling) -> TTS in telephony format.
-      const reply = await generateAgentReply(db, config, { speech, ai }, conversationId, { speechFormat: 'pcm' });
+      const reply = await generateAgentReply(db, config, { speech, ai }, conversationId, {
+        speechFormat: 'pcm',
+        signal: sessionAbort.signal,
+      });
       if (ended) return;
       if (reply.audio && reply.audio.byteLength > 0) {
         const frames = ttsToUlaw(reply.audio, reply.contentType ?? 'audio/mpeg', reply.sampleRate ?? undefined);
@@ -473,7 +487,12 @@ export function createDuplexSession(opts: DuplexSessionOptions): DuplexSession {
       if (!loadConversationPolicy(db, config).humanHandoffOnRequest) return;
       db.prepare('UPDATE conversations SET human_requested = 1 WHERE id = ?').run(conversationId);
       const farewell = 'Thank you. I will ask a member of our team to get back to you. Goodbye.';
-      const synthesized = await speech.synthesize({ text: farewell, language: 'en', format: 'pcm' });
+      const synthesized = await speech.synthesize({
+        text: farewell,
+        language: 'en',
+        format: 'pcm',
+        signal: sessionAbort.signal,
+      });
       const frames = ttsToUlaw(synthesized.audio, synthesized.contentType, synthesized.sampleRate);
       if (ended) return;
       if (frames) player.enqueue(frames);

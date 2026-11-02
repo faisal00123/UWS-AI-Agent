@@ -61,6 +61,40 @@ describe('configuration', () => {
     assert.ok((telephony?.missing.length ?? 0) > 0);
   });
 
+  test('speech state is honest: provider name + any valid key path', () => {
+    const speechOf = (env: Record<string, string | undefined>) =>
+      loadConfig({ ...MIN, ...env }).providers.find((p) => p.key === 'speech');
+
+    // Fully configured via a dedicated speech key (named from STT_PROVIDER —
+    // the generic SPEECH_PROVIDER var does not exist, so it must not be used).
+    const dedicated = speechOf({ STT_PROVIDER: 'openai', STT_API_KEY: 'sk-test' });
+    assert.equal(dedicated?.state, 'configured', 'dedicated key + provider name = configured');
+    assert.deepEqual(dedicated?.missing, []);
+
+    // Shared-key path: no speech key at all, but AI_API_KEY covers it
+    // (same vendor/host) — must NOT be reported as `partial`.
+    const shared = speechOf({ STT_PROVIDER: 'openai', AI_API_KEY: 'sk-platform' });
+    assert.equal(shared?.state, 'configured', 'shared AI key is a valid speech credential');
+    assert.deepEqual(shared?.missing, []);
+
+    // Provider named but no key anywhere: honest `partial`, never configured.
+    const noKey = speechOf({ STT_PROVIDER: 'openai' });
+    assert.equal(noKey?.state, 'partial');
+    assert.deepEqual(noKey?.missing, ['STT_API_KEY']);
+
+    // Key present but no provider named: also `partial` (nothing selected it).
+    const noProvider = speechOf({ STT_API_KEY: 'sk-test' });
+    assert.equal(noProvider?.state, 'partial');
+    assert.ok(noProvider?.missing.includes('STT_PROVIDER'));
+
+    // Nothing at all: unconfigured.
+    assert.equal(speechOf({})?.state, 'unconfigured');
+
+    // No credential values ever leak into the report.
+    const serialized = JSON.stringify(speechOf({ STT_PROVIDER: 'openai', STT_API_KEY: 'sk-super-secret' }));
+    assert.ok(!serialized.includes('sk-super-secret'));
+  });
+
   test('no provider is configured by default', () => {
     const cfg = loadConfig(MIN);
     for (const p of cfg.providers) {

@@ -19,6 +19,13 @@ export interface JsonRequestOptions {
   /** Object is JSON-encoded; a string is sent as-is (form bodies pass their own content-type). */
   body?: unknown;
   timeoutMs?: number;
+  /**
+   * Caller-owned cancellation. When it aborts, the request rejects with an
+   * `unconfigured`-free `AdapterError` whose message says `cancelled` and
+   * `retryable: false` — a cancellation is a deliberate decision (call ended),
+   * never a provider fault, and must not be retried.
+   */
+  signal?: AbortSignal;
 }
 
 /**
@@ -33,7 +40,17 @@ export async function requestJson<T>(
   mapStatus?: (status: number, body: unknown) => AdapterError | null,
 ): Promise<T> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  const timedOut = { value: false };
+  const timer = setTimeout(() => {
+    timedOut.value = true;
+    controller.abort();
+  }, opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  const external = opts.signal;
+  const onExternalAbort = (): void => controller.abort();
+  if (external) {
+    if (external.aborted) controller.abort();
+    else external.addEventListener('abort', onExternalAbort, { once: true });
+  }
   let res: Response;
   try {
     const isPlainObject = typeof opts.body === 'object' && opts.body !== null && !Buffer.isBuffer(opts.body);
@@ -56,16 +73,24 @@ export async function requestJson<T>(
       signal: controller.signal,
     });
   } catch (err) {
-    const timedOut = controller.signal.aborted;
+    // Distinguish caller cancellation (deliberate, not retryable) from a
+    // timeout (transient, retryable) and from a genuine network failure.
+    if (external?.aborted && !timedOut.value) {
+      throw new AdapterError('provider_error', `Request to ${hostOf(url)} cancelled`, {
+        retryable: false,
+        cause: err,
+      });
+    }
     throw new AdapterError(
       'network',
-      timedOut
+      timedOut.value
         ? `Request to ${hostOf(url)} timed out`
         : `Could not reach ${hostOf(url)} (${(err as Error).name})`,
       { retryable: true, cause: err },
     );
   } finally {
     clearTimeout(timer);
+    external?.removeEventListener('abort', onExternalAbort);
   }
 
   let body: unknown = null;
