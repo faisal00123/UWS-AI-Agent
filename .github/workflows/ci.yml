@@ -1,0 +1,59 @@
+# Continuous integration: typecheck + full test suite + doctor + frontend
+# syntax check. No secrets are available to CI, so every provider is
+# unconfigured by design and no test performs a real network call.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck (tsc --noEmit)
+        run: npm run typecheck
+
+      - name: Test suite (unit + integration + API acceptance)
+        run: npm test
+
+      - name: Doctor (config / migrations / safeguards)
+        run: npm run doctor
+
+      - name: Frontend syntax check (node --check)
+        working-directory: .
+        run: |
+          for f in frontend/*.js frontend/views/*.js frontend/vercel.mjs; do
+            node --check "$f"
+            echo "ok $f"
+          done
+
+      - name: Frontend config resolves without env (fails fast by design)
+        working-directory: .
+        run: |
+          if node frontend/vercel.mjs 2>/dev/null; then
+            echo "vercel.mjs should fail when RAILWAY_BACKEND_URL is absent"; exit 1
+          else
+            echo "ok: build-time guard raised the expected error"
+          fi
+          RAILWAY_BACKEND_URL=https://example.up.railway.app \
+            node --input-type=module -e "const m = await import('./frontend/vercel.mjs'); console.log(JSON.stringify(m.config))" \
+            > /tmp/vercel-config.json
+          grep -q "example.up.railway.app/api" /tmp/vercel-config.json && echo "ok: rewrite targets the configured backend"
+          grep -q "Content-Security-Policy" /tmp/vercel-config.json && echo "ok: security headers present"

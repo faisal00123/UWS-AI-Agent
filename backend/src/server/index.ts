@@ -19,6 +19,7 @@ import { markApplicationStart } from '../domain/state/service.ts';
 import { buildRegistry, type AdapterUsageEvent } from '../adapters/registry.ts';
 import { isIntegrationEnabled, recordAdapterUsage } from '../domain/integrations/service.ts';
 import { createApp } from './app.ts';
+import { attachDuplexBridge, type DuplexBridge } from './duplex.ts';
 import { registerReportingJobs } from '../jobs/reporting.ts';
 import { registerBackupJobs } from '../jobs/backup.ts';
 import { registerHealthJobs } from '../jobs/health.ts';
@@ -71,6 +72,10 @@ async function main(): Promise<void> {
 
   const app = createApp({ config, db, logger, adapters });
   const server = app.listen(config.port);
+  // Duplex live-call bridge: Twilio Media Streams on /api/media, attached to
+  // the SAME HTTP server (the upgrade handler is registered before the port
+  // can accept a connection). Rejects honestly when disabled or unconfigured.
+  const duplex: DuplexBridge = attachDuplexBridge(server, { config, db, logger, adapters });
   server.on('error', (err: NodeJS.ErrnoException) => {
     if (err.code === 'EADDRINUSE') {
       process.stderr.write(
@@ -88,6 +93,7 @@ async function main(): Promise<void> {
       port: config.port,
       mode: bootState.mode,
       env: config.nodeEnv,
+      duplex: config.duplex.enabled ? 'enabled' : 'disabled',
     });
     // The banner is intentionally explicit about the operating mode so that a
     // developer can never mistake simulation for live outreach.
@@ -109,9 +115,11 @@ async function main(): Promise<void> {
   const shutdown = (signal: string): void => {
     logger.info('server.shutdown', { signal });
     scheduler.stop();
-    server.close(() => {
-      db.close();
-      process.exit(0);
+    void duplex.close().finally(() => {
+      server.close(() => {
+        db.close();
+        process.exit(0);
+      });
     });
     // Hard exit if providers/jobs hang.
     setTimeout(() => process.exit(1), 8000).unref();

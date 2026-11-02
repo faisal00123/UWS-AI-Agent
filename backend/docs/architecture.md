@@ -361,8 +361,11 @@ messages, verified over `req.rawBody` captured by the JSON parser's `verify`
 hook — never re-serialized JSON), `POST /api/webhooks/telephony/twilio`
 (Twilio status callbacks), `GET /api/webhooks/whatsapp` (Meta subscription
 challenge, owner-configured verify token, 404 when unconfigured), and
-`GET /api/webhooks/telephony/twilio/voice` (TwiML answer URL serving the
-mandated AI-identity disclosure; signature-checked; 404 when unconfigured).
+`GET /api/webhooks/telephony/twilio/voice` (TwiML answer URL: the mandated
+AI-identity disclosure, then — when the duplex bridge is enabled with both
+speech and AI ports present and the call is attributable to a lead —
+`<Connect><Stream>` into the live bridge; otherwise the fixed greeting +
+`<Hangup/>`; signature-checked; 404 when unconfigured).
 Ingestion runs through `src/domain/outreach/providerevents.ts`:
 `(provider, event_id)` is UNIQUE in `provider_events`, so provider retries
 are counted (`duplicate_count`) and change nothing twice; the raw payload is
@@ -372,13 +375,21 @@ at. An inbound WhatsApp message with STOP-class wording suppresses the lead
 recorded, so a later crash cannot un-suppress anyone. `GET /api/integrations`
 reports adapter statuses (secret-free) alongside credential presence.
 
-### Honest limitations of the current live path
+### Live-call media path (duplex bridge)
 
-* A live call currently delivers the **fixed, approved TwiML greeting** with
-  the AI disclosure and hangs up. The AI-conversation and speech ports are
-  implemented and unit-tested, but the duplex media pipeline (STT → turn
-  generation → TTS) that will drive a real conversation is **not wired yet**;
-  until it is, the docs and the TwiML say exactly that.
+* An answered call is served the duplex TwiML: the **AI-identity disclosure**
+  spoken first, then `<Connect><Stream>` into the WebSocket bridge at
+  `/api/media` (signed, expiring token bound to the CallSid — a WebSocket
+  upgrade cannot carry a Twilio signature header). The bridge runs the real
+  conversation loop: μ-law frames → voice-activity utterance detection →
+  STT → engine turn (disclosure + turn ceiling) → TTS → paced μ-law frames
+  back, with barge-in, DTMF human-handoff digits, and hard caps on utterance
+  and call duration. It never dials, never records (`<Record/>` is never
+  emitted), and audio lives in memory only for the duration of a turn.
+* When the bridge is disabled, speech/AI are missing, or the caller cannot be
+  attributed to a lead, the answer URL serves the **fixed, approved TwiML
+  greeting** with the disclosure and hangs up — a stream that could only
+  produce silence or invented speech is never opened.
 * Live call outcome before provider callbacks arrive is `unknown` — never
   assumed `answered`.
 
@@ -580,19 +591,21 @@ providers performs zero network calls.
 
 ## 11. Explicitly not (yet) implemented / external dependencies
 
-See the final status table in `README.md`. Specifically, at the end of Phase 10:
+See the final status table in `README.md`. Specifically:
 
-* **Lead discovery** has no vendor (owner decision pending: cost, terms,
-  regional quality for Pakistan). Import pipeline + analysis are fully
-  functional; discovery port throws `unconfigured` until a vendor is chosen.
-* **Live call media pipeline** (STT → AI turn → TTS, duplex audio) is not
-  wired: the `ConversationPort` and `SpeechPort` implementations exist and are
-  unit-tested, but a live call currently speaks the fixed, approved TwiML
-  greeting with the AI disclosure and hangs up. This is deliberate — recording
-  or transcribing a real person without a consent flow is not acceptable, and
-  the TwiML never enables recording.
-* **Telephony / WhatsApp / SMTP** integrations are **unconfigured** on the
-  deployed instance until real credentials and provider approvals (Meta
-  template approval) exist. Simulation remains the default operating mode; the
-  owner-only `setMode('live')` path requires provider configuration to exist
-  and is never auto-activated.
+* **Lead discovery** is wired to a real, free, keyless vendor (OpenStreetMap
+  via the Overpass API, `DISCOVERY_PROVIDER=overpass`, Pakistan scope —
+  Phase 12). The port still reports `unconfigured` when no provider is
+  selected, and import remains fully functional regardless.
+* **Live call media pipeline** (duplex audio) is fully wired: the answer TwiML
+  opens a Twilio Media Stream and the bridge drives STT → engine turn → TTS
+  over real two-way audio (see §6b/§7). It activates the moment telephony +
+  AI + speech are configured; until then the fixed approved greeting is
+  served. Recording is never enabled — no consent flow exists, so the TwiML
+  never emits `<Record/>`.
+* **Telephony / WhatsApp / SMTP / AI / STT** integrations are **unconfigured**
+  until real credentials and provider approvals (Meta
+  template approval) exist — listed with exact owner actions in
+  `docs/external-dependencies.md`. Simulation remains the default operating
+  mode; the owner-only `setMode('live')` path requires provider configuration
+  to exist and is never auto-activated.

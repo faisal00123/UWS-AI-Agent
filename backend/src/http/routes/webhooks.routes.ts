@@ -18,10 +18,24 @@
  * answer URL; both are signature/token gated and 404 when the corresponding
  * integration is not configured, so an unconfigured instance advertises
  * nothing.
+ *
+ * The answer URL serves the duplex variant (AI disclosure greeting, then
+ * <Connect><Stream> into /api/media) whenever the bridge is enabled, both
+ * speech and AI ports exist, and the call can be attributed to a lead.
+ * Otherwise it serves the fixed greeting + hangup — a call is never opened
+ * into a stream that could only produce silence or invented speech.
  */
 import { Router } from 'express';
 import { asyncRoute } from '../types.ts';
 import { AppError } from '../../core/errors.ts';
+import {
+  duplexAnswerTwiml,
+  duplexPorts,
+  GREETING_HANGUP,
+  mintStreamToken,
+  resolveCallForAnswer,
+  streamWsUrl,
+} from '../../domain/media/duplex.ts';
 import {
   ingestProviderEvent,
   applyCallStatusEvent,
@@ -49,10 +63,11 @@ function callBackPayload(params: Record<string, string>): Record<string, string>
   return params;
 }
 
-/** Greeting served when a live call connects. Fixed approved wording. */
+/** Greeting served when a live call connects but no duplex stream applies.
+ *  Fixed approved wording (disclosure + hangup). */
 const ANSWER_TWIML = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say language="en-US">Hello, this is the artificial intelligence calling assistant from Universal Web Solutions. I am an AI, and I am disclosing that up front. Our team will follow up with you shortly with more information. Thank you for your time. Goodbye.</Say>
+  <Say language="en-US">${GREETING_HANGUP}</Say>
   <Hangup/>
 </Response>`;
 
@@ -193,10 +208,16 @@ export function webhookRoutes(): Router {
   // Answer URL: Twilio fetches this (GET) when the callee picks up. Returns
   // TwiML with the mandated AI disclosure. Signature-checked; 404 when the
   // integration is absent.
+  //
+  // Duplex variant: when the bridge is enabled with STT+AI present and the
+  // call belongs to a lead, the greeting is followed by <Connect><Stream> so
+  // the conversation lifecycle runs over live audio. The stream URL carries a
+  // signed, expiring token bound to this CallSid (the WebSocket upgrade cannot
+  // carry a Twilio signature header). Anything else gets the fixed greeting.
   router.get(
     '/telephony/twilio/voice',
     asyncRoute((req, res) => {
-      const adapters = req.ctx.deps.adapters;
+      const { adapters, config, db, logger } = req.ctx.deps;
       if (!adapters?.telephony || !adapters.voiceAnswerUrl) {
         throw new AppError('not_found', 'Telephony voice endpoint is not configured');
       }
@@ -204,6 +225,38 @@ export function webhookRoutes(): Router {
       if (!adapters.verifyTwilioSignature(absoluteUrl(req), {}, signature)) {
         res.status(401).type('text/plain').send('Invalid signature');
         return;
+      }
+
+      const query = (name: string): string | null => {
+        const value = req.query[name];
+        return typeof value === 'string' && value.length > 0 ? value : null;
+      };
+      const callSid = query('CallSid');
+      const duplexReady =
+        config.duplex.enabled && duplexPorts(adapters.speech, adapters.ai) && callSid !== null;
+
+      if (duplexReady && callSid) {
+        try {
+          const resolved = resolveCallForAnswer(db, {
+            callSid,
+            from: query('From'),
+            to: query('To'),
+          });
+          if (resolved) {
+            const token = mintStreamToken(config.sessionSecret, callSid);
+            logger.info('webhook.twilio.answer.duplex', { createdInboundCall: resolved.created });
+            res
+              .status(200)
+              .type('application/xml')
+              .send(duplexAnswerTwiml(streamWsUrl(config.publicBaseUrl, callSid, token)));
+            return;
+          }
+          logger.info('webhook.twilio.answer.unattributed', {});
+        } catch (err) {
+          logger.error('webhook.twilio.answer.failed', {
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
       }
       res.status(200).type('application/xml').send(ANSWER_TWIML);
     }),

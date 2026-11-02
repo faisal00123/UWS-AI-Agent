@@ -202,7 +202,8 @@ export async function ingestProspectAudio(
   return { segmentSeq: seq, text: trimmed };
 }
 
-/** Append a prospect turn captured as text (e.g. typed by an operator). */
+/**
+ * Append a prospect turn captured as text (e.g. typed by an operator). */
 export function ingestProspectText(db: DB, conversationId: string, text: string): ProspectTurn {
   const conversation = loadConversation(db, conversationId);
   if (conversation.ended_at) throw new AppError('conflict', 'Conversation has already ended');
@@ -220,6 +221,28 @@ export function ingestProspectText(db: DB, conversationId: string, text: string)
   return { segmentSeq: seq, text: trimmed };
 }
 
+/**
+ * Append a system note (e.g. a DTMF digit the prospect pressed). System
+ * segments are evidence, not speech: they are excluded from the engine's
+ * history and from qualification extraction.
+ */
+export function ingestSystemNote(db: DB, conversationId: string, text: string): ProspectTurn {
+  const conversation = loadConversation(db, conversationId);
+  if (conversation.ended_at) throw new AppError('conflict', 'Conversation has already ended');
+  const trimmed = text.trim();
+  if (!trimmed) throw new AppError('validation_failed', 'System note is required');
+  const seq = insertSegment(db, conversationId, {
+    speaker: 'system',
+    text: trimmed,
+    language: null,
+    source: 'typed',
+  });
+  db.prepare(`UPDATE conversations SET transcript_state = 'partial' WHERE id = ? AND transcript_state = 'none'`).run(
+    conversationId,
+  );
+  return { segmentSeq: seq, text: trimmed };
+}
+
 // ----------------------------------------------------------------- agent ---
 
 export interface AgentTurn {
@@ -228,6 +251,8 @@ export interface AgentTurn {
   /** TTS audio for telephony playback; null when no speech provider exists. */
   audio: Uint8Array | null;
   contentType: string | null;
+  /** Sample rate of `audio` when the provider reported one (raw PCM). */
+  sampleRate: number | null;
   model: string;
 }
 
@@ -252,6 +277,10 @@ export function conversationHistory(db: DB, conversationId: string): { role: 'us
  * a speech provider is wired (returns null audio otherwise — the caller can
  * fall back to text-to-speech at the TwiML layer or skip playback).
  *
+ * `opts.speechFormat` asks the provider for a specific byte format: the
+ * duplex bridge requests `pcm` so it can convert the reply into telephony
+ * frames, while the HTTP seam keeps the default mp3 bytes.
+ *
  * Throws `provider_unavailable` when no AI port is wired: no reply is ever
  * fabricated without a model.
  */
@@ -260,6 +289,7 @@ export async function generateAgentReply(
   cfg: Config,
   deps: MediaDeps,
   conversationId: string,
+  opts: { speechFormat?: 'mp3' | 'pcm' } = {},
 ): Promise<AgentTurn> {
   const conversation = loadConversation(db, conversationId);
   if (conversation.ended_at) throw new AppError('conflict', 'Conversation has already ended');
@@ -299,13 +329,19 @@ export async function generateAgentReply(
 
   let audio: Uint8Array | null = null;
   let contentType: string | null = null;
+  let sampleRate: number | null = null;
   if (deps.speech && deps.speech.status().state !== 'unconfigured') {
-    const synthesized = await deps.speech.synthesize({ text: reply, language: speechLang(conversation.language) });
+    const synthesized = await deps.speech.synthesize({
+      text: reply,
+      language: speechLang(conversation.language),
+      ...(opts.speechFormat ? { format: opts.speechFormat } : {}),
+    });
     audio = synthesized.audio;
     contentType = synthesized.contentType;
+    sampleRate = synthesized.sampleRate ?? null;
   }
 
-  return { segmentSeq: seq, text: reply, audio, contentType, model };
+  return { segmentSeq: seq, text: reply, audio, contentType, sampleRate, model };
 }
 
 // ---------------------------------------------------------------- finish ---

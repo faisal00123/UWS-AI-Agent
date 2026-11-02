@@ -1,0 +1,10 @@
+# Build context hygiene for `docker build -f backend/Dockerfile .`
+.git
+.gitignore
+**/node_modules
+backend/data
+**/.env
+!**/.env.example
+backend/tests
+backend/docs
+**/*.md

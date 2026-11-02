@@ -168,7 +168,14 @@ export interface SpeechPort extends Pingable {
     voice?: string;
     /** Language the text is written in (selects a language-appropriate voice). */
     language?: SpeechLanguage;
-  }): Promise<{ audio: Uint8Array; contentType: string }>;
+    /**
+     * Requested byte format. 'mp3' (default) for storage/HTTP playback,
+     * 'pcm' for raw little-endian s16le mono that a telephony layer can
+     * resample. Providers that cannot honour it return their default format
+     * and the caller decides (never guesses) what to do with the bytes.
+     */
+    format?: 'mp3' | 'pcm';
+  }): Promise<{ audio: Uint8Array; contentType: string; sampleRate?: number }>;
 }
 
 // ------------------------------------------------------------------ email ---

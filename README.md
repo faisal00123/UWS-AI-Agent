@@ -82,7 +82,12 @@ The **CRM pipeline** tracks interactions, evidence-backed stage advancement
 (customer-facing stages require a real contact interaction; only the owner
 confirms a conversion), follow-ups and a cross-lead follow-up board.
 **Portfolio sharing** enforces a two-key rule: an item is shareable only when
-it is both *verified* and *approved*. **Daily reports** reconcile the ledger
+it is both *verified* and *approved*. On an answered call the **duplex
+bridge** opens a Twilio Media Stream and runs the same conversation lifecycle
+over real audio — voice-activity turn detection → STT → engine (AI disclosure
+and turn ceiling enforced) → TTS paced back as μ-law frames, with barge-in,
+DTMF human handoff and opt-out handling — and it never dials or records.
+**Daily reports** reconcile the ledger
 against execution rows and counters, surfacing discrepancies and honestly
 reporting missing data instead of estimating it. **Backups** are verified
 snapshots (optionally AES-256-GCM encrypted) with periodic restore tests.
@@ -95,8 +100,9 @@ channel immediately and is reachable from every screen.
 
 ## Final status table
 
-All roadmap phases through Phase 12 are implemented and covered by automated
-tests. The table below reflects the state at the end of Phase 12.
+All roadmap phases through Phase 12 **plus the final addendum** (duplex
+live-call audio, configuration and deployment readiness) are implemented and
+covered by automated tests.
 
 | Phase | Scope | Status | Notes |
 |---|---|---|---|
@@ -105,52 +111,54 @@ tests. The table below reflects the state at the end of Phase 12.
 | 4 | Website analysis (fetcher + parser), explainable scoring, contact eligibility, routes | ✅ Complete | Measured vs estimated vs unknown; `notMeasured` always populated; unreachable ≠ no-website |
 | 5 | Pipeline interactions, evidence-backed stage advancement, follow-up scheduling/execution | ✅ Complete | Migration 007 (consent as an `interactions` row); evidence rules enforced |
 | 6 | Outreach guard + ledger, deterministic simulation adapter, portfolio two-key rule, conversations, orchestration | ✅ Complete | Ordering (guard→ledger→counter→adapter→timeline) is a safety property; blocked=200, allowed=201 |
-| 7 | Provider adapters (Twilio, WhatsApp Cloud, OpenAI-compatible, SMTP), registry, webhooks, live seam | ✅ Complete | TwiML answer = static AI-disclosure + Hangup (no recording); inbound WhatsApp STOP suppresses first |
+| 7 | Provider adapters (Twilio, WhatsApp Cloud, OpenAI-compatible, SMTP), registry, webhooks, live seam | ✅ Complete | TwiML answer = duplex variant (disclosure → `<Connect><Stream>`) or fixed disclosure + Hangup; inbound WhatsApp STOP suppresses first |
 | 8 | Notifications fan-out/delivery, reconciliation, daily reports, reporting jobs, shared registry | ✅ Complete | One `daily_reports` row per date; reports owner-only, notifications owner+staff |
 | 9 | Backup (verified snapshot), AES-256-GCM encryption, restore + restore tests, jobs, CLIs, monitoring | ✅ Complete | `UWSBK1` format; retention never deletes the newest backup; restore re-applies late opt-outs |
 | 10 | No-build ES-module SPA (dashboard, leads, lead detail, pipeline, duplicates, portfolio, notifications, reports, backups, settings, system) | ✅ Complete | CSP `script-src 'self'` — no inline scripts/handlers; all dynamic content escaped |
 | 11A | Integration observability: adapter `ping()` probes, health checks, usage tracking, enable/disable toggles, mock providers, resilience (rate limit/retry/circuit-breaker) | ✅ Complete | Free probes only; unconfigured/disabled = no network; secrets never leave env names |
 | 11B | Live media pipeline seam (STT→AI→TTS conversation lifecycle), provider onboarding verification, opt-in unsuppression review queue, scheduled health checks, live-mode activation guardrails | ✅ Complete | Live requires owner + typed "GO LIVE" + fresh reauth + verified telephony; suppression lifts are append-only, owner-only, reason-mandatory |
 | 12 | Lead discovery vendor integration: OpenStreetMap/Overpass adapter, discovery run service + API (`/api/discovery/status`, `/api/discovery/run`), SPA trigger | ✅ Complete | Free + keyless (no `DISCOVERY_API_KEY` needed); Pakistan-only scope; runs in simulation (public-data research, contacts no customer); all-fail runs throw honestly |
+| Duplex | Live two-way call audio: G.711 μ-law/WAV/resample primitives, voice-activity utterance detection, Twilio Media Streams bridge (`/api/media` WSS), signed expiring stream tokens, inbound call attribution, barge-in, DTMF human handoff, call-duration caps | ✅ Complete | Answer TwiML: disclosure → `<Connect><Stream track=inbound_track codec=PCMU 8kHz>` → `<Hangup/>`; never `<Record/>`; the bridge never dials; a call runs the SAME conversation lifecycle (STT→engine→TTS, transcript, qualification, opt-out suppression) over real audio |
 
 ### Automated test coverage
 
-`npm test` runs **476 tests across 69 suites** (unit + integration + API
+`npm test` runs **524 tests across 79 suites** (unit + integration + API
 acceptance), all green. `npm run typecheck` is clean and `npm run doctor`
 exits 0. No test ever touches a real network: adapters receive an injected
 transport, and the default registry in the test environment is built from an
 explicit env map (never `process.env`), so local credentials cannot be
-exercised by the suite.
+exercised by the suite. The duplex bridge is covered end to end over a real
+WebSocket with mock providers.
 
 ---
 
 ## Not yet implemented / external dependencies
 
-These are deliberate, documented gaps — not oversights. See
-`backend/docs/architecture.md` §11 for the full rationale.
+The software itself is complete. What follows are **external dependencies**
+— items that require the owner (or a provider) to act outside this
+repository. See `backend/docs/architecture.md` §11 for the full rationale.
 
 * **Discovery coverage limits** — Phase 12 wired a real discovery vendor:
   OpenStreetMap via the free, keyless Overpass API (`DISCOVERY_PROVIDER=overpass`).
   It covers Pakistan only and is thinner than commercial directories (best for
-  named businesses with a published phone). Import remains fully functional,
-  and the discovery port reports `unconfigured` until a provider is selected.
-* **Duplex live-call audio** — the conversation lifecycle (STT → AI turn →
-  TTS, transcript segments, qualification extraction, opt-out handling) is
-  implemented and API-driven (`/api/conversations/*`), but an inbound call
-  still speaks the fixed, approved TwiML greeting (with the AI disclosure)
-  and hangs up until a duplex audio bridge is wired to the media seam.
-  Recording or transcribing a real person without a consent flow is not
-  acceptable, so the TwiML never enables recording.
+  named businesses with a published phone). Import remains fully functional.
 * **Telephony / WhatsApp / SMTP / AI / STT** integrations — **unconfigured**
-  on the deployed instance until real credentials and provider approvals
-  (e.g. Meta template approval) exist. Simulation stays the default; the
-  owner-only live-activation path additionally requires a **verified**
-  telephony onboarding (free connection probe), the typed "GO LIVE"
+  until real credentials and provider approvals exist (account creation,
+  Meta template approval, API keys entered as env vars). Simulation stays the
+  default; the owner-only live-activation path additionally requires a
+  **verified** telephony onboarding (free connection probe), the typed "GO LIVE"
   confirmation and a fresh password re-authentication — and is never
-  auto-activated.
-* **Backups** — disabled by default; opt in with `BACKUP_ENABLED=true` and set
-  `BACKUP_PASSPHRASE` for encryption at rest. `npm run doctor` reports the
-  honest state.
+  auto-activated. Each gap, with its exact owner action, is listed in
+  `backend/docs/external-dependencies.md`.
+* **Duplex live-call audio** — implemented (answer TwiML opens a Twilio
+  Media Stream at `/api/media`; the conversation runs over real two-way
+  audio). It requires the telephony + AI + speech integrations above to be
+  configured; until then the answer URL serves the fixed approved greeting
+  and the bridge refuses upgrades honestly (503). Recording is never
+  enabled — no consent flow exists, so `<Record/>` is never emitted.
+* **Backups** — opt in with `BACKUP_ENABLED=true` and set
+  `BACKUP_PASSPHRASE` for encryption at rest (the local `.env` enables both).
+  `npm run doctor` reports the honest state.
 
 ---
 
@@ -194,6 +202,16 @@ Telephony (`TELEPHONY_*`) · WhatsApp Business (`WHATSAPP_*`) · Lead discovery
 (`BACKUP_ENABLED`, `BACKUP_PASSPHRASE`, `BACKUP_RETENTION_DAYS`,
 `BACKUP_INTERVAL_HOURS`, `RESTORE_TEST_INTERVAL_DAYS`).
 
+### Duplex live-call bridge (non-secret behaviour tuning)
+
+| Variable | Default | Notes |
+|---|---|---|
+| `DUPLEX_ENABLED` | `true` | Master switch. When off (or speech/AI missing) the answer URL serves the fixed greeting and the WebSocket upgrade returns 503. |
+| `DUPLEX_VAD_THRESHOLD` | `400` | RMS above which an inbound frame counts as speech. |
+| `DUPLEX_SILENCE_MS` | `600` | Trailing silence that ends a prospect utterance. |
+| `DUPLEX_MAX_UTTERANCE_MS` | `15000` | Hard cap on a single utterance (bounds memory per call). |
+| `DUPLEX_MAX_CALL_SECONDS` | `300` | Hard cap on one live call; the bridge then hangs up. |
+
 ---
 
 ## Documentation
@@ -203,6 +221,8 @@ Telephony (`TELEPHONY_*`) · WhatsApp Business (`WHATSAPP_*`) · Lead discovery
 | `backend/docs/architecture.md` | Full architecture: goals, technology choices (and rejections), layering, safeguards, data model, scoring, import/analysis/pipeline/outreach/notifications/backup design, security, testing strategy |
 | `backend/docs/acceptance-test-plan.md` | Manual acceptance walkthrough per phase, complementing the automated suite |
 | `backend/docs/security-checklist.md` | Security posture checklist mapped to the implementation |
+| `backend/docs/external-dependencies.md` | Every remaining external dependency with its exact owner action (provider accounts, hosting, DNS, GO LIVE) |
+| `backend/docs/deployment.md` | Vercel (frontend) + Railway (backend) topology, deploy sequence, env vars, and the honest current blockage |
 
 ---
 
@@ -222,7 +242,7 @@ backend/     Node 24 + TypeScript (run directly, no build step) — the whole
     db/        connection, migrations (001–010), transaction helpers
     domain/    business logic — pure, framework-free (leads, analysis, scoring,
                eligibility, pipeline, outreach, portfolio, reporting, backup,
-               state, settings, auth, discovery)
+               state, settings, auth, discovery, media/duplex)
     adapters/  provider ports + implementations (mock/simulation and real)
     http/      Express routes, middleware (auth/CSRF/RBAC/reauth), error mapping
     jobs/      scheduler + tasks (reporting, backup, health) — honour safeguards

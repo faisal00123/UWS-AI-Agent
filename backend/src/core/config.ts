@@ -115,6 +115,19 @@ const EnvSchema = z.object({
   /** TTS voice used when synthesising Urdu (falls back to SPEECH_VOICE). */
   SPEECH_VOICE_UR: z.string().default(''),
 
+  // Duplex live-call bridge (answer TwiML opens a Twilio Media Stream).
+  // Tunable behaviour only — credentials are NOT involved here.
+  /** Master switch for the duplex bridge (never affects safety state). */
+  DUPLEX_ENABLED: boolish.default(true),
+  /** RMS above which an inbound frame counts as speech (mu-law PCM scale). */
+  DUPLEX_VAD_THRESHOLD: intIn(50, 8_000).default(400),
+  /** Trailing silence that ends a prospect utterance. */
+  DUPLEX_SILENCE_MS: intIn(200, 3_000).default(600),
+  /** Hard cap on a single utterance (bounds memory per call). */
+  DUPLEX_MAX_UTTERANCE_MS: intIn(2_000, 60_000).default(15_000),
+  /** Hard cap on one live call's duration (then the bridge hangs up). */
+  DUPLEX_MAX_CALL_SECONDS: intIn(30, 3_600).default(300),
+
   // Adapter resilience (Phase 11A). Applies to idempotent operations only.
   /** Total attempts (including the first) for retryable idempotent ops. */
   ADAPTER_RETRY_ATTEMPTS: intIn(1, 6).default(2),
@@ -176,6 +189,14 @@ export interface Config {
   aiBaseUrl: string;
   /** Speech voice/language defaults (never secrets). */
   speech: { language: 'en' | 'ur'; voice: string; voiceUr: string };
+  /** Duplex live-call bridge behaviour (no credentials). */
+  duplex: {
+    enabled: boolean;
+    vadThreshold: number;
+    silenceMs: number;
+    maxUtteranceMs: number;
+    maxCallSeconds: number;
+  };
   /** Adapter resilience settings: retry attempts + per-minute rate limit. */
   adapter: { retryAttempts: number; ratePerMinute: number };
   bootstrapOwner: { email: string; password: string };
@@ -331,6 +352,13 @@ export function loadConfig(env: Env = process.env): Config {
     providers,
     aiBaseUrl: e.AI_BASE_URL.trim(),
     speech: { language: e.SPEECH_LANGUAGE, voice: e.SPEECH_VOICE.trim(), voiceUr: e.SPEECH_VOICE_UR.trim() },
+    duplex: {
+      enabled: e.DUPLEX_ENABLED,
+      vadThreshold: e.DUPLEX_VAD_THRESHOLD,
+      silenceMs: e.DUPLEX_SILENCE_MS,
+      maxUtteranceMs: e.DUPLEX_MAX_UTTERANCE_MS,
+      maxCallSeconds: e.DUPLEX_MAX_CALL_SECONDS,
+    },
     adapter: { retryAttempts: e.ADAPTER_RETRY_ATTEMPTS, ratePerMinute: e.ADAPTER_RATE_LIMIT_PER_MIN },
     bootstrapOwner: { email: e.OWNER_EMAIL, password: e.OWNER_PASSWORD },
     ephemeralSessionSecret: ephemeral,

@@ -12,6 +12,7 @@ import { nullLogger, type Logger } from '../../src/core/logger.ts';
 import { openDatabase, type DB } from '../../src/db/index.ts';
 import { runMigrations } from '../../src/db/migrate.ts';
 import { createApp } from '../../src/server/app.ts';
+import { attachDuplexBridge, type DuplexBridge } from '../../src/server/duplex.ts';
 import { createUser, login, type PublicUser } from '../../src/domain/auth/service.ts';
 import { buildRegistry, type AdapterRegistry, type AdapterUsageEvent } from '../../src/adapters/registry.ts';
 import { isIntegrationEnabled, recordAdapterUsage } from '../../src/domain/integrations/service.ts';
@@ -39,6 +40,8 @@ export interface TestServer {
   server: Server;
   /** The adapter registry the app was built with (for webhook signing, etc.). */
   adapters: AdapterRegistry;
+  /** The duplex media bridge attached to `server` (Twilio Media Streams). */
+  duplex: DuplexBridge;
   close(): Promise<void>;
   client(): TestClient;
 }
@@ -87,6 +90,9 @@ export async function startTestServer(env: TestEnv = {}, opts: TestServerOptions
   });
   const address = server.address() as AddressInfo;
   const url = `http://127.0.0.1:${address.port}`;
+  // Same bridge production uses, so API tests can exercise a real WebSocket
+  // media session end to end (with mock adapters — never a real network).
+  const duplex = attachDuplexBridge(server, { config, db, logger, adapters });
 
   return {
     config,
@@ -95,7 +101,9 @@ export async function startTestServer(env: TestEnv = {}, opts: TestServerOptions
     url,
     server,
     adapters,
+    duplex,
     async close() {
+      await duplex.close();
       await new Promise<void>((resolve) => server.close(() => resolve()));
       db.close();
     },

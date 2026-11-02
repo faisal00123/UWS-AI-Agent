@@ -96,15 +96,24 @@ export function createOpenAISpeechAdapter(opts: OpenAISpeechOptions): SpeechPort
       }
     },
 
-    async synthesize(input): Promise<{ audio: Uint8Array; contentType: string }> {
+    async synthesize(input): Promise<{ audio: Uint8Array; contentType: string; sampleRate?: number }> {
       if (!configured()) throw new AdapterError('unconfigured', 'No speech provider credentials are configured');
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 20_000);
+      // `pcm` is the raw s16le stream at the provider's documented 24 kHz —
+      // the duplex bridge needs sample values it can resample to 8 kHz
+      // telephony audio, which mp3 bytes would not give it.
+      const format = input.format === 'pcm' ? 'pcm' : undefined;
       try {
         const res = await fetchImpl(`${base}/audio/speech`, {
           method: 'POST',
           headers: { authorization: `Bearer ${opts.apiKey}`, 'content-type': 'application/json' },
-          body: JSON.stringify({ model: opts.ttsModel ?? 'tts-1', voice: input.voice ?? opts.voice ?? 'alloy', input: input.text }),
+          body: JSON.stringify({
+            model: opts.ttsModel ?? 'tts-1',
+            voice: input.voice ?? opts.voice ?? 'alloy',
+            input: input.text,
+            ...(format ? { response_format: format } : {}),
+          }),
           signal: controller.signal,
         });
         if (!res.ok) {
@@ -115,7 +124,12 @@ export function createOpenAISpeechAdapter(opts: OpenAISpeechOptions): SpeechPort
         }
         const buf = Buffer.from(await res.arrayBuffer());
         lastError = null;
-        return { audio: new Uint8Array(buf), contentType: res.headers.get('content-type') ?? 'audio/mpeg' };
+        const contentType = res.headers.get('content-type') ?? (format === 'pcm' ? 'audio/pcm' : 'audio/mpeg');
+        return {
+          audio: new Uint8Array(buf),
+          contentType,
+          ...(format === 'pcm' ? { sampleRate: 24_000 } : {}),
+        };
       } catch (err) {
         if (err instanceof AdapterError) throw err;
         lastError = `network: ${err instanceof Error ? err.name : 'error'}`;

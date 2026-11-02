@@ -116,7 +116,9 @@ Record the database path shown by `npm run doctor` (default
 | 7.3 | Inbound WhatsApp `STOP` (signed webhook) | Lead is suppressed **immediately**; the reply is recorded; the suppression blocks all channels |
 | 7.4 | An invalid webhook signature | `401`; the payload is never touched |
 | 7.5 | Share the portfolio in live mode | Only the **approved template** is sent — never free-form text |
-| 7.6 | The TwiML answer URL (signed request) | Speaks the AI disclosure and hangs up; **no** recording is enabled |
+| 7.6 | The TwiML answer URL (signed request) | Speaks the AI disclosure; with the duplex bridge ready it opens `<Connect><Stream>` (disclosure first), otherwise it hangs up; **no** recording is enabled either way |
+| 7.7 | Answered call over the media stream (with speech + AI configured) | The prospect's utterance becomes a transcript segment, the agent replies in audio, barge-in stops playback, DTMF `0`/`1` requests a human per policy, and the call ends with qualification extracted |
+| 7.8 | WebSocket upgrade to `/api/media` without a valid signed token | `401`; with a token but an unknown call `404`; while the call is already streaming `409`; bridge disabled or speech/AI missing `503` |
 
 ---
 

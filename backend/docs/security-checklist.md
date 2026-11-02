@@ -92,7 +92,10 @@
 | Webhook signatures verified (Meta `X-Hub-Signature-256`, Twilio signature) over the exact raw bytes; invalid signature = 401, payload untouched | ✅ | webhook + adapter tests |
 | Webhook processing is idempotent on replay | ✅ | webhook tests |
 | Inbound WhatsApp `STOP` suppresses **before** any other handling | ✅ | webhook test |
-| TwiML answer URL serves only the AI disclosure + hangup; **recording never enabled** | ✅ | webhook test |
+| TwiML answer URL serves the AI disclosure (duplex stream only when fully configured and attributable, else disclosure + hangup); **recording never enabled** | ✅ | webhook + duplex tests |
+| Duplex stream URL access is a signed, expiring token bound to the CallSid; bad/missing token = 401, unknown call = 404, duplicate stream = 409, unconfigured bridge = 503 | ✅ | duplex unit + integration tests |
+| Duplex call audio is transient memory only — never written to disk; no `<Record/>` is ever emitted | ✅ | duplex tests (recording flags asserted `0`) |
+| The bridge never dials and never changes operating mode; it only serves calls already in the ledger | ✅ | duplex tests |
 | Unconfigured webhooks 404 (an unconfigured instance advertises nothing) | ✅ | webhook test |
 | SMTP: plaintext to non-loopback hosts refused (no credential-in-the-clear) | ✅ | SMTP adapter tests |
 | Provider auth/token errors never leak the token | ✅ | adapter tests |
