@@ -1,4 +1,4 @@
-# deploy/sip — CloudyVoice SIP gateway templates
+# backend/deploy/sip — CloudyVoice SIP gateway templates
 
 Everything here is a **template with placeholders**. Nothing is filled in, no
 carrier value is guessed, and nothing in this folder is required to *run* the

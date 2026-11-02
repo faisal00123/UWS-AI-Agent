@@ -79,7 +79,7 @@ const EnvSchema = z.object({
   TELEPHONY_AUTH_TOKEN: z.string().default(''),
   TELEPHONY_FROM_NUMBER: z.string().default(''),
 
-  // CloudyVoice SIP gateway bridge (carrier is SIP-only; see deploy/sip/).
+  // CloudyVoice SIP gateway bridge (carrier is SIP-only; see backend/deploy/sip/).
   // These describe OUR gateway process — never CloudyVoice itself. The carrier
   // hostname/port/transport/credentials live ONLY in the gateway's own config
   // on the VPS, never in this process. Values are never logged or echoed.

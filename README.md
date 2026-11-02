@@ -119,7 +119,7 @@ covered by automated tests.
 | 11B | Live media pipeline seam (STT→AI→TTS conversation lifecycle), provider onboarding verification, opt-in unsuppression review queue, scheduled health checks, live-mode activation guardrails | ✅ Complete | Live requires owner + typed "GO LIVE" + fresh reauth + verified telephony; suppression lifts are append-only, owner-only, reason-mandatory |
 | 12 | Lead discovery vendor integration: OpenStreetMap/Overpass adapter, discovery run service + API (`/api/discovery/status`, `/api/discovery/run`), SPA trigger | ✅ Complete | Free + keyless (no `DISCOVERY_API_KEY` needed); Pakistan-only scope; runs in simulation (public-data research, contacts no customer); all-fail runs throw honestly |
 | Duplex | Live two-way call audio: G.711 μ-law/WAV/resample primitives, voice-activity utterance detection, Twilio Media Streams bridge (`/api/media` WSS), signed expiring stream tokens, inbound call attribution, barge-in, DTMF human handoff, call-duration caps | ✅ Complete | Answer TwiML: disclosure → `<Connect><Stream track=inbound_track codec=PCMU 8kHz>` → `<Hangup/>`; never `<Record/>`; the bridge never dials; a call runs the SAME conversation lifecycle (STT→engine→TTS, transcript, qualification, opt-out suppression) over real audio |
-| CloudyVoice SIP | Backend half of the SIP gateway bridge (intended primary outbound provider): gateway control adapter + registry webhook selection, signed answer/lifecycle routes, SIP-dialect media bridge sharing the server with the Twilio bridge, Q.850 cause mapping, doctor/env/docs/templates | ✅ Backend complete — **NOT connected** | CloudyVoice is a SIP carrier (no HTTP call API): carrier values are BLOCKED on onboarding; `deploy/sip/*.sample` placeholders + `contract.md` ready; no SIP registration or test call has happened; Twilio path byte-identical and untouched |
+| CloudyVoice SIP | Backend half of the SIP gateway bridge (intended primary outbound provider): gateway control adapter + registry webhook selection, signed answer/lifecycle routes, SIP-dialect media bridge sharing the server with the Twilio bridge, Q.850 cause mapping, doctor/env/docs/templates | ✅ Backend complete — **NOT connected** | CloudyVoice is a SIP carrier (no HTTP call API): carrier values are BLOCKED on onboarding; `backend/deploy/sip/*.sample` placeholders + `contract.md` ready; no SIP registration or test call has happened; Twilio path byte-identical and untouched |
 
 ### Automated test coverage
 
@@ -163,7 +163,7 @@ repository. See `backend/docs/architecture.md` §11 for the full rationale.
   `npm run doctor` reports the honest state.
 * **CloudyVoice SIP calling** — the backend half is complete and tested
   (gateway control adapter, signed answer/lifecycle routes, SIP-dialect media
-  bridge, `deploy/sip/` templates, `backend/docs/cloudyvoice-integration.md`),
+  bridge, `backend/deploy/sip/` templates, `backend/docs/cloudyvoice-integration.md`),
   but **nothing is connected to the carrier**: no credentials, no SIP
   registration, no test call. It stays blocked on CloudyVoice onboarding (KYC,
   SIP host/port/transport, auth mode, codecs/DTMF, CLI approval for Pakistan)
@@ -239,7 +239,7 @@ Lead discovery
 | `backend/docs/external-dependencies.md` | Every remaining external dependency with its exact owner action (provider accounts, hosting, DNS, GO LIVE) |
 | `backend/docs/deployment.md` | Vercel (frontend) + Railway (backend) topology, deploy sequence, env vars, and the honest current blockage |
 | `backend/docs/cloudyvoice-integration.md` | CloudyVoice SIP integration: what the carrier is, gateway architecture, implemented backend surface, blocked required values, ordered verification path |
-| `deploy/sip/` | Gateway templates: `contract.md` (authoritative backend ⇄ gateway API), `README.md` (Windows-dev + VPS steps + firewall table), Asterisk/env/systemd `*.sample` files — placeholders only |
+| `backend/deploy/sip/` | Gateway templates: `contract.md` (authoritative backend ⇄ gateway API), `README.md` (Windows-dev + VPS steps + firewall table), Asterisk/env/systemd `*.sample` files — placeholders only |
 
 ---
 
@@ -271,7 +271,8 @@ backend/     Node 24 + TypeScript (run directly, no build step) — the whole
     helpers/     test server/client harness
   docs/        architecture, acceptance plan, security checklist,
                cloudyvoice-integration
-deploy/sip/    SIP gateway templates (repo root): contract.md, README.md,
+  deploy/sip/  SIP gateway templates: contract.md (authoritative backend ⇄
+               gateway API), README.md (VPS steps + firewall table),
                Asterisk/env/systemd *.sample — placeholders only, never filled here
 ```
 

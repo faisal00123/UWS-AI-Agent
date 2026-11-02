@@ -2,7 +2,7 @@
  * Routes: CloudyVoice SIP gateway callbacks.
  *
  * These are the gateway-side counterparts of `webhooks.routes.ts`. The gateway
- * is OUR process (Asterisk/FreeSWITCH + a thin bridge — see `deploy/sip/`), so
+ * is OUR process (Asterisk/FreeSWITCH + a thin bridge — see `backend/deploy/sip/`), so
  * the contract below is ours too; CloudyVoice itself only ever sees SIP/RTP.
  *
  *   GET  /api/webhooks/telephony/gateway/answer

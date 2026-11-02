@@ -116,7 +116,7 @@ function main(): void {
         : ok('SIP_GATEWAY_TIMEOUT_MS: not set (default 10000 ms)'),
     );
     lines.push(
-      warn('carrier values (SIP host, port, transport, codecs, CLI) live in deploy/sip/ on the VPS - never here'),
+      warn('carrier values (SIP host, port, transport, codecs, CLI) live in backend/deploy/sip/ on the VPS - never here'),
     );
     lines.push(
       warn('CloudyVoice NOT verified: SIP registration + an approved test call are still required before live mode'),

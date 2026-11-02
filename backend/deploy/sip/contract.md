@@ -215,7 +215,7 @@ built by adapting a Twilio Media Streams client):
 
 - No CloudyVoice credential, hostname, port, codec list or caller ID appears in
   the backend or in this contract — those live only in the gateway's own
-  configuration (`deploy/sip/*.sample` placeholders → filled on the VPS).
+  configuration (`backend/deploy/sip/*.sample` placeholders → filled on the VPS).
 - The backend never talks SIP and never holds carrier credentials.
 - The gateway never receives backend session data beyond what a call needs.
 - Nothing here enables live calling: `OPERATING_MODE=simulation` + paused

@@ -42,11 +42,11 @@ SIP/RTP to CloudyVoice and speaks *our own* contract to the backend.
 
 Design rules (all enforced in code):
 
-1. **The gateway speaks our contract** (`deploy/sip/contract.md`), never
+1. **The gateway speaks our contract** (`backend/deploy/sip/contract.md`), never
    CloudyVoice's undocumented behaviour. The carrier only ever sees SIP/RTP.
 2. **No carrier value lives in the backend** — no SIP hostname, port, codec,
    caller ID or credential appears anywhere in `backend/src`. Those live only
-   in `deploy/sip/*.sample` → filled copies on the VPS.
+   in `backend/deploy/sip/*.sample` → filled copies on the VPS.
 3. **One conversation pipeline.** The gateway media bridge translates its wire
    dialect into the exact events `createDuplexSession` already consumes, so
    SIP calls run the same VAD → STT (OpenAI) → engine → TTS → transcript →
@@ -132,8 +132,8 @@ Until step 3 succeeds, the honest status remains: **CloudyVoice NOT connected.**
 
 ## 7. Related docs
 
-- `deploy/sip/contract.md` — the authoritative backend ⇄ gateway API
-- `deploy/sip/README.md` — Windows-dev steps, VPS steps, firewall table
+- `backend/deploy/sip/contract.md` — the authoritative backend ⇄ gateway API
+- `backend/deploy/sip/README.md` — Windows-dev steps, VPS steps, firewall table
 - `docs/deployment.md` — topology and deploy sequence
 - `docs/architecture.md` — layer overview (gateway bridge section)
 - `docs/external-dependencies.md` — CloudyVoice entry

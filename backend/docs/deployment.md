@@ -103,8 +103,8 @@ change to the two-host deploy above:
 * The backend needs **no new egress besides** `SIP_GATEWAY_BASE_URL` (ideally
   loopback — gateway on the same host) and the gateway needs HTTPS/WSS to the
   backend's `PUBLIC_BASE_URL` (answer fetch, signed events, media WS).
-* The gateway host is provisioned from `deploy/sip/*.sample` (placeholders
-  filled **on the VPS only**) — see `deploy/sip/README.md` for the step list
+* The gateway host is provisioned from `backend/deploy/sip/*.sample` (placeholders
+  filled **on the VPS only**) — see `backend/deploy/sip/README.md` for the step list
   and the firewall table.
 * Sequence when the carrier values arrive: Phase-1 engine spike → fill
   samples → free `/v1/health` probe → `npm run doctor` gateway block clean →

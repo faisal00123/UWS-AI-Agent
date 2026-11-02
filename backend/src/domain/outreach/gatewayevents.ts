@@ -2,7 +2,7 @@
  * Gateway (CloudyVoice/SIP) call-lifecycle events.
  *
  * The gateway is OUR process, so the vocabulary below is OUR contract (see
- * `deploy/sip/contract.md`) — nothing here is asserted about CloudyVoice's own
+ * `backend/deploy/sip/contract.md`) — nothing here is asserted about CloudyVoice's own
  * API, which does not exist for call placement (it is a SIP carrier). The
  * gateway observes SIP signalling and posts signed JSON to
  * `/api/webhooks/telephony/gateway/events`; this module turns that into the

@@ -5,7 +5,7 @@
  * call-placement API): calls leave the platform as SIP/RTP, so a gateway process
  * (Asterisk or FreeSWITCH, decided by the Phase-1 spike) owns signalling and
  * media. This adapter is the backend half of that bridge and speaks only to a
- * control API **we define ourselves** — see `deploy/sip/contract.md`:
+ * control API **we define ourselves** — see `backend/deploy/sip/contract.md`:
  *
  *   GET  ${SIP_GATEWAY_BASE_URL}/v1/health   free liveness + SIP registration
  *   POST ${SIP_GATEWAY_BASE_URL}/v1/calls    originate one call
@@ -14,7 +14,7 @@
  *
  *  - NO CLOUDYVOICE VALUE LIVES HERE. No SIP hostname, port, codec, caller ID or
  *    carrier credential appears in this file — those belong to the gateway's own
- *    configuration (`deploy/sip/`), which is exactly where they must stay.
+ *    configuration (`backend/deploy/sip/`), which is exactly where they must stay.
  *  - `SIP_GATEWAY_API_TOKEN` authenticates us TO our gateway. It never leaves
  *    this module: no logs, no error bodies, no status payloads.
  *  - `ping()` is a FREE health fetch. It never originates a call, so onboarding

@@ -22,7 +22,7 @@
  *
  * Outbound frames keep Twilio's media shape (`{event:'media', media:{payload}}`)
  * on purpose: a gateway can then be built by adapting a Twilio Media Streams
- * client instead of inventing a second dialect (see deploy/sip/contract.md).
+ * client instead of inventing a second dialect (see backend/deploy/sip/contract.md).
  */
 import type { Server } from 'node:http';
 import { WebSocketServer, type WebSocket } from 'ws';

@@ -1,7 +1,7 @@
 ; =====================================================================
 ;  extensions.conf — TEMPLATE ONLY (Asterisk)
 ;
-;  Shows the SHAPE of the call flow defined in deploy/sip/contract.md:
+;  Shows the SHAPE of the call flow defined in backend/deploy/sip/contract.md:
 ;
 ;    outbound  gateway originates -> callee answers -> GET answerUrl
 ;               -> action=bridge : play greeting, hand media to the

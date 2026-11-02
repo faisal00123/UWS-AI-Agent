@@ -4,7 +4,7 @@
  * `TELEPHONY_PROVIDER` selects the concrete adapter:
  *   twilio      - Twilio voice REST API + signed status callbacks
  *   cloudyvoice - OUR SIP gateway control API (carrier is SIP-only; see
- *                 adapters/telephony/cloudyvoice.ts and deploy/sip/contract.md)
+ *                 adapters/telephony/cloudyvoice.ts and backend/deploy/sip/contract.md)
  *   mock        - deterministic simulation (no key, no network)
  *
  * Unknown or missing provider names yield `null` (unconfigured). The inbound

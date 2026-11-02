@@ -314,7 +314,7 @@ into this same seam (section 7) — simulation remains the default mode.
 | Port | Implementation | Notes |
 |---|---|---|
 | Telephony | `telephony/twilio.ts` | REST `Calls.json` (form-encoded, basic auth). Provider error codes mapped (`21211`→`invalid_destination`, 429→`rate_limited`). **Never requests recording** — no consent, no `Record` param. Also owns Twilio's webhook signature validation (HMAC-SHA1 over URL + sorted params, timing-safe). |
-| Telephony | `telephony/cloudyvoice.ts` | CloudyVoice is a SIP *termination carrier* (no carrier HTTP API), so this adapter talks to **our own gateway control API** (`GET /v1/health`, `POST /v1/calls` on `SIP_GATEWAY_BASE_URL`, bearer `SIP_GATEWAY_API_TOKEN`). Error mapping: 401/403→`provider_error`, `invalid_destination`/`unroutable`→`invalid_destination`, 429→`rate_limited`. Free `ping()` reports SIP registration state without placing a call. **No carrier value (host/port/codec/CLI/credential) exists in the backend** — those live only in `deploy/sip/` on the VPS. |
+| Telephony | `telephony/cloudyvoice.ts` | CloudyVoice is a SIP *termination carrier* (no carrier HTTP API), so this adapter talks to **our own gateway control API** (`GET /v1/health`, `POST /v1/calls` on `SIP_GATEWAY_BASE_URL`, bearer `SIP_GATEWAY_API_TOKEN`). Error mapping: 401/403→`provider_error`, `invalid_destination`/`unroutable`→`invalid_destination`, 429→`rate_limited`. Free `ping()` reports SIP registration state without placing a call. **No carrier value (host/port/codec/CLI/credential) exists in the backend** — those live only in `backend/deploy/sip/` on the VPS. |
 | WhatsApp | `whatsapp/cloud.ts` | Cloud API **template sends only** (free-form text to a prospect who has not messaged us first is never permitted). Owns Meta's `X-Hub-Signature-256` verification (HMAC-SHA256 over the RAW body, timing-safe). Without an app secret, webhooks are **refused**, not accepted unverified. |
 | AI conversation | `ai/openai.ts` | OpenAI-compatible chat completions (`AI_*` env). Defined + unit-tested; **not yet wired** into a live-call media pipeline (see limitations below). |
 | Speech | `speech/openai.ts` | OpenAI-compatible STT (`/audio/transcriptions`, dependency-free multipart that preserves audio bytes) + TTS. Same wiring status as AI. |
@@ -394,12 +394,12 @@ reports adapter statuses (secret-free) alongside credential presence.
 * Live call outcome before provider callbacks arrive is `unknown` — never
   assumed `answered`.
 
-### CloudyVoice SIP gateway bridge (`deploy/sip/`, `src/http/routes/gateway.routes.ts`, `src/server/gatewaymedia.ts`)
+### CloudyVoice SIP gateway bridge (`backend/deploy/sip/`, `src/http/routes/gateway.routes.ts`, `src/server/gatewaymedia.ts`)
 
 When `TELEPHONY_PROVIDER=cloudyvoice`, outbound calls are placed through a
 gateway process we run (Asterisk/FreeSWITCH — engine chosen by the Phase-1
 spike) that speaks SIP/RTP to the carrier and **our own contract** to this
-backend (`deploy/sip/contract.md`):
+backend (`backend/deploy/sip/contract.md`):
 
 * **Control (backend → gateway):** `POST /v1/calls` originates one call,
   `GET /v1/health` is the free onboarding/health probe (bearer-authenticated,
