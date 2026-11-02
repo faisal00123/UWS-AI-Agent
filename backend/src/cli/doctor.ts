@@ -84,6 +84,45 @@ function main(): void {
     );
   }
 
+  // SIP gateway bridge (CloudyVoice). Presence of NAMES only — never a value,
+  // never a carrier credential (those live in the gateway's own config on the
+  // VPS and are deliberately absent from this process).
+  lines.push('\nSIP gateway (CloudyVoice bridge - names only, values never displayed)');
+  const telephonyProvider = (process.env['TELEPHONY_PROVIDER'] ?? '').trim().toLowerCase();
+  if (telephonyProvider !== 'cloudyvoice') {
+    lines.push(
+      warn(
+        `gateway checks skipped - TELEPHONY_PROVIDER is ${telephonyProvider || 'unset'} (gateway mode needs "cloudyvoice")`,
+      ),
+    );
+  } else {
+    const gatewayVars: [string, boolean][] = [
+      ['SIP_GATEWAY_BASE_URL', true],
+      ['SIP_GATEWAY_API_TOKEN', true],
+      ['SIP_GATEWAY_EVENT_SECRET', true],
+      ['SIP_GATEWAY_TIMEOUT_MS', false],
+    ];
+    const missingRequired = gatewayVars.filter(([, required]) => required).map(([name]) => name);
+    const missing = missingRequired.filter((name) => !(process.env[name] ?? '').trim());
+    lines.push(
+      missing.length === 0
+        ? ok('gateway control settings present (URL, token, event secret)')
+        : warn(`gateway control settings incomplete - missing: ${missing.join(', ')}`),
+    );
+    const timeoutSet = (process.env['SIP_GATEWAY_TIMEOUT_MS'] ?? '').trim() !== '';
+    lines.push(
+      timeoutSet
+        ? ok('SIP_GATEWAY_TIMEOUT_MS: set')
+        : ok('SIP_GATEWAY_TIMEOUT_MS: not set (default 10000 ms)'),
+    );
+    lines.push(
+      warn('carrier values (SIP host, port, transport, codecs, CLI) live in deploy/sip/ on the VPS - never here'),
+    );
+    lines.push(
+      warn('CloudyVoice NOT verified: SIP registration + an approved test call are still required before live mode'),
+    );
+  }
+
   lines.push('\nOperating safeguards');
   lines.push(ok(`hard daily call ceiling: ${config.hardDailyCallLimit}`));
   lines.push(ok(`hard daily budget ceiling: ${config.hardDailyBudgetMinor} minor units`));

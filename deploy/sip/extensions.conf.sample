@@ -1,0 +1,58 @@
+; =====================================================================
+;  extensions.conf — TEMPLATE ONLY (Asterisk)
+;
+;  Shows the SHAPE of the call flow defined in deploy/sip/contract.md:
+;
+;    outbound  gateway originates -> callee answers -> GET answerUrl
+;               -> action=bridge : play greeting, hand media to the
+;                                  bridge process (WS to the backend)
+;               -> action=hangup : play greeting, hang up
+;    inbound   INVITE from DID   -> same answerUrl fetch (from/to query)
+;
+;  The exact media-handoff primitive (AGI/AMI/socket/originate app) is
+;  decided by the Phase-1 spike — mark it there. Nothing here invents a
+;  CloudyVoice behaviour; the fetch + JSON shapes are OUR contract.
+;
+;  CURL notes: asterisk performs plain HTTP GETs with -H headers; the
+;  response body is parsed with SET() + JSON_DECODE() (Asterisk 18+)
+;  or by the bridge process if the engine cannot parse JSON itself.
+; =====================================================================
+
+[cloudyvoice-outbound]
+; One dialplan entry per originated call (the bridge/AMI sets variables).
+exten => s,1,NoOp(UWS outbound call)
+ same => n,Answer()
+ same => n,Set(CHANNEL(hangup_on_congestion)=yes)
+ ; Fetch OUR answer decision (contract §2.1). callId comes from the
+ ; originate request; from/to are the call's own numbers.
+ same => n,Set(CDR(answerfetch)=${CURL(${GW_BACKEND_BASE_URL}/api/webhooks/telephony/gateway/answer?callId=${CALLID}&from=${FROMNUM}&to=${TONUM},H "Authorization: Bearer ${GW_API_TOKEN}")})
+ same => n,GotoIf($["${CDR(answerfetch)}" = ""]?fetch_failed)
+ ; TODO(spike): parse {"action":"bridge"|"hangup", "greeting":"..."}.
+ ; A minimal shape until the spike picks the parser:
+ same => n,Set(ACTION=${JSON_DECODE(${CDR(answerfetch)}.action)})
+ same => n,GotoIf($["${ACTION}" = "hangup"]?do_hangup)
+ ;
+ ; action = bridge  ------------------------------------------------
+ same => n,Verbose(1,UWS: bridging to gateway media WS)
+ ; TODO(spike): start the bridge process for this call (it opens
+ ; wss://.../api/gateway/media?callSid=...&token=... and pumps mu-law
+ ; frames). The greeting text is played through that same bridge so the
+ ; mandated AI disclosure is heard BEFORE any conversation turn.
+ ; same => n,Playback(uws-greeting)          ; pre-rendered GREETING_DUPLEX
+ ; same => n,Bridge(...)                     ; engine-specific handoff
+ same => n,Hangup()
+ ;
+ ; action = hangup / fetch failed ----------------------------------
+exten => s,n(fetch_failed),NoOp(UWS: answer fetch failed - honest hangup)
+exten => s,n(do_hangup),NoOp(UWS: fixed approved greeting, then hangup)
+ ; The greeting must contain the AI disclosure (GREETING_HANGUP). It is
+ ; served as TEXT by the backend; render to audio during onboarding —
+ ; never improvise a different message.
+ ; same => n,Playback(uws-hangup)
+ same => n,Hangup()
+
+[cloudyvoice-inbound]
+; DID invitations land here (only if a DID was provisioned — onboarding).
+exten => _+92XXXXXXXXX,1,NoOp(UWS inbound call)
+ same => n,Set(CALLID=gw-in-${UNIQUEID})
+ same => n,Goto(cloudyvoice-outbound,s,1)     ; same answer-fetch flow

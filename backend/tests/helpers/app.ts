@@ -13,6 +13,8 @@ import { openDatabase, type DB } from '../../src/db/index.ts';
 import { runMigrations } from '../../src/db/migrate.ts';
 import { createApp } from '../../src/server/app.ts';
 import { attachDuplexBridge, type DuplexBridge } from '../../src/server/duplex.ts';
+import { attachGatewayMediaBridge, type GatewayMediaBridge } from '../../src/server/gatewaymedia.ts';
+import { attachUpgradeFallback } from '../../src/server/upgrade.ts';
 import { createUser, login, type PublicUser } from '../../src/domain/auth/service.ts';
 import { buildRegistry, type AdapterRegistry, type AdapterUsageEvent } from '../../src/adapters/registry.ts';
 import { isIntegrationEnabled, recordAdapterUsage } from '../../src/domain/integrations/service.ts';
@@ -42,6 +44,8 @@ export interface TestServer {
   adapters: AdapterRegistry;
   /** The duplex media bridge attached to `server` (Twilio Media Streams). */
   duplex: DuplexBridge;
+  /** The SIP-gateway media bridge attached to `server` (/api/gateway/media). */
+  gatewayMedia: GatewayMediaBridge;
   close(): Promise<void>;
   client(): TestClient;
 }
@@ -93,6 +97,9 @@ export async function startTestServer(env: TestEnv = {}, opts: TestServerOptions
   // Same bridge production uses, so API tests can exercise a real WebSocket
   // media session end to end (with mock adapters — never a real network).
   const duplex = attachDuplexBridge(server, { config, db, logger, adapters });
+  const gatewayMedia = attachGatewayMediaBridge(server, { config, db, logger, adapters });
+  // Registered LAST so an unknown upgrade path still fails fast with a 404.
+  attachUpgradeFallback(server);
 
   return {
     config,
@@ -102,8 +109,9 @@ export async function startTestServer(env: TestEnv = {}, opts: TestServerOptions
     server,
     adapters,
     duplex,
+    gatewayMedia,
     async close() {
-      await duplex.close();
+      await Promise.all([duplex.close(), gatewayMedia.close()]);
       await new Promise<void>((resolve) => server.close(() => resolve()));
       db.close();
     },

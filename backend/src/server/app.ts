@@ -24,6 +24,7 @@ import { pipelineRoutes, followupRoutes } from '../http/routes/pipeline.routes.t
 import { duplicateRoutes } from '../http/routes/duplicates.routes.ts';
 import { outreachRoutes, portfolioRoutes } from '../http/routes/outreach.routes.ts';
 import { webhookRoutes } from '../http/routes/webhooks.routes.ts';
+import { gatewayRoutes } from '../http/routes/gateway.routes.ts';
 import { reportingRoutes } from '../http/routes/reporting.routes.ts';
 import { monitoringRoutes } from '../http/routes/monitoring.routes.ts';
 import { reviewRoutes } from '../http/routes/review.routes.ts';
@@ -164,6 +165,8 @@ export function createApp(deps: AppDeps): Express {
   app.use('/api', monitoringRoutes());
   // Provider callbacks: signature-authenticated, no session (see webhooks).
   app.use('/api/webhooks', webhookRoutes());
+  // CloudyVoice gateway callbacks: bearer/HMAC-authenticated, no session.
+  app.use('/api/webhooks', gatewayRoutes());
   // Phase 11B: opt-in unsuppression review (owner-only queue + decisions).
   app.use('/api/suppression', reviewRoutes(full));
   // Phase 11B: live media pipeline (conversation/segment ingestion, no dial).

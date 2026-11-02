@@ -20,6 +20,8 @@ import { buildRegistry, type AdapterUsageEvent } from '../adapters/registry.ts';
 import { isIntegrationEnabled, recordAdapterUsage } from '../domain/integrations/service.ts';
 import { createApp } from './app.ts';
 import { attachDuplexBridge, type DuplexBridge } from './duplex.ts';
+import { attachGatewayMediaBridge, type GatewayMediaBridge } from './gatewaymedia.ts';
+import { attachUpgradeFallback } from './upgrade.ts';
 import { registerReportingJobs } from '../jobs/reporting.ts';
 import { registerBackupJobs } from '../jobs/backup.ts';
 import { registerHealthJobs } from '../jobs/health.ts';
@@ -76,6 +78,11 @@ async function main(): Promise<void> {
   // the SAME HTTP server (the upgrade handler is registered before the port
   // can accept a connection). Rejects honestly when disabled or unconfigured.
   const duplex: DuplexBridge = attachDuplexBridge(server, { config, db, logger, adapters });
+  // CloudyVoice gateway bridge: SIP-delivered calls on /api/gateway/media.
+  // Same session core, different wire dialect (translated in gatewaymedia.ts).
+  const gatewayMedia: GatewayMediaBridge = attachGatewayMediaBridge(server, { config, db, logger, adapters });
+  // Registered LAST: 404s any WebSocket upgrade neither bridge claimed.
+  attachUpgradeFallback(server);
   server.on('error', (err: NodeJS.ErrnoException) => {
     if (err.code === 'EADDRINUSE') {
       process.stderr.write(
@@ -115,7 +122,7 @@ async function main(): Promise<void> {
   const shutdown = (signal: string): void => {
     logger.info('server.shutdown', { signal });
     scheduler.stop();
-    void duplex.close().finally(() => {
+    void Promise.all([duplex.close(), gatewayMedia.close()]).finally(() => {
       server.close(() => {
         db.close();
         process.exit(0);

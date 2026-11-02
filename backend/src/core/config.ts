@@ -79,6 +79,19 @@ const EnvSchema = z.object({
   TELEPHONY_AUTH_TOKEN: z.string().default(''),
   TELEPHONY_FROM_NUMBER: z.string().default(''),
 
+  // CloudyVoice SIP gateway bridge (carrier is SIP-only; see deploy/sip/).
+  // These describe OUR gateway process — never CloudyVoice itself. The carrier
+  // hostname/port/transport/credentials live ONLY in the gateway's own config
+  // on the VPS, never in this process. Values are never logged or echoed.
+  /** Absolute http(s) base URL of the gateway control API. */
+  SIP_GATEWAY_BASE_URL: z.string().default(''),
+  /** Bearer token this backend presents to the gateway (outbound control). */
+  SIP_GATEWAY_API_TOKEN: z.string().default(''),
+  /** HMAC secret the gateway signs its inbound lifecycle events with. */
+  SIP_GATEWAY_EVENT_SECRET: z.string().default(''),
+  /** Per-request timeout for gateway control calls (ms). */
+  SIP_GATEWAY_TIMEOUT_MS: intIn(500, 60_000).default(10_000),
+
   WHATSAPP_PROVIDER: z.string().default(''),
   WHATSAPP_PHONE_NUMBER_ID: z.string().default(''),
   WHATSAPP_ACCESS_TOKEN: z.string().default(''),
@@ -249,6 +262,12 @@ export function loadConfig(env: Env = process.env): Config {
     throw new Error('PUBLIC_BASE_URL must be a valid http(s) URL');
   }
 
+  // A gateway URL that is set but malformed fails fast here rather than at the
+  // first dial (where it would surface as a confusing network error).
+  if (e.SIP_GATEWAY_BASE_URL.trim() !== '' && !isUrl(e.SIP_GATEWAY_BASE_URL.trim())) {
+    throw new Error('SIP_GATEWAY_BASE_URL must be a valid http(s) URL');
+  }
+
   let sessionSecret = e.SESSION_SECRET.trim();
   let ephemeral = false;
   if (sessionSecret === '') {
@@ -265,13 +284,33 @@ export function loadConfig(env: Env = process.env): Config {
   }
 
   const providers: ProviderStatus[] = [
+    // Telephony requirements are PROVIDER-aware: CloudyVoice is a SIP carrier
+    // reached through OUR gateway, so it needs gateway control settings instead
+    // of Twilio's account SID/token. Reporting Twilio's names here would list a
+    // perfectly functional gateway setup as permanently `partial`.
     providerStatus(
       'telephony',
       'Telephony (calls)',
       env,
-      ['TELEPHONY_PROVIDER', 'TELEPHONY_ACCOUNT_SID', 'TELEPHONY_AUTH_TOKEN', 'TELEPHONY_FROM_NUMBER'],
-      ['outbound calls', 'call status events', 'recording (if enabled)'],
-      ['Provider account approved for voice', 'valid credentials in .env'],
+      (env['TELEPHONY_PROVIDER'] ?? '').trim().toLowerCase() === 'cloudyvoice'
+        ? [
+            'TELEPHONY_PROVIDER',
+            'TELEPHONY_FROM_NUMBER',
+            'SIP_GATEWAY_BASE_URL',
+            'SIP_GATEWAY_API_TOKEN',
+            'SIP_GATEWAY_EVENT_SECRET',
+          ]
+        : ['TELEPHONY_PROVIDER', 'TELEPHONY_ACCOUNT_SID', 'TELEPHONY_AUTH_TOKEN', 'TELEPHONY_FROM_NUMBER'],
+      (env['TELEPHONY_PROVIDER'] ?? '').trim().toLowerCase() === 'cloudyvoice'
+        ? ['outbound calls via SIP gateway', 'call status events', 'media bridge (duplex)']
+        : ['outbound calls', 'call status events', 'recording (if enabled)'],
+      (env['TELEPHONY_PROVIDER'] ?? '').trim().toLowerCase() === 'cloudyvoice'
+        ? [
+            'SIP gateway service running on the VPS',
+            'SIP_GATEWAY_* values in .env (never the carrier credentials)',
+            'CloudyVoice account: SIP registration verified + approved test call',
+          ]
+        : ['Provider account approved for voice', 'valid credentials in .env'],
     ),
     providerStatus(
       'whatsapp',

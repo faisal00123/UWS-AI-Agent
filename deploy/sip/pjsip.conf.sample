@@ -1,0 +1,60 @@
+; =====================================================================
+;  pjsip.conf — TEMPLATE ONLY (Asterisk)
+;
+;  Every REPLACE_WITH_* value comes from CloudyVoice onboarding paperwork
+;  or the Phase-1 spike. Nothing here is a real carrier value, and this
+;  file is never loaded as-is: copy on the VPS, fill, then include it.
+;
+;  Engine choice (Asterisk vs FreeSWITCH) is decided by the Phase-1
+;  loopback spike — this sample exists to show the SHAPE of the config,
+;  which is the same either way (transport + auth + aor + endpoint).
+; =====================================================================
+
+[transport-udp]
+type = transport
+protocol = udp
+bind = 0.0.0.0:REPLACE_WITH_SIP_PORT          ; carrier-approved SIP port (5060 CONFIRM)
+; local_net / external_media_address to be set for NAT:
+; local_net = 127.0.0.1/32,REPLACE_WITH_PRIVATE_SUBNET
+; external_media_address = REPLACE_WITH_PUBLIC_IP
+
+; Optional TLS transport — only if the carrier onboarding says TLS.
+; [transport-tls]
+; type = transport
+; protocol = tls
+; bind = 0.0.0.0:REPLACE_WITH_SIPS_PORT
+; cert_file = /etc/asterisk/keys/fullchain.pem
+; priv_key_file = /etc/asterisk/keys/privkey.pem
+
+[cloudyvoice-auth]
+type = auth
+auth = userpass                                ; or 'ip' if the carrier allowlists our static IP
+username = REPLACE_WITH_SIP_USERNAME
+password = REPLACE_WITH_SIP_PASSWORD
+; realm = REPLACE_WITH_CARRIER_REALM            ; only if the carrier specifies one
+
+[cloudyvoice-aor]
+type = aor
+contact = sip:REPLACE_WITH_CARRIER_SIP_HOST:REPLACE_WITH_CARRIER_SIP_PORT
+; qualify_frequency = 60                       ; OPTIONS keepalive, if desired
+
+[cloudyvoice-endpoint]
+type = endpoint
+context = cloudyvoice-outbound                 ; see extensions.conf.sample
+disallow = all
+; Only codecs the carrier confirmed for our account — CONFIRMED DURING
+; ONBOARDING, never assumed. The backend requires mu-law 8 kHz on the
+; bridged leg, so mu-law must be in this list:
+allow = alaw
+allow = ulaw
+; allow = REPLACE_WITH_CARRIER_APPROVED_CODEC
+dtmf_mode = rfc2833                            ; CONFIRM with carrier (rfc2833|info|inband)
+direct_media = no
+rtp_symmetric = yes
+force_rport = yes
+rewrite_contact = yes
+from_user = REPLACE_WITH_SIP_USERNAME
+from_domain = REPLACE_WITH_CARRIER_SIP_HOST
+callerid = REPLACE_WITH_CLI_APPROVED_E164      ; must be CLI-approved before any live dial
+auth = cloudyvoice-auth
+aors = cloudyvoice-aor

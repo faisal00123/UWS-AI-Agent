@@ -20,10 +20,10 @@
  * drives the SAME conversation lifecycle as the HTTP media seam.
  */
 import type { Server } from 'node:http';
-import type { Duplex } from 'node:stream';
 import { WebSocketServer, type WebSocket } from 'ws';
 import type { AppDeps } from '../http/types.ts';
 import { createDuplexSession, duplexPorts, verifyStreamToken, type DuplexSession } from '../domain/media/duplex.ts';
+import { rejectUpgrade, markUpgradeClaimed } from './upgrade.ts';
 
 export const DUPLEX_PATH = '/api/media';
 
@@ -31,12 +31,6 @@ export interface DuplexBridge {
   /** Terminate every live stream (used on shutdown and by test teardown). */
   close(): Promise<void>;
   readonly activeSessions: number;
-}
-
-function rejectUpgrade(socket: Duplex, status: number, reason: string): void {
-  if (socket.destroyed) return;
-  socket.write(`HTTP/1.1 ${status} ${reason}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
-  socket.end();
 }
 
 export function attachDuplexBridge(server: Server, deps: AppDeps): DuplexBridge {
@@ -53,9 +47,10 @@ export function attachDuplexBridge(server: Server, deps: AppDeps): DuplexBridge 
       return;
     }
     if (url.pathname !== DUPLEX_PATH) {
-      rejectUpgrade(socket, 404, 'Not Found');
+      // Not our path: another bridge (or the fallback) answers this upgrade.
       return;
     }
+    markUpgradeClaimed(req);
 
     const fail = (status: number, reason: string): void => {
       logger.debug('duplex.upgrade_rejected', { status, reason });

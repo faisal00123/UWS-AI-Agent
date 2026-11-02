@@ -32,6 +32,7 @@
  * no route can accidentally serialize a token by rendering config.
  */
 import type { Config } from '../core/config.ts';
+import { createHmac, timingSafeEqual } from 'node:crypto';
 import {
   AdapterError,
   type AdapterStatus,
@@ -109,8 +110,25 @@ export interface AdapterRegistry {
   verifyWhatsAppSignature(rawBody: Buffer, signature: string | null): boolean;
   /** Meta webhook subscription challenge token, or null. */
   whatsappVerifyToken: string | null;
-  /** TwiML answer URL for outbound calls, or null when telephony is absent. */
+  /** Answer URL for outbound calls, or null when telephony is absent. */
   voiceAnswerUrl: string | null;
+  /**
+   * Provider-specific status-callback URL for outbound calls (Twilio's signed
+   * webhook, or our gateway's signed event endpoint). Null when telephony is
+   * absent — the domain must never hardcode a vendor path.
+   */
+  voiceStatusUrl: string | null;
+  /**
+   * Bearer-token check for the gateway -> backend answer fetch. False unless
+   * the gateway provider is selected AND `SIP_GATEWAY_API_TOKEN` is set, so an
+   * unconfigured or Twilio-mode instance never accepts gateway traffic.
+   */
+  verifyGatewayControlAuth(header: string | null): boolean;
+  /**
+   * HMAC-SHA256(raw body, SIP_GATEWAY_EVENT_SECRET) check for gateway lifecycle
+   * events. False unless the gateway provider is selected AND the secret is set.
+   */
+  verifyGatewayEventSignature(rawBody: Buffer | undefined, signature: string | null): boolean;
   /** Template + language used for portfolio shares. */
   portfolioTemplate: { name: string; language: string } | null;
 }
@@ -216,6 +234,10 @@ export function buildRegistry(cfg: Config, env: Env = process.env, opts: BuildRe
 
   // ---------------------------------------------------------- telephony ----
   const rawTelephony = createTelephonyAdapter(env, f ? { fetchImpl: f } : {});
+  // Which transport serves outbound calls? true (CloudyVoice SIP via our
+  // gateway) picks OUR webhook paths; everything else keeps Twilio's exactly as
+  // before, so a Twilio deployment sees byte-identical URLs.
+  const isGateway = pick(env, 'TELEPHONY_PROVIDER').trim().toLowerCase() === 'cloudyvoice';
   const telephony: TelephonyPort | null = rawTelephony
     ? {
         key: rawTelephony.key,
@@ -402,7 +424,28 @@ export function buildRegistry(cfg: Config, env: Env = process.env, opts: BuildRe
 
     whatsappVerifyToken: pick(env, 'WHATSAPP_WEBHOOK_VERIFY_TOKEN') || null,
 
-    voiceAnswerUrl: rawTelephony ? `${cfg.publicBaseUrl}/api/webhooks/telephony/twilio/voice` : null,
+    voiceAnswerUrl: rawTelephony
+      ? `${cfg.publicBaseUrl}${isGateway ? '/api/webhooks/telephony/gateway/answer' : '/api/webhooks/telephony/twilio/voice'}`
+      : null,
+
+    voiceStatusUrl: rawTelephony
+      ? `${cfg.publicBaseUrl}${isGateway ? '/api/webhooks/telephony/gateway/events' : '/api/webhooks/telephony/twilio'}`
+      : null,
+
+    verifyGatewayControlAuth(header): boolean {
+      if (!isGateway || !rawTelephony) return false;
+      const token = pick(env, 'SIP_GATEWAY_API_TOKEN');
+      if (!token || !header) return false;
+      return timingSafeStringEqual(header.trim(), `Bearer ${token}`);
+    },
+
+    verifyGatewayEventSignature(rawBody, signature): boolean {
+      if (!isGateway || !rawTelephony) return false;
+      const secret = pick(env, 'SIP_GATEWAY_EVENT_SECRET');
+      if (!secret || !rawBody || !signature) return false;
+      const expected = createHmac('sha256', secret).update(rawBody).digest('hex');
+      return timingSafeStringEqual(signature.trim().toLowerCase(), expected);
+    },
 
     portfolioTemplate:
       rawWhatsapp && pick(env, 'WHATSAPP_TEMPLATE_NAME_PORTFOLIO')
@@ -414,6 +457,19 @@ export function buildRegistry(cfg: Config, env: Env = process.env, opts: BuildRe
   };
 
   return registry;
+}
+
+/**
+ * Constant-time comparison for gateway control/event secrets. Length is
+ * compared first (timingSafeEqual requires equal lengths) but only after both
+ * strings are known to be non-empty, so an attacker learns nothing from it.
+ */
+function timingSafeStringEqual(a: string, b: string): boolean {
+  if (a.length === 0 || b.length === 0) return false;
+  const bufA = Buffer.from(a, 'utf8');
+  const bufB = Buffer.from(b, 'utf8');
+  if (bufA.length !== bufB.length) return false;
+  return timingSafeEqual(bufA, bufB);
 }
 
 /** Report 'disabled' in the status when the toggle is off (regardless of config). */

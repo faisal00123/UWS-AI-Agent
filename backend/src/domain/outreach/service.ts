@@ -53,8 +53,16 @@ export interface OutreachAdapters {
   whatsapp: WhatsAppPort | null;
   /** Approved Meta template used for portfolio shares (null when unset). */
   portfolioTemplate: { name: string; language: string } | null;
-  /** Public TwiML answer URL for outbound calls (null when telephony absent). */
+  /** Public answer URL for outbound calls (null when telephony absent). */
   voiceAnswerUrl: string | null;
+  /**
+   * Provider-specific status-callback URL (Twilio's signed webhook, or the
+   * gateway's signed event endpoint). Supplied by the registry so the domain
+   * never hardcodes a vendor path. Optional only for hand-built adapter maps;
+   * when absent the historical Twilio path is used as a compatibility
+   * fallback, which is exactly what the registry would have provided anyway.
+   */
+  voiceStatusUrl?: string | null;
 }
 
 export interface OutreachActor {
@@ -367,6 +375,10 @@ export async function placeCall(db: DB, cfg: Config, input: PlaceCallInput): Pro
   // ------------------------------- live ------------------------------------
   const telephony = input.adapters?.telephony ?? null;
   const answerUrl = input.adapters?.voiceAnswerUrl ?? null;
+  // Provider-driven (registry) with a Twilio-path compatibility fallback for
+  // hand-built adapter maps — never a vendor path invented by this layer.
+  const statusUrl =
+    input.adapters?.voiceStatusUrl ?? `${cfg.publicBaseUrl}/api/webhooks/telephony/twilio`;
   if (!telephony || !answerUrl) {
     // Config claims telephony is configured but no adapter is installed: the
     // counter is refunded and the request ledgerved as blocked. Nothing dialled.
@@ -421,7 +433,7 @@ export async function placeCall(db: DB, cfg: Config, input: PlaceCallInput): Pro
     const res = await telephony.createCall({
       to: lead.phone_e164 as string,
       answerUrl,
-      statusCallbackUrl: `${cfg.publicBaseUrl}/api/webhooks/telephony/twilio`,
+      statusCallbackUrl: statusUrl,
       metadata: { businessId: lead.id, attemptId: attempt.id },
     });
     return tx(db, (): PlaceCallResult => {

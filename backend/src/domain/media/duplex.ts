@@ -95,13 +95,18 @@ function escapeXml(value: string): string {
   return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
-/** `https://host` -> `wss://host` (Twilio refuses ws:// in production). */
-export function streamWsUrl(publicBaseUrl: string, callSid: string, token: string): string {
+/**
+ * `https://host` -> `wss://host` (Twilio refuses ws:// in production).
+ *
+ * `path` selects the media endpoint: Twilio's `/api/media` by default, or the
+ * gateway bridge's `/api/gateway/media` for SIP-delivered calls.
+ */
+export function streamWsUrl(publicBaseUrl: string, callSid: string, token: string, path = '/api/media'): string {
   const wsBase = publicBaseUrl
     .replace(/\/+$/, '')
     .replace(/^http:\/\//i, 'ws://')
     .replace(/^https:\/\//i, 'wss://');
-  return `${wsBase}/api/media?callSid=${encodeURIComponent(callSid)}&token=${encodeURIComponent(token)}`;
+  return `${wsBase}${path}?callSid=${encodeURIComponent(callSid)}&token=${encodeURIComponent(token)}`;
 }
 
 /**
@@ -150,7 +155,7 @@ function digitsOnly(value: string): string {
  */
 export function resolveCallForAnswer(
   db: DB,
-  input: { callSid: string; from?: string | null; to?: string | null },
+  input: { callSid: string; from?: string | null; to?: string | null; provider?: string },
 ): ResolvedCall | null {
   const existing = db
     .prepare('SELECT id, business_id FROM calls WHERE provider_call_id = ?')
@@ -171,6 +176,9 @@ export function resolveCallForAnswer(
     .get(`+${digits}`, digits) as { id: string } | undefined;
   if (!lead) return null;
 
+  // The provider that carried this answer (default keeps Twilio's historical
+  // value byte-identical; the gateway answer route passes 'cloudyvoice').
+  const provider = (input.provider ?? 'twilio').trim() || 'twilio';
   const at = nowIso();
   const id = newId('cal');
   try {
@@ -178,9 +186,9 @@ export function resolveCallForAnswer(
       `INSERT INTO calls (id, attempt_id, business_id, direction, channel, provider, provider_call_id, status,
          outcome, to_number_e164, recording_enabled, recording_consent, started_at, answered_at, simulation,
          counts_against_daily_limit, daily_bucket, cost_state, created_at, updated_at)
-       VALUES (?, NULL, ?, 'inbound', 'call', 'twilio', ?, 'in_progress', 'answered', ?, 0, 0, ?, ?, 0, 0, NULL,
+       VALUES (?, NULL, ?, 'inbound', 'call', ?, ?, 'in_progress', 'answered', ?, 0, 0, ?, ?, 0, 0, NULL,
          'unavailable', ?, ?)`,
-    ).run(id, lead.id, input.callSid, from, at, at, at, at);
+    ).run(id, lead.id, provider, input.callSid, from, at, at, at, at);
   } catch {
     // A racing status callback already registered this call — read it back.
     const raced = db

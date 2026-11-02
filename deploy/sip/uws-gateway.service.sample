@@ -1,0 +1,47 @@
+# =====================================================================
+#  uws-gateway.service — TEMPLATE ONLY (systemd unit for the VPS)
+#
+#  Copy to /etc/systemd/system/uws-gateway.service, adjust the paths and
+#  user, then:  sudo systemctl daemon-reload && sudo systemctl enable --now uws-gateway
+#
+#  The gateway bridge process itself is produced by the Phase-1 spike
+#  (its entrypoint name below is a placeholder: REPLACE_WITH_BRIDGE_CMD).
+# =====================================================================
+
+[Unit]
+Description=UWS SIP gateway bridge (CloudyVoice carrier link)
+After=network-online.target
+Wants=network-online.target
+; If the engine runs on the same host, start after it:
+; After=asterisk.service
+; Requires=asterisk.service
+
+[Service]
+Type=simple
+User=uws
+Group=uws
+WorkingDirectory=/opt/uws-gateway
+; Secrets file — chmod 600, owner uws, NEVER committed:
+EnvironmentFile=/opt/uws-gateway/gateway.env
+ExecStart=REPLACE_WITH_BRIDGE_CMD          ; e.g. node dist/bridge.js (spike decides)
+Restart=on-failure
+RestartSec=5
+
+# Hardening: the bridge needs only outbound HTTP(S) to the backend, its
+# own loopback control port, and SIP/RTP sockets via the engine.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/uws-gateway
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+
+# Never log secrets: journald receives stdout/stderr only, and the bridge
+# contract forbids printing tokens (they are redacted at the source).
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=uws-gateway
+
+[Install]
+WantedBy=multi-user.target

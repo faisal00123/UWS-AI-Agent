@@ -1,0 +1,16 @@
+; =====================================================================
+;  rtp.conf — TEMPLATE ONLY (Asterisk)
+;
+;  The port range must be:
+;    1. confirmed against the carrier's allowed RTP range (onboarding),
+;    2. opened in the VPS firewall for the CARRIER PEER IPs ONLY,
+;    3. identical to GW_RTP_START / GW_RTP_END in gateway.env.
+;  Nothing below is a real value until an admin fills it in.
+; =====================================================================
+
+[general]
+rtpstart = 10000                               ; CONFIRM range with carrier
+rtpend = 10127                                 ; 128 ports ≈ 64 concurrent calls
+; rtcpenable = yes
+; ice support only if the carrier requires it (CONFIRM):
+; ice_support = yes
