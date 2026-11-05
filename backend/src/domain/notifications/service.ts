@@ -33,6 +33,15 @@ export interface NotificationDestinations {
   whatsapp: string;
 }
 
+/**
+ * Where email notifications go: the dashboard setting wins; the
+ * `NOTIFY_OWNER_EMAIL` environment variable is the fallback, so a fresh
+ * install can deliver owner notifications without a settings round-trip.
+ */
+function emailDestination(d: NotificationDestinations, cfg: Config): string {
+  return d.email.trim() || cfg.notifyOwnerEmail.trim();
+}
+
 export interface NotifyInput {
   kind: string;
   severity?: NotificationSeverity;
@@ -61,7 +70,7 @@ export function resolveDestinations(db: DB, cfg: Config): NotificationChannel[] 
   const d = getSetting<NotificationDestinations>(db, 'notification_destinations', cfg);
   const channels: NotificationChannel[] = [];
   if (d.dashboard) channels.push('in_app');
-  if (d.email) channels.push('email');
+  if (emailDestination(d, cfg)) channels.push('email');
   if (d.whatsapp) channels.push('whatsapp');
   if (channels.length === 0) channels.push('in_app');
   return channels;
@@ -154,10 +163,13 @@ export async function deliverPendingNotifications(
       result.skipped += 1;
       continue;
     }
-    const dest = getSetting<NotificationDestinations>(db, 'notification_destinations', cfg).email;
+    const dest = emailDestination(
+      getSetting<NotificationDestinations>(db, 'notification_destinations', cfg),
+      cfg,
+    );
     if (!dest) {
       db.prepare(`UPDATE notifications SET status = 'skipped', status_source = 'none', error_detail = ? WHERE id = ?`).run(
-        'No notification email address is configured (notification_destinations.email).',
+        'No notification email address is configured (notification_destinations.email or NOTIFY_OWNER_EMAIL).',
         row.id,
       );
       result.skipped += 1;

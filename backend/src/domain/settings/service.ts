@@ -140,7 +140,8 @@ export const SETTING_DEFINITIONS: SettingDefinition[] = [
   {
     key: 'notification_destinations',
     label: 'Notification destinations',
-    description: 'Where dashboard/email/WhatsApp notifications are delivered.',
+    description:
+      'Where dashboard/email/WhatsApp notifications are delivered. Email falls back to the NOTIFY_OWNER_EMAIL environment variable when empty.',
     schema: z.object({
       dashboard: z.boolean(),
       email: z.string().email().or(z.literal('')),

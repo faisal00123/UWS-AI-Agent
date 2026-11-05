@@ -115,6 +115,33 @@ change to the two-host deploy above:
   the previous two-host behaviour byte-for-byte (tests assert the historical
   webhook URLs are unchanged).
 
+## Hosting options compared (persistence, scheduler, WebSockets)
+
+What the backend actually requires of a host:
+
+| Requirement | Why |
+|---|---|
+| Long-running Node 24 process | Express API + in-process job scheduler (reports, backups, health probes) — **not** serverless-friendly (a FaaS instance freezes between invocations; scheduled jobs and the duplex WebSocket `/api/media` bridge would break) |
+| Durable disk | SQLite (`node:sqlite`) is a **single file** (`DATABASE_PATH`); it must sit on a persistent volume, never an ephemeral container filesystem. Single-writer is fine at this workload; nightly verified backups already run in-app |
+| WebSocket + long-lived connections | Duplex call bridge (`ws`) and Twilio/gateway media streams need a host that proxies WS upgrades with generous idle timeouts |
+| Public HTTPS origin | Meta webhook callbacks + Twilio signatures validate absolute URLs (`PUBLIC_BASE_URL`) |
+| PostgreSQL | **Not supported today.** The app is SQLite-only by explicit architecture decision (`docs/architecture.md`); a PG switch is an owner-level project (driver + `DATABASE_URL` wiring), not a hosting checkbox |
+
+| Option | Fits? | Cost | Notes |
+|---|---|---|---|
+| **Railway** (documented path) | ✅ | ~$5–15/mo usage-based | Volume at `/app/data` for SQLite, WS works, Nixpacks config already in `railway.json`, health check wired. Requires a payment method. **Recommended first deployment** — zero ops for the owner |
+| **Small VPS** (Hetzner CX22 / DigitalOcean ~$6/mo) | ✅ | ~$6/mo | Full control: systemd unit, Caddy for auto-TLS, SQLite on local disk, WS native. Best long-term value and **the same machine can later host the CloudyVoice SIP gateway** (Asterisk/FreeSWITCH), removing a whole network hop. Costs: you own OS updates, TLS renewal, backup cron (the app's own `npm run backup` covers app data) |
+| Render / Fly.io / Railway-like PaaS | ✅ (paid tiers) | $7+/mo | Render's **free tier sleeps** — avoid it (scheduler + WS need always-on). Fly SQLite volumes work but pricing/regions changed often |
+| Oracle Cloud free tier ARM VM | ✅ | $0 | Generous free ARM instance; harder support story, but viable for a budget-conscious always-on host |
+| Vercel (backend) / serverless | ❌ | — | Ephemeral filesystem (no SQLite), no always-on scheduler, WS not supported — Vercel remains the **frontend** host only |
+
+**Recommendation:** deploy as documented (Railway backend + Vercel frontend) for the
+first live cut; when CloudyVoice onboarding reaches the gateway phase, migrate the
+backend onto the same VPS as the SIP engine (one `systemd` unit + Caddy, SQLite on
+disk, `npm run backup` scheduled) — fewer moving parts and lower cost than running
+two separate hosts. PostgreSQL only becomes relevant if the owner later decides to
+port the data layer; no hosting choice made today blocks that decision.
+
 ## Why deployment is currently blocked (honest status)
 
 Verified in this environment, never worked around:

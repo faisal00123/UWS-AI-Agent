@@ -496,6 +496,32 @@ describe('notifications', () => {
     assert.ok(row?.errorDetail?.includes('SMTP is not configured'));
   });
 
+  test('NOTIFY_OWNER_EMAIL delivers when the destination setting is empty, and the setting wins when set', async () => {
+    const cfg = loadConfig({ ...TEST_ENV, NOTIFY_OWNER_EMAIL: 'fallback@uws.test' });
+    const db = openDatabase(':memory:');
+    runMigrations(db);
+
+    // Env fallback alone: the email channel opens and delivery uses it.
+    const out = notify(db, cfg, { kind: 'test', title: 'Fallback', body: 'x', dedupeKey: 'fb:1' });
+    assert.equal(out.created.length, 2, 'in_app + email fan-out opens via NOTIFY_OWNER_EMAIL');
+    const fake = fakeEmailPort();
+    const res = await deliverPendingNotifications(db, cfg, { email: fake.port });
+    assert.equal(res.sent, 1);
+    assert.equal(fake.sent[0]?.to, 'fallback@uws.test');
+
+    // The dashboard setting takes priority over the env fallback.
+    updateSettings(
+      db,
+      cfg,
+      { notification_destinations: { dashboard: true, email: 'owner@uws.test', whatsapp: '' } },
+      owner,
+    );
+    notify(db, cfg, { kind: 'test', title: 'Setting wins', body: 'x', dedupeKey: 'fb:2' });
+    const res2 = await deliverPendingNotifications(db, cfg, { email: fake.port });
+    assert.equal(res2.sent, 1);
+    assert.equal(fake.sent[fake.sent.length - 1]?.to, 'owner@uws.test');
+  });
+
   test('marking read preserves delivery state and tracks unread counts', () => {
     const { db, cfg } = freshDb();
     updateSettings(

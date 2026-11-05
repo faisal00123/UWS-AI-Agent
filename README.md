@@ -55,6 +55,27 @@ printed URL.
 | `npm run doctor` | Environment / DB / provider / safeguard health report |
 | `npm run backup` | Take a (verified, optionally encrypted) backup now |
 | `npm run restore` | Restore a backup (writes a copy, or `--apply` to swap) |
+| `npm run seed:demo` | Insert 5 clearly-labelled demo leads (idempotent, no outreach) |
+
+### Safe usage — `npm run seed:demo`
+
+Inserts five clearly-labelled demo leads (Pakistani business names, each on its
+own `example.com` subdomain) so the dashboard can be explored without touching
+real prospects.
+
+- **Local/dev databases only.** Demo rows are real rows in `businesses`
+  (`source_type = manual`, created by the `system` actor) — do not run it
+  against a database whose leads must stay real.
+- **Idempotent.** Re-running skips leads that already exist by name, so a
+  double-run is safe.
+- **No outreach, no mode change.** Seeding only writes `businesses` rows — it
+  never calls a provider, never sends anything, and leaves `OPERATING_MODE`
+  exactly as it was (`simulation` stays `simulation`).
+- **Migrations are applied first** (same as `npm run migrate`); an owner
+  account from `npm run setup` is not required.
+- **Easy to recognise later:** every demo site lives under `example.com`.
+- **Try it without touching your data:** point it at a scratch database first,
+  e.g. PowerShell: `$env:DATABASE_PATH = "$env:TEMP\uws-demo.sqlite"; npm run seed:demo`.
 
 ---
 

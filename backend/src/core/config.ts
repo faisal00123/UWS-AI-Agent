@@ -217,6 +217,11 @@ export interface Config {
   /** Adapter resilience settings: retry attempts + per-minute rate limit. */
   adapter: { retryAttempts: number; ratePerMinute: number };
   bootstrapOwner: { email: string; password: string };
+  /**
+   * Fallback destination for owner notifications, used when the
+   * `notification_destinations.email` setting is empty. Never a secret.
+   */
+  notifyOwnerEmail: string;
   /** true when the session secret was generated for this process only. */
   ephemeralSessionSecret: boolean;
 }
@@ -431,6 +436,7 @@ export function loadConfig(env: Env = process.env): Config {
     },
     adapter: { retryAttempts: e.ADAPTER_RETRY_ATTEMPTS, ratePerMinute: e.ADAPTER_RATE_LIMIT_PER_MIN },
     bootstrapOwner: { email: e.OWNER_EMAIL, password: e.OWNER_PASSWORD },
+    notifyOwnerEmail: e.NOTIFY_OWNER_EMAIL.trim(),
     ephemeralSessionSecret: ephemeral,
   };
 }
