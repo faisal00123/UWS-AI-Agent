@@ -70,7 +70,7 @@ export const config = {
 
   rewrites: [
     // The API (and webhooks, and probes) live on the backend.
-    { source: '/api/:path*', destination: `${backendOrigin}/api/:path*` },
+    { source: '/api/:path*', destination: 'https://uws-ai-agent-backend.onrender.com/api/:path*' },
   ],
 
   headers: [
