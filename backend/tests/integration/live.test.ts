@@ -44,17 +44,31 @@ const LIVE_ENV = {
   WHATSAPP_APP_SECRET: 'live-app-secret',
   WHATSAPP_WEBHOOK_VERIFY_TOKEN: 'live-verify',
   WHATSAPP_TEMPLATE_NAME_PORTFOLIO: 'portfolio_v1',
+  WHATSAPP_TEMPLATE_LANGUAGE: 'en_US',
+  WHATSAPP_BUSINESS_ACCOUNT_ID: '555666',
   PUBLIC_BASE_URL: 'https://uws.example',
 };
 
+interface FakeRoute {
+  /** Substring or regex matched against the request URL. First match wins. */
+  match: string | RegExp;
+  status?: number;
+  body?: unknown;
+}
+
 function fakeFetch(
-  reply: { status?: number; body?: unknown },
+  reply: { status?: number; body?: unknown; routes?: FakeRoute[] },
 ): { fetchImpl: FetchLike; calls: { url: string; init: RequestInit }[] } {
   const calls: { url: string; init: RequestInit }[] = [];
   const fetchImpl: FetchLike = async (url, init) => {
-    calls.push({ url, init });
-    return new Response(JSON.stringify(reply.body ?? {}), {
-      status: reply.status ?? 200,
+    const u = String(url);
+    calls.push({ url: u, init });
+    const route = reply.routes?.find((r) =>
+      typeof r.match === 'string' ? u.includes(r.match) : r.match.test(u),
+    );
+    const chosen = route ?? reply;
+    return new Response(JSON.stringify(chosen.body ?? {}), {
+      status: chosen.status ?? 200,
       headers: { 'content-type': 'application/json' },
     });
   };
@@ -286,7 +300,17 @@ describe('live mode execution', () => {
     verifyPortfolioItem(db, item.id, true, 'verified live');
     approvePortfolioItem(db, item.id, true);
 
-    fetchState = fakeFetch({ body: { messages: [{ id: 'wamid.LIVE1' }] } });
+    // Two calls now: (1) the read-only approval GET against the WABA's
+    // message_templates, then (2) the actual template send — in that order.
+    fetchState = fakeFetch({
+      routes: [
+        {
+          match: '/message_templates',
+          body: { data: [{ name: 'portfolio_v1', status: 'APPROVED', language: 'en_US' }] },
+        },
+        { match: '/messages', body: { messages: [{ id: 'wamid.LIVE1' }] } },
+      ],
+    });
     const registry = buildRegistry(cfg, LIVE_ENV, { fetchImpl: fetchState.fetchImpl });
     const waAdapters: OutreachAdapters = {
       telephony: null,
@@ -301,10 +325,15 @@ describe('live mode execution', () => {
     assert.ok(result.decision === 'allowed' && result.simulated === false);
     assert.equal(result.provider, 'whatsapp_cloud');
 
-    assert.equal(fetchState.calls.length, 1);
-    const call = fetchState.calls[0]!;
-    assert.ok(call.url.includes('/v20.0/998877/messages'));
-    const sent = JSON.parse(String(call.init.body)) as {
+    assert.equal(fetchState.calls.length, 2, 'approval check first, send second');
+    const [approvalCall, sendCall] = fetchState.calls;
+    // (1) read-only approval verification against the CORRECT WABA.
+    assert.equal(String(approvalCall!.init.method ?? '').toUpperCase(), 'GET');
+    assert.ok(approvalCall!.url.includes('/v20.0/555666/message_templates'), approvalCall!.url);
+    // (2) the template send itself.
+    assert.equal(String(sendCall!.init.method ?? '').toUpperCase(), 'POST');
+    assert.ok(sendCall!.url.includes('/v20.0/998877/messages'));
+    const sent = JSON.parse(String(sendCall!.init.body)) as {
       type: string;
       template: { name: string; components: { parameters: { text: string }[] }[] };
     };
@@ -329,6 +358,100 @@ describe('live mode execution', () => {
     assert.equal(row.status_source, 'provider_event');
     assert.equal(row.template_key, 'portfolio_v1');
     assert.equal(row.simulation, 0);
+  });
+
+  test('a PENDING template blocks the send before any counter is spent', async () => {
+    const biz = makeLead('03001110007');
+    consentTo(biz);
+    const item = createPortfolioItem(db, { title: 'Dentist website', url: 'https://example.com/dentist' });
+    verifyPortfolioItem(db, item.id, true, 'verified live');
+    approvePortfolioItem(db, item.id, true);
+
+    fetchState = fakeFetch({
+      routes: [
+        {
+          match: '/message_templates',
+          body: { data: [{ name: 'portfolio_v1', status: 'PENDING', language: 'en_US' }] },
+        },
+        { match: '/messages', body: { messages: [{ id: 'wamid.MUST_NOT_HAPPEN' }] } },
+      ],
+    });
+    const registry = buildRegistry(cfg, LIVE_ENV, { fetchImpl: fetchState.fetchImpl });
+    const waAdapters: OutreachAdapters = {
+      telephony: null,
+      whatsapp: registry.whatsapp,
+      portfolioTemplate: registry.portfolioTemplate,
+      voiceAnswerUrl: null,
+    };
+
+    const dayKey = businessDayKey(cfg, new Date());
+    const usedBefore = usageSnapshot(db, dayKey, 'whatsapp_messages', 100).used;
+    const messagesBefore = (db.prepare('SELECT COUNT(*) AS n FROM messages').get() as { n: number }).n;
+
+    const result = await sharePortfolio(db, cfg, { businessId: biz, actor: owner, adapters: waAdapters });
+
+    assert.equal(result.decision, 'blocked');
+    assert.equal(result.attempt.blockedCode, 'template_not_approved');
+    assert.ok(result.attempt.blockedReason?.includes('PENDING'), result.attempt.blockedReason ?? 'missing reason');
+
+    // Exactly ONE call happened: the read-only approval GET. The send was
+    // never attempted — there is no free-form fallback.
+    assert.equal(fetchState.calls.length, 1, 'only the approval check may run');
+    assert.ok(fetchState.calls[0]!.url.includes('/v20.0/555666/message_templates'));
+    assert.ok(fetchState.calls.every((c) => !c.url.includes('/messages')), 'no send request may be made');
+
+    // The blocked approval costs nothing: no daily slot, no message row.
+    const usedAfter = usageSnapshot(db, dayKey, 'whatsapp_messages', 100).used;
+    assert.equal(usedAfter, usedBefore, 'a PENDING template must not consume a daily slot');
+    const messagesAfter = (db.prepare('SELECT COUNT(*) AS n FROM messages').get() as { n: number }).n;
+    assert.equal(messagesAfter, messagesBefore, 'no message row may be written');
+    assert.equal(hasContactEvidence(db, biz), false, 'a blocked approval is not contact evidence');
+  });
+
+  test('an approval-check API failure blocks the send safely (UNVERIFIABLE)', async () => {
+    const biz = makeLead('03001110008');
+    consentTo(biz);
+    const item = createPortfolioItem(db, { title: 'Law firm website', url: 'https://example.com/law' });
+    verifyPortfolioItem(db, item.id, true, 'verified live');
+    approvePortfolioItem(db, item.id, true);
+
+    // The WABA endpoint itself fails: HTTP 500 with a Graph-style error body.
+    fetchState = fakeFetch({
+      routes: [
+        {
+          match: '/message_templates',
+          status: 500,
+          body: { error: { message: 'temporarily unavailable', code: 2, fbtrace_id: 'test-trace' } },
+        },
+        { match: '/messages', body: { messages: [{ id: 'wamid.MUST_NOT_HAPPEN' }] } },
+      ],
+    });
+    const registry = buildRegistry(cfg, LIVE_ENV, { fetchImpl: fetchState.fetchImpl });
+    const waAdapters: OutreachAdapters = {
+      telephony: null,
+      whatsapp: registry.whatsapp,
+      portfolioTemplate: registry.portfolioTemplate,
+      voiceAnswerUrl: null,
+    };
+
+    const dayKey = businessDayKey(cfg, new Date());
+    const usedBefore = usageSnapshot(db, dayKey, 'whatsapp_messages', 100).used;
+    const messagesBefore = (db.prepare('SELECT COUNT(*) AS n FROM messages').get() as { n: number }).n;
+
+    const result = await sharePortfolio(db, cfg, { businessId: biz, actor: owner, adapters: waAdapters });
+
+    assert.equal(result.decision, 'blocked');
+    assert.equal(result.attempt.blockedCode, 'template_not_approved');
+    assert.ok(result.attempt.blockedReason?.includes('UNVERIFIABLE'), result.attempt.blockedReason ?? 'missing reason');
+
+    // Fail-closed: the failed check alone blocks, nothing is sent, no slot
+    // is spent, and no message row exists.
+    assert.equal(fetchState.calls.length, 1, 'only the failing approval check may run');
+    assert.ok(fetchState.calls.every((c) => !c.url.includes('/messages')), 'no send request may be made');
+    const usedAfter = usageSnapshot(db, dayKey, 'whatsapp_messages', 100).used;
+    assert.equal(usedAfter, usedBefore, 'a failed verification must not consume a daily slot');
+    const messagesAfter = (db.prepare('SELECT COUNT(*) AS n FROM messages').get() as { n: number }).n;
+    assert.equal(messagesAfter, messagesBefore, 'no message row may be written');
   });
 
   test('a missing template blocks before any counter is spent', async () => {

@@ -112,11 +112,32 @@ export interface SendTemplateResponse {
   status: string;
 }
 
+/**
+ * Result of the PRE-SEND template approval check: a read-only GET against the
+ * WABA's `message_templates` edge. `ok` is true ONLY when the exact template
+ * exists, its status is `APPROVED`, and its language matches what we will
+ * send. Every other outcome (PENDING, REJECTED, missing, mismatch, or the
+ * check itself failing) is a safe block — there is no free-form fallback.
+ */
+export interface TemplateApprovalCheck {
+  ok: boolean;
+  /** APPROVED | PENDING | REJECTED | MISSING | LANGUAGE_MISMATCH | UNVERIFIABLE | provider status */
+  status: string;
+  /** Human-readable, credential-free detail recorded in the outreach ledger. */
+  detail: string;
+}
+
 export interface WhatsAppPort extends Pingable {
   readonly key: string;
   readonly label: string;
   status(): AdapterStatus;
   sendTemplate(req: SendTemplateRequest): Promise<SendTemplateResponse>;
+  /**
+   * Pre-send gate: confirm the configured template is APPROVED in the
+   * configured language before anything is sent. Optional on the port —
+   * callers MUST treat a missing implementation as "cannot verify -> block".
+   */
+  verifyTemplate?(name: string, language: string): Promise<TemplateApprovalCheck>;
   /**
    * Verify Meta's X-Hub-Signature-256 over the RAW request body. Must be a
    * timing-safe comparison; returns false for any malformed header.

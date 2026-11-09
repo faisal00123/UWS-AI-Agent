@@ -31,6 +31,7 @@ import type {
   TelephonyPort,
   CreateCallRequest,
   CreateCallResponse,
+  TemplateApprovalCheck,
   WhatsAppPort,
 } from '../types.ts';
 
@@ -111,6 +112,15 @@ export function createMockWhatsAppAdapter(): MockWhatsAppAdapter {
     // returning false is the honest behaviour (bad signatures stay refused).
     verifySignature(): boolean {
       return false;
+    },
+    // A mock cannot consult Meta: an unverifiable template must BLOCK a live
+    // send (never a silent approve) — same fail-safe as a real API failure.
+    async verifyTemplate(name: string): Promise<TemplateApprovalCheck> {
+      return {
+        ok: false,
+        status: 'UNVERIFIABLE',
+        detail: `Mock provider cannot verify template '${name}' approval — live send blocked.`,
+      };
     },
     async ping(): Promise<PingResult> {
       return { ok: true, detail: 'mock adapter — simulated, no network used' };

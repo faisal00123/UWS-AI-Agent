@@ -35,6 +35,7 @@ export function createWhatsAppAdapter(env: Env, opts: WhatsAppAdapterOptions = {
       phoneNumberId,
       accessToken,
       appSecret: (env['WHATSAPP_APP_SECRET'] ?? '').trim(),
+      businessAccountId: (env['WHATSAPP_BUSINESS_ACCOUNT_ID'] ?? '').trim(),
       ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
     });
   }

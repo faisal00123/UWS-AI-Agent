@@ -18,6 +18,7 @@ import { requestJson, type FetchLike } from '../http.ts';
 import {
   AdapterError,
   type AdapterStatus,
+  type TemplateApprovalCheck,
   type WhatsAppPort,
   type SendTemplateRequest,
   type SendTemplateResponse,
@@ -27,6 +28,8 @@ export interface WhatsAppCloudOptions {
   phoneNumberId: string;
   accessToken: string;
   appSecret: string;
+  /** WABA id — used by the pre-send template approval check (read-only GET). */
+  businessAccountId?: string;
   fetchImpl?: FetchLike;
   /** Override for tests (default https://graph.facebook.com). */
   baseUrl?: string;
@@ -104,6 +107,68 @@ export function createWhatsAppCloudAdapter(opts: WhatsAppCloudOptions): WhatsApp
         if (err instanceof AdapterError) lastError = `${err.code}: ${err.message}`;
         throw err;
       }
+    },
+
+    /**
+     * Pre-send approval gate (read-only GET): fetch the WABA's message
+     * templates and confirm the EXACT configured template is APPROVED in the
+     * configured language. Any failure — PENDING/REJECTED/missing/mismatch,
+     * a missing WABA id, a non-2xx response or a network error — returns
+     * `ok: false` so the caller blocks the send. Never throws, never retries
+     * into a send, and the token never appears in the result or errors.
+     */
+    async verifyTemplate(name: string, language: string): Promise<TemplateApprovalCheck> {
+      const wanted = name.trim();
+      const wantedLang = language.trim();
+      if (!wanted || !wantedLang) {
+        return {
+          ok: false,
+          status: 'UNVERIFIABLE',
+          detail: 'No template name/language is configured — approval cannot be verified.',
+        };
+      }
+      const waba = (opts.businessAccountId ?? '').trim();
+      if (!waba) {
+        return {
+          ok: false,
+          status: 'UNVERIFIABLE',
+          detail: 'WHATSAPP_BUSINESS_ACCOUNT_ID is not configured — approval cannot be verified.',
+        };
+      }
+      const url = `${base}/${version}/${waba}/message_templates?fields=name,status,language&limit=100`;
+      let body: { data?: { name?: string; status?: string; language?: string }[] };
+      try {
+        body = await requestJson<{ data?: { name?: string; status?: string; language?: string }[] }>(
+          fetchImpl,
+          url,
+          { method: 'GET', headers: { authorization: `Bearer ${opts.accessToken}` }, timeoutMs: 8_000 },
+        );
+      } catch (err) {
+        // requestJson messages carry the host only — never credentials.
+        const detail = err instanceof AdapterError ? err.message : 'template status check failed';
+        return { ok: false, status: 'UNVERIFIABLE', detail: `Template approval check failed (${detail}).` };
+      }
+      const list = Array.isArray(body?.data) ? body.data : [];
+      const hit = list.find((t) => t?.name === wanted);
+      if (!hit) {
+        return {
+          ok: false,
+          status: 'MISSING',
+          detail: `Template '${wanted}' is not present on this WhatsApp business account.`,
+        };
+      }
+      const status = (hit.status ?? 'UNKNOWN').toUpperCase();
+      if (status !== 'APPROVED') {
+        return { ok: false, status, detail: `Template '${wanted}' status is ${status}, not APPROVED.` };
+      }
+      if ((hit.language ?? '') !== wantedLang) {
+        return {
+          ok: false,
+          status: 'LANGUAGE_MISMATCH',
+          detail: `Template '${wanted}' is '${hit.language ?? 'unknown'}' but '${wantedLang}' is configured.`,
+        };
+      }
+      return { ok: true, status: 'APPROVED', detail: `Template '${wanted}' is APPROVED in ${wantedLang}.` };
     },
 
     verifySignature(rawBody: Buffer, signatureHeader: string | null): boolean {

@@ -150,6 +150,7 @@ const IDEMPOTENT_OPS = new Set([
   'synthesize',
   'search',
   'ping',
+  'verifyTemplate', // read-only GET against message_templates — never a send
 ]);
 
 function noopUsage(): void {
@@ -266,6 +267,13 @@ export function buildRegistry(cfg: Config, env: Env = process.env, opts: BuildRe
         sendTemplate: decorate('whatsapp', 'sendTemplate', (req: SendTemplateRequest) =>
           rawWhatsapp.sendTemplate(req),
         ),
+        ...(rawWhatsapp.verifyTemplate
+          ? {
+              verifyTemplate: decorate('whatsapp', 'verifyTemplate', (name: string, language: string) =>
+                rawWhatsapp.verifyTemplate!(name, language),
+              ),
+            }
+          : {}),
         verifySignature: (rawBody: Buffer, signature: string | null) =>
           rawWhatsapp.verifySignature(rawBody, signature),
         ...(rawWhatsapp.ping

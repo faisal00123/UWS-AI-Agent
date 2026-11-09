@@ -102,6 +102,9 @@ const EnvSchema = z.object({
   WHATSAPP_APP_SECRET: z.string().default(''),
   /** Owner-chosen token Meta must echo back on the webhook subscription GET. */
   WHATSAPP_WEBHOOK_VERIFY_TOKEN: z.string().default(''),
+  /** WhatsApp Business Account (WABA) id — required to read template
+   *  approval status before any live send (pre-send verification gate). */
+  WHATSAPP_BUSINESS_ACCOUNT_ID: z.string().default(''),
 
   DISCOVERY_PROVIDER: z.string().default(''),
   DISCOVERY_API_KEY: z.string().default(''),

@@ -27,7 +27,7 @@ import type { Config } from '../../core/config.ts';
 import { newId } from '../../core/ids.ts';
 import { nowIso } from '../../core/time.ts';
 import { AppError, notFound } from '../../core/errors.ts';
-import { AdapterError, type TelephonyPort, type WhatsAppPort } from '../../adapters/types.ts';
+import { AdapterError, type TemplateApprovalCheck, type TelephonyPort, type WhatsAppPort } from '../../adapters/types.ts';
 import { recordInteraction } from '../pipeline/interactions.ts';
 import {
   runGuard,
@@ -658,6 +658,41 @@ export async function sharePortfolio(db: DB, cfg: Config, input: SharePortfolioI
         createdBy: input.actor.userId,
       });
       return { decision: 'blocked', attempt: blockedAttempt };
+    }
+
+    // PRE-SEND TEMPLATE APPROVAL GATE (read-only GET against the WABA's
+    // message_templates). Runs BEFORE the daily counter is consumed and
+    // BEFORE any send: an unapproved (PENDING/REJECTED), missing or
+    // language-mismatched template — or a verification request that fails
+    // outright — blocks with a first-class ledger row and NOTHING is sent.
+    // There is deliberately no free-form fallback: sendTemplate is the only
+    // outbound WhatsApp primitive this domain can reach.
+    const waLive = whatsapp as WhatsAppPort;
+    const tplLive = template as { name: string; language: string };
+    let approval: TemplateApprovalCheck;
+    try {
+      approval = waLive.verifyTemplate
+        ? await waLive.verifyTemplate(tplLive.name, tplLive.language)
+        : { ok: false, status: 'UNVERIFIABLE', detail: 'The installed WhatsApp adapter cannot verify template approval.' };
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : 'unknown verification failure';
+      approval = { ok: false, status: 'UNVERIFIABLE', detail: `Template approval check failed (${detail}).` };
+    }
+    if (!approval.ok) {
+      const { attempt } = recordAttempt(db, {
+        businessId: lead.id,
+        channel,
+        purpose,
+        verdict: {
+          ...verdict,
+          allowed: false,
+          blockedCode: 'template_not_approved',
+          blockedReason: `Live mode: template '${tplLive.name}' failed approval verification (${approval.status}) — ${approval.detail} Nothing was sent.`,
+        },
+        idempotencyKey: input.idempotencyKey ?? null,
+        createdBy: input.actor.userId,
+      });
+      return { decision: 'blocked', attempt };
     }
   }
 
