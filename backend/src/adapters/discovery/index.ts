@@ -48,12 +48,29 @@ export function createDiscoveryAdapter(
           source: 'mock_directory',
         },
       ]);
-    case 'overpass':
+    case 'overpass': {
       // Real OpenStreetMap search; free, no credentials exist for it at all.
+      // Optional fallbacks are tried ONLY after a transport-level failure of
+      // the primary; each candidate is re-validated inside the adapter
+      // (credential-free https only). Parsed here: trimmed, non-empty,
+      // deduped against the primary and each other, hard-capped at 2 so the
+      // fallback fan-out can never grow unbounded.
+      const primaryRaw = (env['DISCOVERY_OVERPASS_URL'] ?? '').trim();
+      const seenFallbacks = new Set<string>(primaryRaw !== '' ? [primaryRaw] : []);
+      const fallbacks: string[] = [];
+      for (const entry of (env['DISCOVERY_OVERPASS_FALLBACK_URLS'] ?? '').split(',')) {
+        const candidate = entry.trim();
+        if (candidate.length === 0 || seenFallbacks.has(candidate)) continue;
+        seenFallbacks.add(candidate);
+        fallbacks.push(candidate);
+        if (fallbacks.length >= 2) break;
+      }
       return createOverpassDiscoveryAdapter({
         ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
-        ...(env['DISCOVERY_OVERPASS_URL']?.trim() ? { endpoint: env['DISCOVERY_OVERPASS_URL'].trim() } : {}),
+        ...(primaryRaw !== '' ? { endpoint: primaryRaw } : {}),
+        ...(fallbacks.length > 0 ? { fallbackEndpoints: fallbacks } : {}),
       });
+    }
     default:
       // Unknown vendor name: honest unconfigured, never fabricated leads.
       return createUnconfiguredDiscovery();

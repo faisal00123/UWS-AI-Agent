@@ -110,8 +110,14 @@ const EnvSchema = z.object({
   DISCOVERY_API_KEY: z.string().default(''),
   // Optional self-hosted Overpass instance (Phase 12); empty = the public
   // overpass-api.de instance. Not a secret — it is a URL, but it is env-only
-  // configuration like everything else and never echoed in responses.
+  // configuration like everything else and never echoed in responses. The
+  // adapter's health detail shows ONLY the hostname (credential-free by
+  // construction) so the effective endpoint can be verified in production.
   DISCOVERY_OVERPASS_URL: z.string().default(''),
+  // Optional comma-separated fallback Overpass interpreters (max 2 used),
+  // tried ONLY after a transport-level failure of the primary endpoint.
+  // Empty (the default) = no fallbacks: no mirror is assumed to work.
+  DISCOVERY_OVERPASS_FALLBACK_URLS: z.string().default(''),
 
   AI_PROVIDER: z.string().default(''),
   AI_API_KEY: z.string().default(''),

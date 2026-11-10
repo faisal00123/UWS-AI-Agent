@@ -249,3 +249,225 @@ describe('discovery provider dispatch', () => {
     assert.equal(createDiscoveryAdapter({ DISCOVERY_PROVIDER: 'yelp' }).status().state, 'unconfigured');
   });
 });
+
+describe('discovery transport strategy', () => {
+  const FB = 'https://fallback.example/api/interpreter';
+
+  /** A stub that records calls and throws a whitelisted transport error. */
+  function throwingFetch(code: string): { fetchImpl: FetchLike; calls: Captured[] } {
+    const calls: Captured[] = [];
+    const fetchImpl: FetchLike = async (url, init) => {
+      calls.push({ url: String(url), body: typeof init.body === 'string' ? init.body : null });
+      throw Object.assign(new TypeError('fetch failed'), { code });
+    };
+    return { fetchImpl, calls };
+  }
+
+  test('falls back to the next endpoint ONLY on a transport failure', async () => {
+    const calls: Captured[] = [];
+    const fetchImpl: FetchLike = async (url, init) => {
+      calls.push({ url: String(url), body: typeof init.body === 'string' ? init.body : null });
+      if (calls.length === 1) throw Object.assign(new TypeError('fetch failed'), { code: 'ETIMEDOUT' });
+      return okJson([{ type: 'node', id: 7, tags: { name: 'Fallback Clinic', phone: '+923001112233' } }]);
+    };
+    const adapter = createOverpassDiscoveryAdapter({ fetchImpl, fallbackEndpoints: [FB] });
+
+    const hits = await adapter.search({ query: 'clinic', city: 'Karachi' });
+    assert.equal(hits.length, 1, 'the fallback supplied an honest result');
+    assert.deepEqual(
+      calls.map((c) => c.url),
+      [DEFAULT_OVERPASS_ENDPOINT, FB],
+      'primary first, fallback only after its transport failure',
+    );
+  });
+
+  test('an HTTP response is authoritative — no fallback on 5xx', async () => {
+    const calls: Captured[] = [];
+    const fetchImpl: FetchLike = async (url, init) => {
+      calls.push({ url: String(url), body: typeof init.body === 'string' ? init.body : null });
+      return new Response('busy', { status: 503 });
+    };
+    const adapter = createOverpassDiscoveryAdapter({ fetchImpl, fallbackEndpoints: [FB] });
+
+    await assert.rejects(
+      () => adapter.search({ query: 'clinic', city: 'Karachi' }),
+      (err: AdapterError) => err.code === 'provider_error' && err.providerStatus === 503,
+    );
+    assert.equal(calls.length, 1, 'a 5xx from the primary is authoritative — never swapped');
+    assert.equal(calls[0]!.url, DEFAULT_OVERPASS_ENDPOINT);
+  });
+
+  test('when every endpoint fails: network + sanitized category + original cause', async () => {
+    const fallbackErr = Object.assign(new TypeError('fetch failed'), { code: 'ECONNREFUSED' });
+    let n = 0;
+    const fetchImpl: FetchLike = async () => {
+      n += 1;
+      throw n === 1
+        ? Object.assign(new TypeError('fetch failed'), { code: 'ECONNRESET' })
+        : fallbackErr;
+    };
+    const adapter = createOverpassDiscoveryAdapter({ fetchImpl, fallbackEndpoints: [FB] });
+
+    await assert.rejects(
+      () => adapter.search({ query: 'clinic', city: 'Karachi' }),
+      (err: AdapterError) => {
+        assert.equal(err.code, 'network');
+        assert.match(err.message, /transport: refused/, 'the LAST failure category is reported');
+        assert.match(err.message, /2 endpoint\(s\) tried/, 'the fan-out is disclosed');
+        assert.equal(err.cause, fallbackErr, 'the original error cause is preserved, not discarded');
+        assert.equal(err.retryable, true);
+        return true;
+      },
+    );
+  });
+
+  test('cooldown: a transport-failed primary is skipped by the next search, ping still probes it', async () => {
+    const calls: Captured[] = [];
+    const fetchImpl: FetchLike = async (url, init) => {
+      const u = String(url);
+      calls.push({ url: u, body: typeof init.body === 'string' ? init.body : null });
+      if (u.endsWith('/api/status')) return new Response('Rate limit: 10000 queries per day\n', { status: 200 });
+      if (u === DEFAULT_OVERPASS_ENDPOINT) throw Object.assign(new TypeError('fetch failed'), { code: 'ECONNREFUSED' });
+      return okJson([{ type: 'node', id: 7, tags: { name: 'Fallback Clinic', phone: '+923001112233' } }]);
+    };
+    const adapter = createOverpassDiscoveryAdapter({ fetchImpl, fallbackEndpoints: [FB] });
+
+    const first = await adapter.search({ query: 'clinic', city: 'Karachi' });
+    assert.equal(first.length, 1);
+    assert.deepEqual(calls.map((c) => c.url), [DEFAULT_OVERPASS_ENDPOINT, FB]);
+
+    const second = await adapter.search({ query: 'clinic', city: 'Karachi' });
+    assert.equal(second.length, 1, 'the fallback keeps serving');
+    assert.deepEqual(
+      calls.map((c) => c.url),
+      [DEFAULT_OVERPASS_ENDPOINT, FB, FB],
+      'the dead primary host must not be re-requested inside the cooldown',
+    );
+
+    const pong = await adapter.ping();
+    assert.equal(pong.ok, true, 'health pings ignore the cooldown — the dashboard stays honest');
+    assert.ok(
+      calls.some((c) => c.url === 'https://overpass-api.de/api/status'),
+      'ping always probes the configured primary status endpoint',
+    );
+  });
+
+  test('cooldownMs:0 disables the cooldown (each search tries every endpoint)', async () => {
+    const { fetchImpl, calls } = throwingFetch('ECONNREFUSED');
+    const adapter = createOverpassDiscoveryAdapter({ fetchImpl, fallbackEndpoints: [FB], cooldownMs: 0 });
+
+    await assert.rejects(() => adapter.search({ query: 'clinic', city: 'Karachi' }));
+    await assert.rejects(() => adapter.search({ query: 'clinic', city: 'Karachi' }));
+    assert.equal(calls.length, 4, '2 endpoints x 2 searches — no cooldown skipping');
+  });
+
+  test('ping failure reports the sanitized category and the effective host', async () => {
+    const { fetchImpl } = throwingFetch('ENOTFOUND');
+    const adapter = createOverpassDiscoveryAdapter({ fetchImpl, endpoint: 'https://mail.example/api/interpreter' });
+
+    await assert.rejects(
+      () => adapter.ping(),
+      (err: AdapterError) => {
+        assert.equal(err.code, 'network');
+        assert.match(err.message, /transport: dns/);
+        assert.match(err.message, /mail\.example/, 'the host is named so production can self-verify');
+        assert.equal(err.retryable, true);
+        return true;
+      },
+    );
+  });
+
+  test('ping success names the reachable host', async () => {
+    const { fetchImpl } = stubFetch(() => new Response('Rate limit: 500\n', { status: 200 }));
+    const adapter = createOverpassDiscoveryAdapter({ fetchImpl, endpoint: 'https://mail.example/api/interpreter' });
+
+    const pong = await adapter.ping();
+    assert.equal(pong.ok, true);
+    assert.match(pong.detail ?? '', /reachable at mail\.example/);
+    assert.match(pong.detail ?? '', /no search performed/);
+  });
+
+  test('an invalid configured primary is an honest config error with zero network I/O', async () => {
+    const { fetchImpl, calls } = stubFetch(() => okJson([]));
+    const adapter = createOverpassDiscoveryAdapter({ fetchImpl, endpoint: 'http://insecure.example' });
+
+    const s = adapter.status();
+    assert.equal(s.state, 'error', 'a broken configuration is never reported as configured');
+    assert.ok(s.lastError, 'the reason is surfaced');
+
+    const pong = await adapter.ping();
+    assert.equal(pong.ok, false, 'health must never claim healthy for a misconfigured endpoint');
+    assert.match(pong.detail ?? '', /misconfigured/i);
+
+    await assert.rejects(
+      () => adapter.search({ query: 'clinic', city: 'Karachi' }),
+      (err: AdapterError) => err.code === 'unconfigured',
+    );
+    assert.equal(calls.length, 0, 'zero network I/O for a broken configuration');
+  });
+
+  test('invalid or credential-bearing fallbacks are dropped and never contacted', async () => {
+    const { fetchImpl, calls } = throwingFetch('ECONNREFUSED');
+    const adapter = createOverpassDiscoveryAdapter({
+      fetchImpl,
+      fallbackEndpoints: [
+        'ftp://weird.example/api',
+        'https://user:pass@evil.example/api/interpreter',
+        'http://insecure.example/api/interpreter',
+      ],
+    });
+
+    await assert.rejects(
+      () => adapter.search({ query: 'clinic', city: 'Karachi' }),
+      (err: AdapterError) => err.code === 'network',
+    );
+    assert.deepEqual(
+      calls.map((c) => c.url),
+      [DEFAULT_OVERPASS_ENDPOINT],
+      'only the valid primary was contacted',
+    );
+  });
+
+  test('DISCOVERY_OVERPASS_FALLBACK_URLS is trimmed, deduped and capped at 2 fallbacks', async () => {
+    const { fetchImpl, calls } = throwingFetch('ECONNREFUSED');
+    const adapter = createDiscoveryAdapter(
+      {
+        DISCOVERY_PROVIDER: 'overpass',
+        DISCOVERY_OVERPASS_URL: 'https://primary.example/api/interpreter',
+        DISCOVERY_OVERPASS_FALLBACK_URLS:
+          ' https://primary.example/api/interpreter , https://second.example/api/interpreter , https://third.example/api/interpreter ',
+      },
+      { fetchImpl },
+    );
+
+    await assert.rejects(() => adapter.search({ query: 'clinic', city: 'Karachi' }));
+    assert.deepEqual(
+      calls.map((c) => c.url),
+      [
+        'https://primary.example/api/interpreter',
+        'https://second.example/api/interpreter',
+        'https://third.example/api/interpreter',
+      ],
+      'trimmed, primary-duplicate dropped, then exactly 2 fallbacks used',
+    );
+  });
+
+  test('the fallback fan-out is bounded: a third configured fallback is never contacted', async () => {
+    const { fetchImpl, calls } = throwingFetch('ECONNREFUSED');
+    const adapter = createDiscoveryAdapter(
+      {
+        DISCOVERY_PROVIDER: 'overpass',
+        DISCOVERY_OVERPASS_FALLBACK_URLS:
+          'https://f1.example/api/interpreter,https://f2.example/api/interpreter,https://f3.example/api/interpreter',
+      },
+      { fetchImpl },
+    );
+
+    await assert.rejects(() => adapter.search({ query: 'clinic', city: 'Karachi' }));
+    assert.equal(calls.length, 3, 'primary + at most 2 fallbacks');
+    assert.ok(
+      calls.every((c) => !c.url.includes('f3.example')),
+      'the third fallback is beyond the bound and must never be contacted',
+    );
+  });
+});

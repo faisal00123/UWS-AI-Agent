@@ -557,6 +557,9 @@ export async function renderSystem(root, ctx) {
         const r = out.result;
         if (r.ok) toast('Connection OK', `${r.integration}: ${r.detail}`, 'ok');
         else toast('Connection failed', `${r.integration} (${r.state}): ${r.detail}`, 'err');
+        // Re-render so the health table cell shows the fresh result next to
+        // the toast (previously the cell stayed stale at "never checked").
+        renderSystem(root, ctx);
       } catch (err) {
         toast('Test failed', errMsg(err), 'err');
       } finally {

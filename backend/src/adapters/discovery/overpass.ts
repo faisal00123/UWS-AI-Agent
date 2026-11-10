@@ -29,9 +29,18 @@
  *   - no credentials exist in this adapter at all, and error details are
  *     short and redaction-safe;
  *   - `ping()` uses the FREE `/api/status` endpoint (rate-limit info), never
- *     a search request.
+ *     a search request;
+ *   - endpoint policy: the configured primary (DISCOVERY_OVERPASS_URL or the
+ *     public default) plus optional fallbacks (DISCOVERY_OVERPASS_FALLBACK_URLS).
+ *     Only a TRANSPORT-level failure (no HTTP response) falls back — an HTTP
+ *     response of any status is authoritative. Failures carry a sanitized
+ *     transport category (timeout/dns/tls/refused/reset/unknown) while the
+ *     original error stays attached as `cause`;
+ *   - `ping()` always probes the configured primary only, so discovery is
+ *     never reported healthy unless the actual configured provider answers.
  */
 import type { FetchLike } from '../http.ts';
+import { classifyTransportError, type TransportCategory } from './transport.ts';
 import {
   AdapterError,
   type AdapterStatus,
@@ -162,6 +171,22 @@ export interface OverpassAdapterOptions {
   fetchImpl?: FetchLike;
   /** Override the interpreter endpoint (self-hosted Overpass instance). */
   endpoint?: string;
+  /**
+   * Optional fallback interpreter endpoints, tried in order ONLY after a
+   * transport-level failure (no HTTP response) of the primary. An HTTP
+   * response of any status is authoritative and never falls back. Each
+   * candidate must be a credential-free https URL; invalid candidates are
+   * dropped and never contacted. Global-coverage instances only — every
+   * query this adapter sends is Pakistan-scoped.
+   */
+  fallbackEndpoints?: string[];
+  /**
+   * How long (ms) a host that failed at transport level is skipped by
+   * searches (0 disables). Health pings deliberately ignore the cooldown so
+   * the dashboard always reflects the configured provider's real state.
+   * Default: 60_000.
+   */
+  cooldownMs?: number;
   /** User-Agent sent with every request (Overpass etiquette asks to identify). */
   userAgent?: string;
 }
@@ -174,17 +199,102 @@ export interface OverpassDiscoveryPort extends DiscoveryPort {
   ping(): Promise<PingResult>;
 }
 
+/**
+ * Validate one endpoint candidate: a credential-free https URL (plain http
+ * only on loopback, for local test instances). Returns the normalized URL
+ * (trailing slashes removed) on success, or the reason it was rejected.
+ */
+function validateEndpoint(raw: string): { ok: true; url: string } | { ok: false; reason: string } {
+  const trimmed = raw.trim().replace(/\/+$/, '');
+  if (trimmed === '') return { ok: false, reason: 'empty URL' };
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return { ok: false, reason: 'not a valid URL' };
+  }
+  if (parsed.username !== '' || parsed.password !== '') {
+    return { ok: false, reason: 'credentials embedded in the URL are not allowed' };
+  }
+  const loopback =
+    parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1' || parsed.hostname === '[::1]';
+  if (parsed.protocol !== 'https:' && !(parsed.protocol === 'http:' && loopback)) {
+    return { ok: false, reason: 'must be an https URL (plain http only on loopback)' };
+  }
+  return { ok: true, url: trimmed };
+}
+
+/**
+ * Hostname of an endpoint — public and non-secret by construction (URLs with
+ * embedded credentials never pass validation). Shown in health details so the
+ * effective production endpoint can be verified without reading configuration.
+ */
+function hostOf(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    return 'unknown-host';
+  }
+}
+
 export function createOverpassDiscoveryAdapter(opts: OverpassAdapterOptions = {}): OverpassDiscoveryPort {
-  const endpoint = (opts.endpoint ?? DEFAULT_OVERPASS_ENDPOINT).replace(/\/+$/, '');
-  const statusEndpoint = endpoint.endsWith('/interpreter')
-    ? `${endpoint.slice(0, -'/interpreter'.length)}/status`
-    : null;
+  const primaryCheck = validateEndpoint(opts.endpoint ?? DEFAULT_OVERPASS_ENDPOINT);
+  const configError = primaryCheck.ok ? null : primaryCheck.reason;
+
+  // Primary first, then configured fallbacks — deduped, each independently
+  // validated. An invalid PRIMARY is surfaced honestly as configError (no
+  // network at all: a broken configuration must not be silently swapped); an
+  // invalid FALLBACK is dropped and never contacted.
+  const endpoints: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of [opts.endpoint ?? DEFAULT_OVERPASS_ENDPOINT, ...(opts.fallbackEndpoints ?? [])]) {
+    const check = validateEndpoint(raw);
+    if (check.ok && !seen.has(check.url)) {
+      seen.add(check.url);
+      endpoints.push(check.url);
+    }
+  }
+  const primary = configError === null ? (endpoints[0] ?? '') : '';
+  const statusEndpoint =
+    primary !== '' && primary.endsWith('/interpreter')
+      ? `${primary.slice(0, -'/interpreter'.length)}/status`
+      : null;
+
   const fetchImpl: FetchLike = opts.fetchImpl ?? ((u, init) => fetch(u, init));
   const userAgent = opts.userAgent ?? 'UWS-AI-Sales-Agent/0.1 (lead-discovery; OpenStreetMap/Overpass)';
 
+  // Transport-failure cooldown, keyed by HOST (a dead host is dead on every
+  // path of that host). Bounded fan-out: a search never re-requests a host
+  // that just failed at transport level, and when every candidate is cooling
+  // down it fails fast with the last known category instead of waiting out
+  // every timeout again. pings ignore the cooldown (health must be honest).
+  const cooldownMs = opts.cooldownMs ?? 60_000;
+  interface CooldownEntry {
+    until: number;
+    cat: TransportCategory;
+    err: unknown;
+  }
+  const cooldowns = new Map<string, CooldownEntry>();
+  const isCooling = (host: string): boolean => {
+    const entry = cooldowns.get(host);
+    return cooldownMs > 0 && entry !== undefined && entry.until > Date.now();
+  };
+  const markDown = (url: string, cat: TransportCategory, err: unknown): void => {
+    cooldowns.set(hostOf(url), { until: Date.now() + cooldownMs, cat, err });
+  };
+  const markUp = (url: string): void => {
+    cooldowns.delete(hostOf(url));
+  };
+
+  /**
+   * Single-endpoint request used by ping(): always the configured primary,
+   * cooldown ignored. A transport failure becomes a `network` AdapterError
+   * carrying the sanitized category, the effective host, and the original
+   * error as `cause`.
+   */
   async function request(path: string, body: string | null, timeoutMs: number): Promise<Response> {
     try {
-      return await fetchImpl(path, {
+      const res = await fetchImpl(path, {
         method: body === null ? 'GET' : 'POST',
         ...(body !== null
           ? { headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json', 'user-agent': userAgent } }
@@ -192,9 +302,64 @@ export function createOverpassDiscoveryAdapter(opts: OverpassAdapterOptions = {}
         ...(body !== null ? { body } : {}),
         signal: AbortSignal.timeout(timeoutMs),
       });
+      markUp(path);
+      return res;
     } catch (err) {
-      throw new AdapterError('network', 'Could not reach the Overpass API', { retryable: true, cause: err });
+      const cat = classifyTransportError(err);
+      markDown(path, cat, err);
+      throw new AdapterError('network', `Could not reach the Overpass API at ${hostOf(path)} (transport: ${cat})`, {
+        retryable: true,
+        cause: err,
+      });
     }
+  }
+
+  /**
+   * Search request: primary first, then non-cooling fallbacks — the first
+   * HTTP response wins and is returned for normal status mapping. Only
+   * transport failures fall through to the next endpoint; an HTTP response
+   * of any status (429/503/...) is authoritative and never falls back.
+   */
+  async function requestSearch(body: string, timeoutMs: number): Promise<Response> {
+    let tried = 0;
+    let lastCat: TransportCategory = 'unknown';
+    let lastHost = '';
+    let lastErr: unknown;
+    for (const url of endpoints) {
+      const host = hostOf(url);
+      if (isCooling(host)) continue;
+      tried += 1;
+      try {
+        const res = await fetchImpl(url, {
+          method: 'POST',
+          headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json', 'user-agent': userAgent },
+          body,
+          signal: AbortSignal.timeout(timeoutMs),
+        });
+        markUp(url);
+        return res;
+      } catch (err) {
+        lastErr = err;
+        lastCat = classifyTransportError(err);
+        lastHost = host;
+        markDown(url, lastCat, err);
+      }
+    }
+    if (tried === 0) {
+      // Every candidate host is inside its cooldown window: fail fast with
+      // the last known category rather than stalling on every timeout again.
+      const entry = primary !== '' ? cooldowns.get(hostOf(primary)) : undefined;
+      throw new AdapterError(
+        'network',
+        `Could not reach the Overpass API (transport: ${entry?.cat ?? 'unknown'}; endpoint cooling down after a recent transport failure)`,
+        { retryable: true, cause: entry?.err },
+      );
+    }
+    throw new AdapterError(
+      'network',
+      `Could not reach the Overpass API (transport: ${lastCat}) at ${lastHost}${endpoints.length > 1 ? `; ${tried} endpoint(s) tried` : ''}`,
+      { retryable: true, cause: lastErr },
+    );
   }
 
   function mapHttpError(status: number): AdapterError {
@@ -219,12 +384,14 @@ export function createOverpassDiscoveryAdapter(opts: OverpassAdapterOptions = {}
         key: 'discovery',
         label: 'Lead discovery',
         implementation: 'overpass',
-        state: 'configured',
+        // An invalid configured endpoint is a real configuration error, not a
+        // silently-swappable one: it is reported as `error` with the reason.
+        state: configError === null ? 'configured' : 'error',
         features: [
           'public OpenStreetMap lead search (free, no API key)',
           'Pakistan coverage via the Overpass API',
         ],
-        lastError: null,
+        lastError: configError,
       };
     },
 
@@ -239,10 +406,14 @@ export function createOverpassDiscoveryAdapter(opts: OverpassAdapterOptions = {}
       if (terms.length === 0) {
         throw new AdapterError('invalid_destination', 'A discovery search needs at least one category');
       }
+      if (configError !== null) {
+        // Broken endpoint configuration: fail honestly before any network I/O.
+        throw new AdapterError('unconfigured', `Discovery endpoint misconfigured: ${configError}`);
+      }
       const limit = Math.min(Math.max(q.limit ?? 50, 1), 100);
       const query = buildOverpassQuery(terms, q.city?.trim() || undefined, limit);
 
-      const res = await request(endpoint, `data=${encodeURIComponent(query)}`, TIMEOUT_MS);
+      const res = await requestSearch(`data=${encodeURIComponent(query)}`, TIMEOUT_MS);
       if (!res.ok) throw mapHttpError(res.status);
 
       const text = (await res.text()).slice(0, MAX_RESPONSE_BYTES);
@@ -276,6 +447,10 @@ export function createOverpassDiscoveryAdapter(opts: OverpassAdapterOptions = {}
     },
 
     async ping(): Promise<PingResult> {
+      if (configError !== null) {
+        // Misconfigured endpoint: honest failure with NO network I/O at all.
+        return { ok: false, detail: `Discovery endpoint misconfigured: ${configError}` };
+      }
       if (statusEndpoint) {
         // FREE status endpoint: rate-limit info, no query is executed.
         const res = await request(statusEndpoint, null, PING_TIMEOUT_MS);
@@ -284,15 +459,15 @@ export function createOverpassDiscoveryAdapter(opts: OverpassAdapterOptions = {}
         const limitLine = /rate limit:\s*(.+)/i.exec(body)?.[1]?.trim();
         return {
           ok: true,
-          detail: `Overpass API reachable (free status probe; no search performed)${limitLine ? ` — rate limit: ${limitLine.slice(0, 60)}` : ''}`,
+          detail: `Overpass API reachable at ${hostOf(statusEndpoint)} (free status probe; no search performed)${limitLine ? ` — rate limit: ${limitLine.slice(0, 60)}` : ''}`,
         };
       }
       // Custom endpoint that is not a standard interpreter URL: fall back to a
       // count-only query (returns a single number; still free of charge).
       const countQuery = `[out:json][timeout:${QUERY_TIMEOUT_S}];node(around:1,0,0)["name"];out count;`;
-      const res = await request(endpoint, `data=${encodeURIComponent(countQuery)}`, PING_TIMEOUT_MS);
+      const res = await request(primary, `data=${encodeURIComponent(countQuery)}`, PING_TIMEOUT_MS);
       if (!res.ok) throw mapHttpError(res.status);
-      return { ok: true, detail: 'Overpass endpoint reachable (free count probe; no search performed)' };
+      return { ok: true, detail: `Overpass endpoint reachable at ${hostOf(primary)} (free count probe; no search performed)` };
     },
   };
 }
