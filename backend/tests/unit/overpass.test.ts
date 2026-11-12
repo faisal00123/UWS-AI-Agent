@@ -470,4 +470,112 @@ describe('discovery transport strategy', () => {
       'the third fallback is beyond the bound and must never be contacted',
     );
   });
+
+  // --------------------------------------------------------- ping() pool ---
+
+  test('ping: primary success stops the walk — the fallback is never contacted', async () => {
+    const { fetchImpl, calls } = stubFetch(
+      () => new Response('Rate limit: 10000 queries per day\n', { status: 200 }),
+    );
+    const adapter = createOverpassDiscoveryAdapter({ fetchImpl, fallbackEndpoints: [FB] });
+
+    const pong = await adapter.ping();
+    assert.equal(pong.ok, true);
+    assert.match(pong.detail ?? '', /reachable at overpass-api\.de/);
+    assert.match(pong.detail ?? '', /no search performed/);
+    assert.deepEqual(
+      calls.map((c) => c.url),
+      ['https://overpass-api.de/api/status'],
+      'only the primary status probe runs when the primary answers',
+    );
+    assert.ok(calls.every((c) => c.body === null), 'the health probe is a body-less GET');
+  });
+
+  test('ping: a transport failure of the primary falls back to the configured fallback', async () => {
+    const calls: Captured[] = [];
+    const fetchImpl: FetchLike = async (url, init) => {
+      const u = String(url);
+      calls.push({ url: u, body: typeof init.body === 'string' ? init.body : null });
+      if (u.startsWith('https://overpass-api.de')) {
+        throw Object.assign(new TypeError('fetch failed'), { code: 'ENOTFOUND' });
+      }
+      return new Response('Rate limit: 500\n', { status: 200 });
+    };
+    const adapter = createOverpassDiscoveryAdapter({ fetchImpl, fallbackEndpoints: [FB] });
+
+    const pong = await adapter.ping();
+    assert.equal(pong.ok, true, 'health is green because a CONFIGURED endpoint answers');
+    assert.match(pong.detail ?? '', /reachable at fallback\.example/);
+    assert.match(pong.detail ?? '', /no search performed/);
+    assert.deepEqual(
+      calls.map((c) => c.url),
+      ['https://overpass-api.de/api/status', 'https://fallback.example/api/status'],
+      'primary first, fallback only after the primary transport failure',
+    );
+    assert.ok(calls.every((c) => c.body === null), 'both probes are body-less GETs');
+  });
+
+  test('ping: when every configured endpoint fails, the error names each attempt and its category', async () => {
+    const codes: Record<string, string> = {
+      'https://overpass-api.de/api/status': 'ENOTFOUND',
+      'https://fallback.example/api/status': 'ECONNREFUSED',
+    };
+    const calls: Captured[] = [];
+    const fetchImpl: FetchLike = async (url, init) => {
+      const u = String(url);
+      calls.push({ url: u, body: typeof init.body === 'string' ? init.body : null });
+      throw Object.assign(new TypeError('fetch failed'), { code: codes[u] ?? 'ECONNREFUSED' });
+    };
+    const adapter = createOverpassDiscoveryAdapter({ fetchImpl, fallbackEndpoints: [FB] });
+
+    await assert.rejects(
+      () => adapter.ping(),
+      (err: AdapterError) => {
+        assert.equal(err.code, 'network');
+        assert.match(err.message, /2 endpoint\(s\) tried/, 'the fan-out is disclosed');
+        assert.match(err.message, /overpass-api\.de \(transport: dns\)/, 'each attempt carries its host + category');
+        assert.match(err.message, /fallback\.example \(transport: refused\)/);
+        assert.equal(err.retryable, true);
+        assert.ok(err.cause, 'the original failure cause is preserved, not discarded');
+        return true;
+      },
+    );
+    assert.deepEqual(
+      calls.map((c) => c.url),
+      ['https://overpass-api.de/api/status', 'https://fallback.example/api/status'],
+      'every configured endpoint was probed exactly once, in order',
+    );
+    assert.ok(calls.every((c) => c.body === null), 'failed probes were still body-less GETs');
+  });
+
+  test('ping: only configured endpoints are contacted — a capped-out fallback never is', async () => {
+    const { fetchImpl, calls } = throwingFetch('ENOTFOUND');
+    const adapter = createDiscoveryAdapter(
+      {
+        DISCOVERY_PROVIDER: 'overpass',
+        DISCOVERY_OVERPASS_FALLBACK_URLS:
+          'https://f1.example/api/interpreter,https://f2.example/api/interpreter,https://f3.example/api/interpreter',
+      },
+      { fetchImpl },
+    );
+
+    await assert.rejects(() => adapter.ping!());
+    assert.deepEqual(
+      calls.map((c) => c.url),
+      [
+        'https://overpass-api.de/api/status',
+        'https://f1.example/api/status',
+        'https://f2.example/api/status',
+      ],
+      'primary + at most 2 configured fallbacks, each via its free status path',
+    );
+    assert.ok(
+      calls.every((c) => !c.url.includes('f3.example')),
+      'the third fallback is beyond the bound and must never be contacted',
+    );
+    assert.ok(
+      calls.every((c) => c.url.endsWith('/status')),
+      'health probes are read-only status GETs — never the interpreter',
+    );
+  });
 });

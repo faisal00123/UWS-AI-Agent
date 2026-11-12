@@ -237,6 +237,18 @@ function hostOf(url: string): string {
   }
 }
 
+/**
+ * Read-only status URL for ONE endpoint: a standard interpreter exposes
+ * `<base>/status`; anything else needs the free count-probe instead (null).
+ * Shared by every pool member so the health probe and the search agree on
+ * which host is being contacted.
+ */
+function statusUrlOf(endpoint: string): string | null {
+  return endpoint.endsWith('/interpreter')
+    ? `${endpoint.slice(0, -'/interpreter'.length)}/status`
+    : null;
+}
+
 export function createOverpassDiscoveryAdapter(opts: OverpassAdapterOptions = {}): OverpassDiscoveryPort {
   const primaryCheck = validateEndpoint(opts.endpoint ?? DEFAULT_OVERPASS_ENDPOINT);
   const configError = primaryCheck.ok ? null : primaryCheck.reason;
@@ -255,10 +267,6 @@ export function createOverpassDiscoveryAdapter(opts: OverpassAdapterOptions = {}
     }
   }
   const primary = configError === null ? (endpoints[0] ?? '') : '';
-  const statusEndpoint =
-    primary !== '' && primary.endsWith('/interpreter')
-      ? `${primary.slice(0, -'/interpreter'.length)}/status`
-      : null;
 
   const fetchImpl: FetchLike = opts.fetchImpl ?? ((u, init) => fetch(u, init));
   const userAgent = opts.userAgent ?? 'UWS-AI-Sales-Agent/0.1 (lead-discovery; OpenStreetMap/Overpass)';
@@ -287,7 +295,7 @@ export function createOverpassDiscoveryAdapter(opts: OverpassAdapterOptions = {}
   };
 
   /**
-   * Single-endpoint request used by ping(): always the configured primary,
+   * Single-endpoint request used by ping(): one pool member at a time,
    * cooldown ignored. A transport failure becomes a `network` AdapterError
    * carrying the sanitized category, the effective host, and the original
    * error as `cause`.
@@ -451,23 +459,60 @@ export function createOverpassDiscoveryAdapter(opts: OverpassAdapterOptions = {}
         // Misconfigured endpoint: honest failure with NO network I/O at all.
         return { ok: false, detail: `Discovery endpoint misconfigured: ${configError}` };
       }
-      if (statusEndpoint) {
-        // FREE status endpoint: rate-limit info, no query is executed.
-        const res = await request(statusEndpoint, null, PING_TIMEOUT_MS);
-        if (!res.ok) throw mapHttpError(res.status);
+      // Walk the SAME configured pool as search() (primary + fallbacks),
+      // ignoring the cooldown — health must stay honest even right after a
+      // transport failure. A transport failure moves on to the next endpoint;
+      // an HTTP response of any status is authoritative and stops the loop,
+      // exactly like search(): a search could not succeed against a host that
+      // health just reported as reachable.
+      const attempted: string[] = [];
+      let lastCause: unknown;
+      for (const endpoint of endpoints) {
+        const host = hostOf(endpoint);
+        const statusUrl = statusUrlOf(endpoint);
+        let res: Response;
+        try {
+          res =
+            statusUrl !== null
+              ? // FREE status endpoint: rate-limit info, no query is executed.
+                await request(statusUrl, null, PING_TIMEOUT_MS)
+              : // Custom endpoint that is not a standard interpreter URL: a
+                // count-only query (returns a single number; free of charge).
+                await request(
+                  endpoint,
+                  `data=${encodeURIComponent(`[out:json][timeout:${QUERY_TIMEOUT_S}];node(around:1,0,0)["name"];out count;`)}`,
+                  PING_TIMEOUT_MS,
+                );
+        } catch (err) {
+          const cat = classifyTransportError(err);
+          attempted.push(`${host} (transport: ${cat})`);
+          // Keep the ORIGINAL fetch failure as the cause (request() wrapped it
+          // in an AdapterError), matching what search() reports.
+          lastCause = err instanceof AdapterError && err.cause !== undefined ? err.cause : err;
+          continue;
+        }
+        if (!res.ok) {
+          const httpErr = mapHttpError(res.status);
+          throw new AdapterError(httpErr.code, `${httpErr.message} (at ${host})`, {
+            providerStatus: httpErr.providerStatus,
+            retryable: httpErr.retryable,
+          });
+        }
         const body = (await res.text()).slice(0, 2000);
-        const limitLine = /rate limit:\s*(.+)/i.exec(body)?.[1]?.trim();
-        return {
-          ok: true,
-          detail: `Overpass API reachable at ${hostOf(statusEndpoint)} (free status probe; no search performed)${limitLine ? ` — rate limit: ${limitLine.slice(0, 60)}` : ''}`,
-        };
+        if (statusUrl !== null) {
+          const limitLine = /rate limit:\s*(.+)/i.exec(body)?.[1]?.trim();
+          return {
+            ok: true,
+            detail: `Overpass API reachable at ${host} (free status probe; no search performed)${limitLine ? ` — rate limit: ${limitLine.slice(0, 60)}` : ''}`,
+          };
+        }
+        return { ok: true, detail: `Overpass endpoint reachable at ${host} (free count probe; no search performed)` };
       }
-      // Custom endpoint that is not a standard interpreter URL: fall back to a
-      // count-only query (returns a single number; still free of charge).
-      const countQuery = `[out:json][timeout:${QUERY_TIMEOUT_S}];node(around:1,0,0)["name"];out count;`;
-      const res = await request(primary, `data=${encodeURIComponent(countQuery)}`, PING_TIMEOUT_MS);
-      if (!res.ok) throw mapHttpError(res.status);
-      return { ok: true, detail: `Overpass endpoint reachable at ${hostOf(primary)} (free count probe; no search performed)` };
+      throw new AdapterError(
+        'network',
+        `Could not reach the Overpass API — ${endpoints.length} endpoint(s) tried: ${attempted.join('; ')}`,
+        { retryable: true, cause: lastCause },
+      );
     },
   };
 }
