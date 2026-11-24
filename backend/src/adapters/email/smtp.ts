@@ -203,7 +203,7 @@ export function createSmtpAdapter(opts: SmtpOptions): EmailPort {
     key: 'smtp',
     label: 'Email (SMTP)',
 
-    status(): AdapterStatus {
+    async status(): Promise<AdapterStatus> {
       const configured = Boolean(opts.host && opts.user && opts.pass && opts.from);
       return {
         key: 'email',

@@ -93,7 +93,7 @@ export interface CreateCallResponse {
 export interface TelephonyPort extends Pingable {
   readonly key: string;
   readonly label: string;
-  status(): AdapterStatus;
+  status(): Promise<AdapterStatus>;
   createCall(req: CreateCallRequest): Promise<CreateCallResponse>;
 }
 
@@ -130,7 +130,7 @@ export interface TemplateApprovalCheck {
 export interface WhatsAppPort extends Pingable {
   readonly key: string;
   readonly label: string;
-  status(): AdapterStatus;
+  status(): Promise<AdapterStatus>;
   sendTemplate(req: SendTemplateRequest): Promise<SendTemplateResponse>;
   /**
    * Pre-send gate: confirm the configured template is APPROVED in the
@@ -155,7 +155,7 @@ export interface ConversationTurn {
 export interface ConversationPort extends Pingable {
   readonly key: string;
   readonly label: string;
-  status(): AdapterStatus;
+  status(): Promise<AdapterStatus>;
   complete(input: {
     messages: ConversationTurn[];
     maxTokens?: number;
@@ -176,7 +176,7 @@ export type SpeechLanguage = 'en' | 'ur';
 export interface SpeechPort extends Pingable {
   readonly key: string;
   readonly label: string;
-  status(): AdapterStatus;
+  status(): Promise<AdapterStatus>;
   transcribe(input: {
     audio: Uint8Array;
     mimeType?: string;
@@ -219,7 +219,7 @@ export interface EmailMessage {
 export interface EmailPort extends Pingable {
   readonly key: string;
   readonly label: string;
-  status(): AdapterStatus;
+  status(): Promise<AdapterStatus>;
   send(msg: EmailMessage): Promise<{ messageId: string }>;
 }
 
@@ -239,6 +239,22 @@ export interface DiscoveryHit {
   website?: string;
   sourceUrl: string;
   source: string;
+  /**
+   * Extended provenance (Phase 2). Optional so every existing adapter
+   * (mock, unconfigured, Overpass) stays valid; the `osm_local` provider
+   * fills these from the extracted dataset. Nothing here is ever invented —
+   * a provider either has the value from its source or omits it.
+   */
+  category?: string;
+  email?: string;
+  /** Street/city address as recorded in the source (e.g. OSM addr tags). */
+  address?: string;
+  /** Source coordinates (WGS84). */
+  lat?: number;
+  lon?: number;
+  /** OSM element identity when the provider knows it (audit back to source). */
+  osmType?: 'node' | 'way' | 'relation';
+  osmId?: number;
 }
 
 /**
@@ -249,6 +265,6 @@ export interface DiscoveryHit {
 export interface DiscoveryPort extends Pingable {
   readonly key: string;
   readonly label: string;
-  status(): AdapterStatus;
+  status(): Promise<AdapterStatus>;
   search(q: DiscoveryQuery): Promise<DiscoveryHit[]>;
 }

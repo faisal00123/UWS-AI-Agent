@@ -32,7 +32,7 @@ function querystring() {
   return p.toString();
 }
 
-function importPreviewHtml(preview) {
+export function importPreviewHtml(preview) {
   const rows = (preview.rows ?? []).slice(0, 200).map((r) => {
     const status =
       r.status === 'imported' ? '<span class="badge ok">imported</span>'
@@ -46,7 +46,7 @@ function importPreviewHtml(preview) {
       <td class="muted small">${esc(r.line)}</td>
       <td>${esc(r.name ?? r.candidate?.displayName ?? r.raw?.name ?? '')}</td>
       <td>${status} ${dup}</td>
-      <td class="small">${(r.problems ?? []).map(esc).join('; ')}</td>
+      <td class="small">${(r.problems ?? []).map((p) => esc(p?.message ?? p)).join('; ')}</td>
     </tr>`;
   });
   return `
@@ -145,6 +145,7 @@ async function newLead(root) {
       { name: 'phoneE164', label: 'Phone (E.164)', type: 'text', placeholder: '+92…' },
       { name: 'email', label: 'Email', type: 'text' },
       { name: 'city', label: 'City', type: 'text' },
+      { name: 'address', label: 'Address', type: 'text' },
       { name: 'category', label: 'Category', type: 'text', placeholder: 'e.g. restaurant' },
       { name: 'contactPersonName', label: 'Contact person', type: 'text' },
       { name: 'requirements', label: 'Requirements / notes', type: 'textarea' },
@@ -177,7 +178,8 @@ async function renderList(root) {
     const res = await api('GET', `/api/leads?${querystring()}`);
     const rows = (res.items ?? []).map((l) => `<tr class="clickable" data-id="${esc(l.id)}">
       <td><strong>${esc(l.displayName)}</strong>
-        <div class="muted small">${esc(l.city ?? '')}${l.city && l.category ? ' · ' : ''}${esc(l.category ?? '')}</div></td>
+        <div class="muted small">${esc(l.city ?? '')}${l.city && l.category ? ' · ' : ''}${esc(l.category ?? '')}</div>
+        ${l.address ? `<div class="muted small">${esc(l.address)}</div>` : ''}</td>
       <td>${stageBadge(l.stage)}</td>
       <td>${l.score === null ? '<span class="muted">—</span>' : `${esc(l.score)} ${bandBadge(l.scoreBand)}`}</td>
       <td>${eligBadge(l.eligibilityState)}</td>
@@ -192,7 +194,13 @@ async function renderList(root) {
         <span class="muted small">${total} lead${total === 1 ? '' : 's'} · page ${res.page ?? 1} of ${pages}</span>
         <button class="btn sm" data-prev ${(res.page ?? 1) <= 1 ? 'disabled' : ''}>← Prev</button>
         <button class="btn sm" data-next ${(res.page ?? 1) >= pages ? 'disabled' : ''}>Next →</button>
-      </div>`;
+      </div>
+      <p class="muted small" style="margin:10px 0 0">
+        Leads discovered from OpenStreetMap ©
+        <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">OpenStreetMap contributors</a>
+        — Data available under the
+        <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">Open Database License (ODbL)</a>.
+      </p>`;
     const prev = $('[data-prev]', container);
     const next = $('[data-next]', container);
     if (prev) prev.addEventListener('click', () => { state.page -= 1; renderList(root); });
@@ -212,6 +220,7 @@ export async function renderLeads(root, ctx) {
       <div class="btn-row">
         <button class="btn" data-action="discover">Discover (OpenStreetMap)</button>
         <button class="btn" data-action="import">Import CSV / Excel</button>
+        <button class="btn" data-action="export">Export CSV</button>
         <button class="btn primary" data-action="new">New lead</button>
       </div>
     </div>
@@ -265,31 +274,75 @@ export async function renderLeads(root, ctx) {
   $('[data-action=import]', root).addEventListener('click', () => runImport(root));
   $('[data-action=new]', root).addEventListener('click', () => newLead(root));
 
+  // Phase 8: full CSV export of every live lead (address + coordinates
+  // included, so the file round-trips through the import unchanged).
+  $('[data-action=export]', root).addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    try {
+      const res = await fetch('/api/leads/export', { credentials: 'same-origin' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const blob = await res.blob();
+      const cd = res.headers.get('content-disposition') ?? '';
+      const match = /filename="([^"]+)"/.exec(cd);
+      const filename = match ? match[1] : 'leads-export.csv';
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      toast('Export ready', `${filename} — re-importable as-is.`);
+    } catch (err) {
+      toast('Export failed', errMsg(err), 'err');
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
   // Phase 12: lead discovery run (OpenStreetMap/Overpass — free, public data).
-  $('[data-action=discover]', root).addEventListener('click', async () => {
+  $('[data-action=discover]', root).addEventListener('click', async (e) => {
+    // Captured synchronously: `currentTarget` is nulled once dispatch ends,
+    // i.e. before the confirm dialog (and the run itself) resolves.
+    const btn = e.currentTarget;
     const ok = await confirmDialog({
       title: 'Discover leads on OpenStreetMap?',
       body: `<p>Searches public OpenStreetMap data (free Overpass API, no customer is contacted)
         for the categories and cities configured in the discovery policy, then creates leads
         through the normal import pipeline — duplicates are detected and merged automatically.</p>
         <p class="muted small">Works in simulation mode. Coverage in Pakistan is good for named
-        businesses with a published phone, and thinner than commercial directories.</p>`,
+        businesses with a published phone, and thinner than commercial directories.</p>
+        <p class="muted small">© OpenStreetMap contributors — Data available under the
+        <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">Open Database License (ODbL)</a>.</p>`,
       confirmLabel: 'Run discovery',
     });
     if (!ok) return;
+    // A run issues one request per city (each with a hard deadline) and can
+    // take minutes: lock the button for the duration so a second click cannot
+    // start a concurrent run, and show that work is in progress.
+    const label = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = 'Discovering…';
     try {
       const out = await api('POST', '/api/discovery/run', { json: {} });
       const r = out.run;
       const cityErrors = (r.cityResults ?? []).filter((c) => c.error);
+      // ODbL credit rides along with every run result (Phase 9).
+      const credit = r.attribution?.text ? ` © OpenStreetMap contributors (${r.attribution.license})` : '';
       toast(
         'Discovery finished',
         `${r.hits} hit(s): ${r.created} new, ${r.pendingReview} need review, ${r.merged} merged` +
-          `${cityErrors.length ? `, ${cityErrors.length} city error(s)` : ''}.`,
+          `${cityErrors.length ? `, ${cityErrors.length} city error(s)` : ''}.${credit}`,
         r.created > 0 ? 'ok' : 'warn',
       );
       await renderList(root);
     } catch (err) {
       toast('Discovery failed', errMsg(err), 'err');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = label;
     }
   });
 

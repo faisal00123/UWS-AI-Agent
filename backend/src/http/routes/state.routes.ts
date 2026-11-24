@@ -27,13 +27,13 @@ export function stateRoutes(deps: AppDeps): Router {
   router.get(
     '/',
     requireAuth,
-    asyncRoute((req, res) => {
-      const state = getOperatingState(req.ctx.deps.db);
-      const summary = summarise(req.ctx.deps.db);
-      const evaluation = evaluateResume(req.ctx.deps.db, req.ctx.deps.config);
+    asyncRoute(async (req, res) => {
+      const state = await getOperatingState(req.ctx.deps.db);
+      const summary = await summarise(req.ctx.deps.db);
+      const evaluation = await evaluateResume(req.ctx.deps.db, req.ctx.deps.config);
       // Phase 11B: latest live activation record (which guardrail checks
       // passed when live mode was enabled, and when it was reverted).
-      const activation = latestActivation(req.ctx.deps.db);
+      const activation = await latestActivation(req.ctx.deps.db);
       res.json({ state, summary, resume: evaluation, activation });
     }),
   );
@@ -42,15 +42,15 @@ export function stateRoutes(deps: AppDeps): Router {
     '/emergency-stop',
     requireAuth,
     requireCsrf,
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const body = z.object({ reason: z.string().min(3).max(500) }).parse(req.body);
-      const state = emergencyStop(req.ctx.deps.db, body.reason, {
+      const state = await emergencyStop(req.ctx.deps.db, body.reason, {
         userId: req.ctx.user!.id,
         label: req.ctx.user!.role,
         displayName: req.ctx.user!.displayName,
         ipHash: req.ctx.ipHash,
       });
-      res.json({ state, summary: summarise(req.ctx.deps.db) });
+      res.json({ state, summary: await summarise(req.ctx.deps.db) });
     }),
   );
 
@@ -60,11 +60,11 @@ export function stateRoutes(deps: AppDeps): Router {
     requireRole('owner'),
     requireCsrf,
     requireReauth,
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const body = z
         .object({ clearEmergencyStop: z.boolean().default(true), acknowledgeChecks: z.boolean().optional() })
         .parse(req.body);
-      const result = resume(req.ctx.deps.db, req.ctx.deps.config, {
+      const result = await resume(req.ctx.deps.db, req.ctx.deps.config, {
         userId: req.ctx.user!.id,
         label: 'owner',
         displayName: req.ctx.user!.displayName,
@@ -73,7 +73,7 @@ export function stateRoutes(deps: AppDeps): Router {
       res.json({
         state: result.state,
         evaluation: result.evaluation,
-        summary: summarise(req.ctx.deps.db),
+        summary: await summarise(req.ctx.deps.db),
       });
     }),
   );
@@ -94,7 +94,7 @@ export function stateRoutes(deps: AppDeps): Router {
     requireAuth,
     requireRole('owner'),
     requireCsrf,
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const body = modeBody.parse(req.body);
       if (body.mode === 'live') {
         if (body.confirmation !== 'GO LIVE') {
@@ -109,13 +109,13 @@ export function stateRoutes(deps: AppDeps): Router {
           });
         }
       }
-      const state = setMode(req.ctx.deps.db, req.ctx.deps.config, body.mode, {
+      const state = await setMode(req.ctx.deps.db, req.ctx.deps.config, body.mode, {
         userId: req.ctx.user!.id,
         label: 'owner',
         displayName: req.ctx.user!.displayName,
         ipHash: req.ctx.ipHash,
       });
-      res.json({ state, summary: summarise(req.ctx.deps.db) });
+      res.json({ state, summary: await summarise(req.ctx.deps.db) });
     }),
   );
 

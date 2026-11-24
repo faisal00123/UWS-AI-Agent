@@ -100,13 +100,13 @@ interface RefRows {
   id: string;
 }
 
-function refsFor(db: DB, sql: string, ...params: (string | number)[]): string[] {
-  const rows = db.prepare(`${sql} LIMIT ${MAX_REFS}`).all(...params) as unknown as RefRows[];
+async function refsFor(db: DB, sql: string, ...params: (string | number)[]): Promise<string[]> {
+  const rows = (await db.prepare(`${sql} LIMIT ${MAX_REFS}`).all(...params)) as RefRows[];
   return rows.map((r) => r.id);
 }
 
-function countFor(db: DB, sql: string, ...params: (string | number)[]): number {
-  const row = db.prepare(sql).get(...params) as { c: number };
+async function countFor(db: DB, sql: string, ...params: (string | number)[]): Promise<number> {
+  const row = (await db.prepare(sql).get(...params)) as { c: number };
   return row.c;
 }
 
@@ -117,7 +117,7 @@ const METRIC_CHANNELS: { metric: string; channel: string; label: string }[] = [
   { metric: 'whatsapp_calls', channel: 'whatsapp_call', label: 'WhatsApp calls' },
 ];
 
-export function reconcileDay(db: DB, cfg: Config, reportDate: string, now: Date = new Date()): Reconciliation {
+export async function reconcileDay(db: DB, cfg: Config, reportDate: string, now: Date = new Date()): Promise<Reconciliation> {
   const { start, end } = businessDayUtcRange(cfg, reportDate);
   const s = start.toISOString();
   const e = end.toISOString();
@@ -132,7 +132,7 @@ export function reconcileDay(db: DB, cfg: Config, reportDate: string, now: Date 
     WHERE created_at >= ? AND created_at < ? AND decision = 'allowed'
       AND ((channel IN ('call','whatsapp_call') AND call_id IS NULL)
         OR (channel = 'whatsapp_message' AND message_id IS NULL))`;
-  const missingCount = countFor(db, `SELECT COUNT(*) c FROM (${missingSql})`, s, e);
+  const missingCount = await countFor(db, `SELECT COUNT(*) c FROM (${missingSql})`, s, e);
   checks.push({
     code: 'missing_execution',
     label: 'Allowed attempts have execution rows',
@@ -148,7 +148,7 @@ export function reconcileDay(db: DB, cfg: Config, reportDate: string, now: Date 
       severity: 'critical',
       count: missingCount,
       detail: 'Allowed outreach attempt(s) without a corresponding call/message row.',
-      refs: refsFor(db, missingSql, s, e),
+      refs: await refsFor(db, missingSql, s, e),
     });
   }
 
@@ -157,16 +157,16 @@ export function reconcileDay(db: DB, cfg: Config, reportDate: string, now: Date 
   const driftRefs: string[] = [];
   const driftDetails: string[] = [];
   for (const m of METRIC_CHANNELS) {
-    const allowed = countFor(
+    const allowed = await countFor(
       db,
       `SELECT COUNT(*) c FROM outreach_attempts WHERE created_at >= ? AND created_at < ? AND decision = 'allowed' AND channel = ?`,
       s,
       e,
       m.channel,
     );
-    const usage = db
+    const usage = (await db
       .prepare('SELECT used_value FROM budget_usage WHERE usage_date = ? AND metric = ?')
-      .get(reportDate, m.metric) as { used_value: number } | undefined;
+      .get(reportDate, m.metric)) as { used_value: number } | undefined;
     const used = usage?.used_value ?? 0;
     if (allowed === 0 && !usage) continue; // nothing metered, nothing to compare
     if (allowed !== used) {
@@ -198,7 +198,7 @@ export function reconcileDay(db: DB, cfg: Config, reportDate: string, now: Date 
   const stuckCallSql = `SELECT id FROM calls
     WHERE created_at >= ? AND created_at < ? AND created_at < ?
       AND simulation = 0 AND status IN ('queued','initiated','ringing','in_progress')`;
-  const stuckCalls = countFor(db, `SELECT COUNT(*) c FROM (${stuckCallSql})`, s, e, graceCutoff);
+  const stuckCalls = await countFor(db, `SELECT COUNT(*) c FROM (${stuckCallSql})`, s, e, graceCutoff);
   checks.push({
     code: 'call_without_provider_callback',
     label: 'Live calls reached a terminal status',
@@ -214,7 +214,7 @@ export function reconcileDay(db: DB, cfg: Config, reportDate: string, now: Date 
       severity: 'warning',
       count: stuckCalls,
       detail: 'Live call(s) still non-terminal well after placement; check the telephony webhook.',
-      refs: refsFor(db, stuckCallSql, s, e, graceCutoff),
+      refs: await refsFor(db, stuckCallSql, s, e, graceCutoff),
     });
   }
 
@@ -222,7 +222,7 @@ export function reconcileDay(db: DB, cfg: Config, reportDate: string, now: Date 
   const stuckMsgSql = `SELECT id FROM messages
     WHERE created_at >= ? AND created_at < ? AND created_at < ?
       AND simulation = 0 AND status IN ('queued','accepted','sent')`;
-  const stuckMsgs = countFor(db, `SELECT COUNT(*) c FROM (${stuckMsgSql})`, s, e, graceCutoff);
+  const stuckMsgs = await countFor(db, `SELECT COUNT(*) c FROM (${stuckMsgSql})`, s, e, graceCutoff);
   checks.push({
     code: 'message_without_provider_callback',
     label: 'Live messages reached a terminal status',
@@ -238,18 +238,18 @@ export function reconcileDay(db: DB, cfg: Config, reportDate: string, now: Date 
       severity: 'warning',
       count: stuckMsgs,
       detail: 'Live message(s) still non-terminal well after sending; check the WhatsApp webhook.',
-      refs: refsFor(db, stuckMsgSql, s, e, graceCutoff),
+      refs: await refsFor(db, stuckMsgSql, s, e, graceCutoff),
     });
   }
 
   // 5. Costs exist or are explicitly reported missing — never estimated.
-  const allowedTotal = countFor(
+  const allowedTotal = await countFor(
     db,
     `SELECT COUNT(*) c FROM outreach_attempts WHERE created_at >= ? AND created_at < ? AND decision = 'allowed'`,
     s,
     e,
   );
-  const costRows = countFor(db, `SELECT COUNT(*) c FROM cost_records WHERE usage_date = ?`, reportDate);
+  const costRows = await countFor(db, `SELECT COUNT(*) c FROM cost_records WHERE usage_date = ?`, reportDate);
   const costMissing = allowedTotal > 0 && costRows === 0;
   checks.push({
     code: 'cost_data_available',

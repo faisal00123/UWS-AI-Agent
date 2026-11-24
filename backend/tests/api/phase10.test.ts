@@ -253,11 +253,11 @@ describe('phase 10 API', () => {
     });
     assert.equal(res.status, 200, res.raw);
 
-    const audit = server.db
+    const audit = (await server.db
       .prepare(
         `SELECT COUNT(*) c FROM audit_events WHERE action = 'settings.reset' AND entity_id = 'daily_call_limit'`,
       )
-      .get() as { c: number };
+      .get()) as { c: number };
     assert.ok(audit.c >= 1, 'resetting a setting must be audited');
   });
 });

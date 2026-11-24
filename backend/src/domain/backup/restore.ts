@@ -40,10 +40,10 @@ export interface LateSuppression {
  * Opt-outs recorded in the LIVE database after the snapshot was taken. Read
  * before the swap so the restored file can re-apply them.
  */
-export function capturePostBackupSuppressions(liveDb: DB, backupCreatedAt: string): LateSuppression[] {
-  return liveDb
+export async function capturePostBackupSuppressions(liveDb: DB, backupCreatedAt: string): Promise<LateSuppression[]> {
+  return (await liveDb
     .prepare('SELECT * FROM suppression_list WHERE created_at > ? ORDER BY created_at')
-    .all(backupCreatedAt) as unknown as LateSuppression[];
+    .all(backupCreatedAt)) as LateSuppression[];
 }
 
 /**
@@ -51,11 +51,14 @@ export function capturePostBackupSuppressions(liveDb: DB, backupCreatedAt: strin
  * present (same id or same business+reason unique pair) are skipped, so a
  * double-run can never duplicate or error.
  */
-export function applyRestoredSuppressions(restoredDb: DB, late: LateSuppression[]): { applied: number; skipped: number } {
+export async function applyRestoredSuppressions(
+  restoredDb: DB,
+  late: LateSuppression[],
+): Promise<{ applied: number; skipped: number }> {
   let applied = 0;
   let skipped = 0;
   for (const row of late) {
-    const exists = restoredDb
+    const exists = await restoredDb
       .prepare(
         `SELECT 1 FROM suppression_list WHERE id = ?
            OR (business_id IS ? AND business_id IS NOT NULL AND reason = ?)`,
@@ -66,7 +69,7 @@ export function applyRestoredSuppressions(restoredDb: DB, late: LateSuppression[
       continue;
     }
     try {
-      restoredDb
+      await restoredDb
         .prepare(
           `INSERT INTO suppression_list (id, business_id, scope, phone_e164, whatsapp_e164, email,
              reason, source, evidence, permanent, created_by, created_at)
@@ -179,11 +182,11 @@ export interface ApplyRestoreResult {
  * verified the backup and collected an explicit --confirm; this function
  * re-checks that the live file is free before touching anything.
  */
-export function applyRestore(
+export async function applyRestore(
   cfg: Config,
   backup: { path: string; createdAt: string },
   opts: { passphrase?: string },
-): ApplyRestoreResult {
+): Promise<ApplyRestoreResult> {
   const dbPath = cfg.databasePath;
   if (dbPath === ':memory:') {
     throw new AppError('validation_failed', 'Cannot apply a restore to an in-memory database');
@@ -199,7 +202,7 @@ export function applyRestore(
   if (existsSync(dbPath)) {
     const live = new DatabaseSync(dbPath, { readOnly: true, enableForeignKeyConstraints: false });
     try {
-      late = capturePostBackupSuppressions(live as unknown as DB, backup.createdAt);
+      late = await capturePostBackupSuppressions(live as unknown as DB, backup.createdAt);
     } finally {
       live.close();
     }
@@ -214,7 +217,7 @@ export function applyRestore(
   let applied = { applied: 0, skipped: 0 };
   try {
     restored.exec('PRAGMA foreign_keys = ON');
-    applied = applyRestoredSuppressions(restored as unknown as DB, late);
+    applied = await applyRestoredSuppressions(restored as unknown as DB, late);
     const integrity = restored.prepare('PRAGMA integrity_check').get() as { integrity_check?: string } | undefined;
     if (integrity?.integrity_check !== 'ok') {
       throw new AppError('validation_failed', `Restored copy failed final integrity check: ${integrity?.integrity_check}`);

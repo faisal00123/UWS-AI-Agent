@@ -62,7 +62,7 @@ export function createTwilioAdapter(opts: TwilioOptions): TelephonyPort {
     key: 'twilio',
     label: 'Twilio (voice)',
 
-    status(): AdapterStatus {
+    async status(): Promise<AdapterStatus> {
       const configured = Boolean(opts.accountSid && opts.authToken && opts.fromNumber);
       return {
         key: 'telephony',

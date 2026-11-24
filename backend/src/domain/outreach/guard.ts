@@ -20,7 +20,7 @@
  * daily counters — so the hard caps are enforced by the database atomically,
  * not by optimistic read-then-write code.
  */
-import type { SQLInputValue } from 'node:sqlite';
+import type { SqlParam } from '../../db/types.ts';
 import type { DB } from '../../db/index.ts';
 import type { Config } from '../../core/config.ts';
 import { newId } from '../../core/ids.ts';
@@ -95,15 +95,22 @@ export interface UsageSnapshot {
  * fresh here means the atomic consume below always compares against the same
  * number the guard reported to the operator.
  */
-export function usageSnapshot(db: DB, usageDate: string, metric: string, limit: number): UsageSnapshot {
-  db.prepare(
-    `INSERT INTO budget_usage (usage_date, metric, used_value, limit_value, state, updated_at)
-     VALUES (?, ?, 0, ?, 'ok', ?)
-     ON CONFLICT(usage_date, metric) DO UPDATE SET limit_value = excluded.limit_value, updated_at = excluded.updated_at`,
-  ).run(usageDate, metric, limit, nowIso());
-  const row = db
+export async function usageSnapshot(
+  db: DB,
+  usageDate: string,
+  metric: string,
+  limit: number,
+): Promise<UsageSnapshot> {
+  await db
+    .prepare(
+      `INSERT INTO budget_usage (usage_date, metric, used_value, limit_value, state, updated_at)
+       VALUES (?, ?, 0, ?, 'ok', ?)
+       ON CONFLICT(usage_date, metric) DO UPDATE SET limit_value = excluded.limit_value, updated_at = excluded.updated_at`,
+    )
+    .run(usageDate, metric, limit, nowIso());
+  const row = (await db
     .prepare('SELECT used_value, limit_value FROM budget_usage WHERE usage_date = ? AND metric = ?')
-    .get(usageDate, metric) as { used_value: number; limit_value: number } | undefined;
+    .get(usageDate, metric)) as { used_value: number; limit_value: number } | undefined;
   return { used: row?.used_value ?? 0, limit: row?.limit_value ?? limit };
 }
 
@@ -112,8 +119,13 @@ export function usageSnapshot(db: DB, usageDate: string, metric: string, limit: 
  * the UPDATE so two concurrent requests can never both squeeze past the cap:
  * at most one receives `changes = 1`. Returns false when the cap is reached.
  */
-export function tryConsumeUsage(db: DB, usageDate: string, metric: string, amount: number): boolean {
-  const res = db
+export async function tryConsumeUsage(
+  db: DB,
+  usageDate: string,
+  metric: string,
+  amount: number,
+): Promise<boolean> {
+  const res = await db
     .prepare(
       `UPDATE budget_usage SET used_value = used_value + ?, state = CASE
           WHEN used_value + ? >= limit_value THEN 'exhausted'
@@ -138,14 +150,14 @@ export function businessDayKey(cfg: Config, now: Date): string {
 }
 
 /** Effective daily call ceiling: owner setting clamped by the compiled-in hard limit. */
-export function effectiveCallLimit(db: DB, cfg: Config): number {
-  const setting = getSetting<number>(db, 'daily_call_limit', cfg);
+export async function effectiveCallLimit(db: DB, cfg: Config): Promise<number> {
+  const setting = await getSetting<number>(db, 'daily_call_limit', cfg);
   return Math.max(1, Math.min(setting, cfg.hardDailyCallLimit));
 }
 
 /** Effective daily spend cap in minor units (0 = unlimited, mirroring resume checks). */
-export function effectiveBudgetMinor(db: DB, cfg: Config): number {
-  const setting = getSetting<{ limitMinor: number }>(db, 'daily_budget', cfg);
+export async function effectiveBudgetMinor(db: DB, cfg: Config): Promise<number> {
+  const setting = await getSetting<{ limitMinor: number }>(db, 'daily_budget', cfg);
   return Math.min(setting.limitMinor, cfg.hardDailyBudgetMinor);
 }
 
@@ -155,10 +167,10 @@ export function effectiveBudgetMinor(db: DB, cfg: Config): number {
  * Evaluate every safeguard for one requested outbound action. Never throws for
  * a normal "blocked" outcome; the caller records the verdict in the ledger.
  */
-export function runGuard(db: DB, cfg: Config, input: GuardInput): GuardVerdict {
+export async function runGuard(db: DB, cfg: Config, input: GuardInput): Promise<GuardVerdict> {
   const now = input.now ?? new Date();
   const checks: GuardCheck[] = [];
-  const state = getOperatingState(db);
+  const state = await getOperatingState(db);
   const mode = state.mode;
 
   // 1. Emergency stop overrides everything.
@@ -218,7 +230,7 @@ export function runGuard(db: DB, cfg: Config, input: GuardInput): GuardVerdict {
   // 4. Eligibility (consent, suppression, destination, channel switch). The
   //    blocked code mirrors the eligibility decision so the ledger can tell a
   //    hard "do not contact" apart from a "consent unconfirmed, needs review".
-  const eligibility = evaluateEligibility(db, cfg, input.businessId, input.channel as Channel);
+  const eligibility = await evaluateEligibility(db, cfg, input.businessId, input.channel as Channel);
   const eligibilityCode =
     eligibility.decision === 'eligible' ? 'eligible' : eligibility.decision === 'ineligible' ? 'ineligible' : 'needs_review';
   checks.push({
@@ -234,9 +246,9 @@ export function runGuard(db: DB, cfg: Config, input: GuardInput): GuardVerdict {
   // 5. Daily volume. Voice channels share the single hard call counter so the
   //    100/day ceiling holds across call and WhatsApp-call alike.
   const dayKey = businessDayKey(cfg, now);
-  const callLimit = effectiveCallLimit(db, cfg);
+  const callLimit = await effectiveCallLimit(db, cfg);
   if (isVoice(input.channel)) {
-    const usage = usageSnapshot(db, dayKey, 'calls', callLimit);
+    const usage = await usageSnapshot(db, dayKey, 'calls', callLimit);
     checks.push(
       usage.used < usage.limit
         ? {
@@ -254,7 +266,7 @@ export function runGuard(db: DB, cfg: Config, input: GuardInput): GuardVerdict {
     );
   } else {
     // Messages keep their own counter, capped defensively at the same ceiling.
-    const usage = usageSnapshot(db, dayKey, 'whatsapp_messages', callLimit);
+    const usage = await usageSnapshot(db, dayKey, 'whatsapp_messages', callLimit);
     checks.push(
       usage.used < usage.limit
         ? {
@@ -274,10 +286,10 @@ export function runGuard(db: DB, cfg: Config, input: GuardInput): GuardVerdict {
 
   // 6. Daily budget. Simulation spends nothing, so this only bites in live
   //    mode — but it is evaluated uniformly so a mode flip mid-day is safe.
-  const budgetLimit = effectiveBudgetMinor(db, cfg);
-  const costRow = db
+  const budgetLimit = await effectiveBudgetMinor(db, cfg);
+  const costRow = (await db
     .prepare(`SELECT used_value FROM budget_usage WHERE usage_date = ? AND metric = 'cost_minor'`)
-    .get(dayKey) as { used_value: number } | undefined;
+    .get(dayKey)) as { used_value: number } | undefined;
   const costUsed = costRow?.used_value ?? 0;
   const budgetExhausted = budgetLimit > 0 && costUsed >= budgetLimit;
   checks.push({
@@ -300,7 +312,7 @@ export function runGuard(db: DB, cfg: Config, input: GuardInput): GuardVerdict {
         detail: 'Owner-initiated action: the calling window is recorded but not enforced.',
       });
     } else {
-      const w = callingWindowFor(db, cfg, input.channel as Channel);
+      const w = await callingWindowFor(db, cfg, input.channel as Channel);
       const inWindow = inCallingWindow(now.toISOString(), w);
       checks.push({
         code: 'calling_window',
@@ -406,13 +418,13 @@ function toAttempt(r: AttemptRow): OutreachAttempt {
   };
 }
 
-export function getAttempt(db: DB, id: string): OutreachAttempt | null {
-  const r = db.prepare('SELECT * FROM outreach_attempts WHERE id = ?').get(id) as AttemptRow | undefined;
+export async function getAttempt(db: DB, id: string): Promise<OutreachAttempt | null> {
+  const r = (await db.prepare('SELECT * FROM outreach_attempts WHERE id = ?').get(id)) as AttemptRow | undefined;
   return r ? toAttempt(r) : null;
 }
 
-export function findAttemptByKey(db: DB, key: string): OutreachAttempt | null {
-  const r = db.prepare('SELECT * FROM outreach_attempts WHERE idempotency_key = ?').get(key) as
+export async function findAttemptByKey(db: DB, key: string): Promise<OutreachAttempt | null> {
+  const r = (await db.prepare('SELECT * FROM outreach_attempts WHERE idempotency_key = ?').get(key)) as
     | AttemptRow
     | undefined;
   return r ? toAttempt(r) : null;
@@ -429,19 +441,21 @@ export interface RecordedAttempt {
  * or blocked — produces exactly one row; a repeated idempotency key returns the
  * original row instead of writing a second one.
  */
-export function recordAttempt(db: DB, input: RecordAttemptInput): RecordedAttempt {
+export async function recordAttempt(db: DB, input: RecordAttemptInput): Promise<RecordedAttempt> {
   const key = input.idempotencyKey?.trim() || newId('idem');
-  const existing = findAttemptByKey(db, key);
+  const existing = await findAttemptByKey(db, key);
   if (existing) return { attempt: existing, replayed: true };
 
   const id = newId('oat');
   const at = nowIso();
   const allowed = input.verdict.allowed;
-  db.prepare(
-    `INSERT INTO outreach_attempts (id, business_id, channel, purpose, task_id, decision, blocked_reason,
-       blocked_code, guard_results_json, mode, provider, call_id, message_id, idempotency_key, created_by, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)`,
-  ).run(
+  await db
+    .prepare(
+      `INSERT INTO outreach_attempts (id, business_id, channel, purpose, task_id, decision, blocked_reason,
+         blocked_code, guard_results_json, mode, provider, call_id, message_id, idempotency_key, created_by, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)`,
+    )
+    .run(
     id,
     input.businessId,
     input.channel,
@@ -460,21 +474,18 @@ export function recordAttempt(db: DB, input: RecordAttemptInput): RecordedAttemp
     input.createdBy ?? null,
     at,
   );
-  return { attempt: getAttempt(db, id) as OutreachAttempt, replayed: false };
+  return { attempt: (await getAttempt(db, id)) as OutreachAttempt, replayed: false };
 }
 
 /** Attach the created call/message (and the adapter that executed it) to its ledger row. */
-export function linkAttemptResult(
+export async function linkAttemptResult(
   db: DB,
   attemptId: string,
   result: { callId?: string; messageId?: string; provider?: string },
-): void {
-  db.prepare('UPDATE outreach_attempts SET call_id = ?, message_id = ?, provider = COALESCE(?, provider) WHERE id = ?').run(
-    result.callId ?? null,
-    result.messageId ?? null,
-    result.provider ?? null,
-    attemptId,
-  );
+): Promise<void> {
+  await db
+    .prepare('UPDATE outreach_attempts SET call_id = ?, message_id = ?, provider = COALESCE(?, provider) WHERE id = ?')
+    .run(result.callId ?? null, result.messageId ?? null, result.provider ?? null, attemptId);
 }
 
 export interface AttemptQuery {
@@ -483,15 +494,15 @@ export interface AttemptQuery {
   limit?: number;
 }
 
-export function listAttempts(db: DB, q: AttemptQuery): OutreachAttempt[] {
+export async function listAttempts(db: DB, q: AttemptQuery): Promise<OutreachAttempt[]> {
   const clauses: string[] = ['business_id = ?'];
-  const params: SQLInputValue[] = [q.businessId];
+  const params: SqlParam[] = [q.businessId];
   if (q.decision) {
     clauses.push('decision = ?');
     params.push(q.decision);
   }
-  const rows = db
-    .prepare(`SELECT * FROM outreach_attempts WHERE ${clauses.join(' AND ')} ORDER BY created_at DESC, rowid DESC LIMIT ?`)
-    .all(...params, q.limit ?? 100) as unknown as AttemptRow[];
+  const rows = (await db
+    .prepare(`SELECT * FROM outreach_attempts WHERE ${clauses.join(' AND ')} ORDER BY created_at DESC, id DESC LIMIT ?`)
+    .all(...params, q.limit ?? 100)) as AttemptRow[];
   return rows.map(toAttempt);
 }

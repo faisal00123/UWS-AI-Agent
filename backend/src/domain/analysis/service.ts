@@ -16,8 +16,10 @@ import type { DB } from '../../db/index.ts';
 import { newId } from '../../core/ids.ts';
 import { nowIso } from '../../core/time.ts';
 import { normalizeWebsite } from '../leads/normalize.ts';
+import { enrichLeadContacts } from '../leads/enrich.ts';
 import { fetchForAnalysis, type FetchOptions } from './fetcher.ts';
 import { analyzeHtml, NO_WEBSITE_NOT_MEASURED, ENGINE_VERSION, type MeasuredSignals, type Opportunity } from './parse.ts';
+import { extractContacts } from '../../core/contacts.ts';
 
 export type AnalysisStatus = 'pending' | 'running' | 'reachable' | 'unreachable' | 'blocked' | 'no_website' | 'error';
 
@@ -178,7 +180,7 @@ export async function analyzeWebsite(
   const { signals, opportunities, notMeasured } = analyzeHtml(outcome.html, outcome.finalUrl);
   const isEstimate = opportunities.some((o) => o.state === 'estimated');
 
-  return persist(db, {
+  const record = await persist(db, {
     id,
     businessId: input.businessId,
     targetUrl: site.url as string,
@@ -195,6 +197,23 @@ export async function analyzeWebsite(
     errorMessage: outcome.truncated ? 'Response truncated at size cap; signals cover the first portion only' : null,
     at,
   });
+
+  // Phase 4: free contact enrichment from the SAME fetch — no extra network,
+  // still inside the SSRF guard / timeout / size cap. Gap-fill only: a lead
+  // that already has an email/phone is never touched, every valid candidate
+  // is recorded in field_verifications, and nothing is invented.
+  const contacts = extractContacts(outcome.html);
+  if (contacts.emails.length > 0 || contacts.phones.length > 0) {
+    await enrichLeadContacts(db, {
+      businessId: input.businessId,
+      emails: contacts.emails,
+      phones: contacts.phones,
+      evidenceUrl: outcome.finalUrl,
+      method: 'website_analysis',
+    });
+  }
+
+  return record;
 }
 
 interface PersistInput {
@@ -215,13 +234,15 @@ interface PersistInput {
   at: string;
 }
 
-function persist(db: DB, input: PersistInput): WebsiteAnalysisRecord {
+async function persist(db: DB, input: PersistInput): Promise<WebsiteAnalysisRecord> {
   const s = input.signals;
   const estimates: Record<string, unknown> = {};
-  db.prepare(
-    `INSERT INTO website_analyses (${COLS})
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
+  await db
+    .prepare(
+      `INSERT INTO website_analyses (${COLS})
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
     input.id,
     input.businessId,
     input.targetUrl,
@@ -260,37 +281,39 @@ function persist(db: DB, input: PersistInput): WebsiteAnalysisRecord {
 
   // Keep the lead's stage moving only on a real, measured result.
   if (input.status === 'reachable' || input.status === 'no_website') {
-    db.prepare(
-      `UPDATE businesses SET last_checked_at = ?, updated_at = ? WHERE id = ?`,
-    ).run(input.at, input.at, input.businessId);
+    await db
+      .prepare(
+        `UPDATE businesses SET last_checked_at = ?, updated_at = ? WHERE id = ?`,
+      )
+      .run(input.at, input.at, input.businessId);
   } else {
-    db.prepare(`UPDATE businesses SET last_checked_at = ?, updated_at = ? WHERE id = ?`).run(
+    await db.prepare(`UPDATE businesses SET last_checked_at = ?, updated_at = ? WHERE id = ?`).run(
       input.at,
       input.at,
       input.businessId,
     );
   }
 
-  return getAnalysis(db, input.id) as WebsiteAnalysisRecord;
+  return (await getAnalysis(db, input.id)) as WebsiteAnalysisRecord;
 }
 
 /** Latest analysis for a lead, or null when none has ever been run. */
-export function latestAnalysis(db: DB, businessId: string): WebsiteAnalysisRecord | null {
-  const row = db
-    .prepare(`SELECT ${COLS} FROM website_analyses WHERE business_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1`)
-    .get(businessId) as Row | undefined;
+export async function latestAnalysis(db: DB, businessId: string): Promise<WebsiteAnalysisRecord | null> {
+  const row = (await db
+    .prepare(`SELECT ${COLS} FROM website_analyses WHERE business_id = ? ORDER BY created_at DESC, id DESC LIMIT 1`)
+    .get(businessId)) as Row | undefined;
   return row ? rowToRecord(row) : null;
 }
 
-export function getAnalysis(db: DB, id: string): WebsiteAnalysisRecord | null {
-  const row = db.prepare(`SELECT ${COLS} FROM website_analyses WHERE id = ?`).get(id) as Row | undefined;
+export async function getAnalysis(db: DB, id: string): Promise<WebsiteAnalysisRecord | null> {
+  const row = (await db.prepare(`SELECT ${COLS} FROM website_analyses WHERE id = ?`).get(id)) as Row | undefined;
   return row ? rowToRecord(row) : null;
 }
 
 /** Recent analyses for a lead (history view). */
-export function analysisHistory(db: DB, businessId: string, limit = 20): WebsiteAnalysisRecord[] {
-  const rows = db
+export async function analysisHistory(db: DB, businessId: string, limit = 20): Promise<WebsiteAnalysisRecord[]> {
+  const rows = (await db
     .prepare(`SELECT ${COLS} FROM website_analyses WHERE business_id = ? ORDER BY created_at DESC LIMIT ?`)
-    .all(businessId, limit) as unknown as Row[];
+    .all(businessId, limit)) as Row[];
   return rows.map(rowToRecord);
 }

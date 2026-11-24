@@ -74,16 +74,16 @@ export interface PortfolioQuery {
   limit?: number;
 }
 
-export function listPortfolio(db: DB, q: PortfolioQuery = {}): PortfolioItem[] {
+export async function listPortfolio(db: DB, q: PortfolioQuery = {}): Promise<PortfolioItem[]> {
   const where = q.shareableOnly ? 'WHERE verified = 1 AND is_approved = 1' : '';
-  const rows = db
+  const rows = (await db
     .prepare(`SELECT * FROM portfolio_items ${where} ORDER BY sort_order ASC, created_at ASC LIMIT ?`)
-    .all(q.limit ?? 200) as unknown as Row[];
+    .all(q.limit ?? 200)) as Row[];
   return rows.map(toItem);
 }
 
-export function getPortfolioItem(db: DB, id: string): PortfolioItem | null {
-  const r = db.prepare('SELECT * FROM portfolio_items WHERE id = ?').get(id) as Row | undefined;
+export async function getPortfolioItem(db: DB, id: string): Promise<PortfolioItem | null> {
+  const r = (await db.prepare('SELECT * FROM portfolio_items WHERE id = ?').get(id)) as Row | undefined;
   return r ? toItem(r) : null;
 }
 
@@ -98,54 +98,61 @@ export interface CreatePortfolioInput {
 }
 
 /** Create a draft item. New items start unverified and un-approved. */
-export function createPortfolioItem(db: DB, input: CreatePortfolioInput): PortfolioItem {
+export async function createPortfolioItem(db: DB, input: CreatePortfolioInput): Promise<PortfolioItem> {
   if (input.serviceKey) {
-    const svc = db.prepare('SELECT key FROM services WHERE key = ?').get(input.serviceKey);
+    const svc = await db.prepare('SELECT key FROM services WHERE key = ?').get(input.serviceKey);
     if (!svc) throw new AppError('validation_failed', `Unknown service key "${input.serviceKey}"`);
   }
   const id = newId('pfi');
   const at = nowIso();
-  db.prepare(
-    `INSERT INTO portfolio_items (id, title, description, service_key, url, image_url, verified, verification_note,
-       is_approved, sort_order, created_by, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, 0, NULL, 0, ?, ?, ?, ?)`,
-  ).run(
-    id,
-    input.title.trim(),
-    input.description?.trim() ?? '',
-    input.serviceKey ?? null,
-    input.url ?? null,
-    input.imageUrl ?? null,
-    input.sortOrder ?? 0,
-    input.createdBy ?? null,
-    at,
-    at,
-  );
-  return getPortfolioItem(db, id) as PortfolioItem;
+  await db
+    .prepare(
+      `INSERT INTO portfolio_items (id, title, description, service_key, url, image_url, verified, verification_note,
+         is_approved, sort_order, created_by, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, 0, NULL, 0, ?, ?, ?, ?)`,
+    )
+    .run(
+      id,
+      input.title.trim(),
+      input.description?.trim() ?? '',
+      input.serviceKey ?? null,
+      input.url ?? null,
+      input.imageUrl ?? null,
+      input.sortOrder ?? 0,
+      input.createdBy ?? null,
+      at,
+      at,
+    );
+  return (await getPortfolioItem(db, id)) as PortfolioItem;
 }
 
 /** Owner-only: mark an item verified (or un-verify it) with a note. */
-export function verifyPortfolioItem(db: DB, id: string, verified: boolean, note: string | null): PortfolioItem {
-  const item = getPortfolioItem(db, id);
+export async function verifyPortfolioItem(
+  db: DB,
+  id: string,
+  verified: boolean,
+  note: string | null,
+): Promise<PortfolioItem> {
+  const item = await getPortfolioItem(db, id);
   if (!item) throw notFound('Portfolio item');
   const trimmed = note?.trim() ?? '';
   if (verified && trimmed.length < 3) {
     throw new AppError('validation_failed', 'Verifying an item requires a note describing how it was verified');
   }
-  db.prepare(
-    `UPDATE portfolio_items SET verified = ?, verification_note = ?, updated_at = ? WHERE id = ?`,
-  ).run(verified ? 1 : 0, verified ? trimmed : null, nowIso(), id);
+  await db
+    .prepare(`UPDATE portfolio_items SET verified = ?, verification_note = ?, updated_at = ? WHERE id = ?`)
+    .run(verified ? 1 : 0, verified ? trimmed : null, nowIso(), id);
   // Un-verifying an approved item must also revoke approval: the two-key rule
   // would otherwise leave a stale "approved" flag on unverified material.
   if (!verified && item.isApproved) {
-    db.prepare(`UPDATE portfolio_items SET is_approved = 0, updated_at = ? WHERE id = ?`).run(nowIso(), id);
+    await db.prepare(`UPDATE portfolio_items SET is_approved = 0, updated_at = ? WHERE id = ?`).run(nowIso(), id);
   }
-  return getPortfolioItem(db, id) as PortfolioItem;
+  return (await getPortfolioItem(db, id)) as PortfolioItem;
 }
 
 /** Owner-only: approve (or withdraw) an item for use in outreach. */
-export function approvePortfolioItem(db: DB, id: string, approved: boolean): PortfolioItem {
-  const item = getPortfolioItem(db, id);
+export async function approvePortfolioItem(db: DB, id: string, approved: boolean): Promise<PortfolioItem> {
+  const item = await getPortfolioItem(db, id);
   if (!item) throw notFound('Portfolio item');
   if (approved && !item.verified) {
     throw new AppError(
@@ -154,12 +161,12 @@ export function approvePortfolioItem(db: DB, id: string, approved: boolean): Por
       { id, verified: item.verified },
     );
   }
-  db.prepare(`UPDATE portfolio_items SET is_approved = ?, updated_at = ? WHERE id = ?`).run(
+  await db.prepare(`UPDATE portfolio_items SET is_approved = ?, updated_at = ? WHERE id = ?`).run(
     approved ? 1 : 0,
     nowIso(),
     id,
   );
-  return getPortfolioItem(db, id) as PortfolioItem;
+  return (await getPortfolioItem(db, id)) as PortfolioItem;
 }
 
 /**
@@ -168,13 +175,17 @@ export function approvePortfolioItem(db: DB, id: string, approved: boolean): Por
  * every offender, so an operator cannot accidentally push a draft. With no ids
  * the current shareable set is used (capped so a message cannot balloon).
  */
-export function resolveShareableItems(db: DB, itemIds: string[] | null | undefined, max = 5): PortfolioItem[] {
+export async function resolveShareableItems(
+  db: DB,
+  itemIds: string[] | null | undefined,
+  max = 5,
+): Promise<PortfolioItem[]> {
   if (itemIds && itemIds.length > 0) {
     const items: PortfolioItem[] = [];
     const missing: string[] = [];
     const rejected: { id: string; title: string; verified: boolean; approved: boolean }[] = [];
     for (const id of [...new Set(itemIds)]) {
-      const item = getPortfolioItem(db, id);
+      const item = await getPortfolioItem(db, id);
       if (!item) {
         missing.push(id);
         continue;
@@ -200,7 +211,7 @@ export function resolveShareableItems(db: DB, itemIds: string[] | null | undefin
     }
     return items;
   }
-  const shareable = listPortfolio(db, { shareableOnly: true, limit: max });
+  const shareable = await listPortfolio(db, { shareableOnly: true, limit: max });
   if (shareable.length === 0) {
     throw new AppError(
       'validation_failed',
@@ -211,9 +222,9 @@ export function resolveShareableItems(db: DB, itemIds: string[] | null | undefin
 }
 
 /** Ids of every shareable item, used by tests and the dashboard. */
-export function shareableIds(db: DB): string[] {
-  const rows = db
+export async function shareableIds(db: DB): Promise<string[]> {
+  const rows = (await db
     .prepare('SELECT id FROM portfolio_items WHERE verified = 1 AND is_approved = 1 ORDER BY sort_order ASC')
-    .all() as unknown as { id: string }[];
+    .all()) as { id: string }[];
   return rows.map((r) => r.id);
 }

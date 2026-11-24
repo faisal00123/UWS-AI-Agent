@@ -78,16 +78,16 @@ function pendingRecord(key: IntegrationKey): OnboardingRecord {
 }
 
 /** Onboarding record for one integration (missing row => pending). */
-export function getOnboarding(db: DB, key: IntegrationKey): OnboardingRecord {
-  const row = db.prepare('SELECT * FROM provider_onboardings WHERE integration = ?').get(key) as
+export async function getOnboarding(db: DB, key: IntegrationKey): Promise<OnboardingRecord> {
+  const row = (await db.prepare('SELECT * FROM provider_onboardings WHERE integration = ?').get(key)) as
     | OnboardingRow
     | undefined;
   return row ? toRecord(row) : pendingRecord(key);
 }
 
 /** Onboarding records for every integration (missing rows => pending). */
-export function getOnboardingState(db: DB): Record<IntegrationKey, OnboardingRecord> {
-  const rows = db.prepare('SELECT * FROM provider_onboardings').all() as unknown as OnboardingRow[];
+export async function getOnboardingState(db: DB): Promise<Record<IntegrationKey, OnboardingRecord>> {
+  const rows = (await db.prepare('SELECT * FROM provider_onboardings').all()) as OnboardingRow[];
   const out = {} as Record<IntegrationKey, OnboardingRecord>;
   for (const key of ALL_KEYS) {
     const row = rows.find((r) => r.integration === key);
@@ -127,31 +127,33 @@ export async function recordOnboardingVerification(
   const probe = await runHealthCheck(db, cfg, registry, key);
 
   const state = stateFromProbe(probe);
-  const status = registry[key]?.status?.() ?? null;
+  const status = registry[key]?.status ? (await registry[key].status!()) : null;
   const provider = status?.implementation ?? null;
   const at = nowIso();
 
-  db.prepare(
-    `INSERT INTO provider_onboardings (integration, provider, state, verified_at, verified_by, detail, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT(integration) DO UPDATE SET
-       provider    = excluded.provider,
-       state       = excluded.state,
-       verified_at = excluded.verified_at,
-       verified_by = excluded.verified_by,
-       detail      = excluded.detail,
-       updated_at  = excluded.updated_at`,
-  ).run(
-    key,
-    provider,
-    state,
-    state === 'verified' ? probe.checkedAt : null,
-    state === 'verified' ? actor.userId : null,
-    probe.detail.slice(0, 300),
-    at,
-  );
+  await db
+    .prepare(
+      `INSERT INTO provider_onboardings (integration, provider, state, verified_at, verified_by, detail, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(integration) DO UPDATE SET
+         provider    = excluded.provider,
+         state       = excluded.state,
+         verified_at = excluded.verified_at,
+         verified_by = excluded.verified_by,
+         detail      = excluded.detail,
+         updated_at  = excluded.updated_at`,
+    )
+    .run(
+      key,
+      provider,
+      state,
+      state === 'verified' ? probe.checkedAt : null,
+      state === 'verified' ? actor.userId : null,
+      probe.detail.slice(0, 300),
+      at,
+    );
 
-  recordAudit(db, {
+  await recordAudit(db, {
     actorUserId: actor.userId,
     actorLabel: actor.label,
     action: state === 'verified' ? 'integration.onboarded' : 'integration.onboarding_failed',
@@ -161,7 +163,7 @@ export async function recordOnboardingVerification(
     details: { integration: key, provider, state, probeState: probe.state },
   });
 
-  return { record: getOnboarding(db, key), probe };
+  return { record: await getOnboarding(db, key), probe };
 }
 
 /**
@@ -169,6 +171,9 @@ export async function recordOnboardingVerification(
  * guardrail (telephony must be verified before live activation) and by the
  * dashboard to show readiness.
  */
-export function allVerified(db: DB, keys: IntegrationKey[] = ALL_KEYS): boolean {
-  return keys.every((k) => getOnboarding(db, k).state === 'verified');
+export async function allVerified(db: DB, keys: IntegrationKey[] = ALL_KEYS): Promise<boolean> {
+  for (const k of keys) {
+    if ((await getOnboarding(db, k)).state !== 'verified') return false;
+  }
+  return true;
 }

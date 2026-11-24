@@ -16,6 +16,7 @@
 | CSRF double-submit: mutating requests require `x-csrf-token` matching the readable `uws_csrf` cookie | ✅ | `requireCsrf`; API tests reject a missing/incorrect token with 403 |
 | Login rate limiting (per account + per IP) returns 429 | ✅ | `loginLimiter`; API test trips it within 8 attempts |
 | Generic login failure message (no account enumeration) | ✅ | API test asserts identical 401 for wrong-password and unknown-account |
+| Locked accounts reveal nothing: rejections are not counted toward the lockout window, and the locked path still verifies the password first (wrong password → the same generic error — no lockout oracle) | ✅ | `tests/integration/auth.test.ts` |
 | Sensitive actions require a **fresh re-authentication** (5-min grant) | ✅ | `requireReauth`: live-mode activation, resume after stop, sensitive settings changes/resets |
 | Password change revokes all other sessions | ✅ | `changePassword`; integration test |
 | Weak-password policy enforced on create/change | ✅ | password policy test |
@@ -38,6 +39,8 @@
 | SQL uses bound parameters throughout (no string-built queries) | ✅ | `db.prepare(...).run/all(...)` with `?` placeholders |
 | Phone/website/email normalised and validated; malformed values rejected with a reason | ✅ | `tests/unit/normalize.test.ts`; repository tests |
 | CSV import: header mapping, per-row validation, parse errors surfaced (no silent drops); RFC4180 parser is owned and tested | ✅ | `tests/unit/csv.test.ts`, import pipeline tests |
+| Import size is bounded: files above 5000 data rows are **rejected** (never silently truncated), the parser stops building rows at the cap, and preview/commit row lists are capped at 500 (counts stay exact) | ✅ | `tests/unit/csv.test.ts` (maxRows), `tests/api/leads.test.ts` (cap + bounding) |
+| Regexes over fetched/attacker-influenced text are linear (no catastrophic backtracking): contact extractors, HTML analysis scanners and log e-mail masking were rewritten as single-pass scanners | ✅ | `tests/unit/contacts.test.ts`, `tests/unit/analysis.test.ts` (doubling-time vectors), `tests/unit/logger.test.ts` |
 | Structured error responses; stack traces never sent to the client | ✅ | error middleware maps `AppError` → `{error:{code,message,details}}` |
 
 ## 4. Transport & browser hardening
@@ -49,6 +52,7 @@
 | `X-Content-Type-Options`, referrer policy, frameguard, COOP/CORP same-origin | ✅ | helmet config |
 | HTTPS: `upgrade-insecure-requests` enabled when the public base URL is https | ✅ | **[owner action]** terminate TLS in front of the app; set `PUBLIC_BASE_URL=https://…` |
 | Unknown `/api/*` routes return JSON 404 (not the SPA) | ✅ | API test |
+| The `/api` rate limiter and the access logger run **before** the body parsers, so an over-limit request is rejected with 429 without paying a JSON parse (and 413/429 are both logged) | ✅ | `tests/api/rate-limit-order.test.ts` |
 
 ## 5. Secrets & logging
 

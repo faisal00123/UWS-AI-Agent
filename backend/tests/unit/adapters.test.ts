@@ -217,6 +217,22 @@ describe('openai-compatible adapters', () => {
     assert.ok(text.includes('Content-Type: audio/wav'));
   });
 
+  test('multipart neutralises header/field injection in filename and contentType', () => {
+    const evilFilename = 'a.wav"\r\n\r\n--evil\r\nContent-Disposition: form-data; name="model"\r\n\r\nsmuggled';
+    const mp = multipart(
+      { model: 'm1' },
+      { field: 'file', filename: evilFilename, contentType: 'audio/wav"\r\nX-Inject: 1', data: Uint8Array.from([1, 2, 3]) },
+    );
+    const text = mp.body.toString('latin1');
+    // The legitimate model field appears exactly once: no smuggled part.
+    assert.equal((text.match(/name="model"/g) ?? []).length, 1, 'no injected form field');
+    assert.ok(!text.includes('\r\n--evil'), 'no injected boundary at a line start');
+    assert.ok(!text.includes('\r\nX-Inject:'), 'no injected header line');
+    // The sanitised values remain usable on their own lines.
+    assert.ok(text.includes('filename="a.wav'), 'filename survives, sanitised');
+    assert.ok(text.includes('Content-Type: audio/wavX-Inject: 1'), 'contentType stays on one line');
+  });
+
   test('unconfigured adapters refuse loudly instead of returning silence', async () => {
     const ai = createOpenAIConversationAdapter({ apiKey: '', model: '' });
     assert.equal(ai.status().state, 'unconfigured');

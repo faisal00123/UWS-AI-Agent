@@ -48,20 +48,18 @@ export interface IngestOutcome {
  * transaction as the event row; returning null means "nothing matched" and is
  * stored as an ignored result.
  */
-export function ingestProviderEvent(
+export async function ingestProviderEvent(
   db: DB,
   input: ProviderEventInput,
-  apply: (payload: unknown) => string | null,
-): IngestOutcome {
+  apply: (payload: unknown) => string | null | Promise<string | null>,
+): Promise<IngestOutcome> {
   const at = nowIso();
   let eventId: number;
   try {
-    const res = db
-      .prepare(
-        `INSERT INTO provider_events (provider, event_id, event_type, resource_type, resource_id, payload_json, received_at, processed_at, process_result)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
+    const baseSql = `INSERT INTO provider_events (provider, event_id, event_type, resource_type, resource_id, payload_json, received_at, processed_at, process_result)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+    const sql = db.dialect === 'postgres' ? baseSql + ' RETURNING id' : baseSql;
+    const res = await db.prepare(sql).run(
         input.provider,
         input.eventId,
         input.eventType,
@@ -76,7 +74,7 @@ export function ingestProviderEvent(
   } catch (err) {
     const msg = (err as Error).message ?? '';
     if (msg.includes('UNIQUE') || msg.includes('ux_provider_events')) {
-      db.prepare(
+      await db.prepare(
         `UPDATE provider_events SET duplicate_count = duplicate_count + 1
           WHERE provider = ? AND event_id = ?`,
       ).run(input.provider, input.eventId);
@@ -85,10 +83,10 @@ export function ingestProviderEvent(
     throw err;
   }
 
-  const detail = tx(db, () => {
-    const applied = apply(input.payload);
+  const detail = await tx(db, async () => {
+    const applied = await apply(input.payload);
     const d = applied ?? 'No matching resource; event recorded but not applied';
-    db.prepare(`UPDATE provider_events SET process_result = ? WHERE id = ?`).run(
+    await db.prepare(`UPDATE provider_events SET process_result = ? WHERE id = ?`).run(
       applied ? `applied: ${d}` : `ignored: ${d}`,
       eventId,
     );
@@ -127,10 +125,10 @@ export interface TwilioCallCallback {
 }
 
 /** Apply one Twilio status callback. Returns detail, or null if unknown. */
-export function applyCallStatusEvent(db: DB, payload: unknown): string | null {
+export async function applyCallStatusEvent(db: DB, payload: unknown): Promise<string | null> {
   const p = (payload ?? {}) as TwilioCallCallback;
   if (!p.CallSid) return null;
-  const call = db.prepare('SELECT id, status FROM calls WHERE provider_call_id = ?').get(p.CallSid) as
+  const call = (await db.prepare('SELECT id, status FROM calls WHERE provider_call_id = ?').get(p.CallSid)) as
     | { id: string; status: string }
     | undefined;
   if (!call) return null;
@@ -148,7 +146,7 @@ export function applyCallStatusEvent(db: DB, payload: unknown): string | null {
   else if (mapped === 'busy' || mapped === 'no_answer' || mapped === 'cancelled') outcome = 'unanswered';
   else if (mapped === 'failed') outcome = 'failed';
 
-  db.prepare(
+  await db.prepare(
     `UPDATE calls
         SET status = ?,
             answered_at = CASE WHEN ? = 1 AND answered_at IS NULL THEN ? ELSE answered_at END,
@@ -181,10 +179,10 @@ export interface MetaMessageStatus {
 }
 
 /** Apply one Meta delivery status. Returns detail, or null if unknown. */
-export function applyMessageStatusEvent(db: DB, payload: unknown): string | null {
+export async function applyMessageStatusEvent(db: DB, payload: unknown): Promise<string | null> {
   const p = (payload ?? {}) as MetaMessageStatus;
   if (!p.id || !p.status) return null;
-  const msg = db.prepare('SELECT id FROM messages WHERE provider_message_id = ?').get(p.id) as
+  const msg = (await db.prepare('SELECT id FROM messages WHERE provider_message_id = ?').get(p.id)) as
     | { id: string }
     | undefined;
   if (!msg) return null;
@@ -194,7 +192,7 @@ export function applyMessageStatusEvent(db: DB, payload: unknown): string | null
     ? p.status
     : 'unknown';
   const err = p.errors?.[0];
-  db.prepare(
+  await db.prepare(
     `UPDATE messages
         SET status = ?, status_source = 'provider_event', last_status_at = ?,
             error_code = COALESCE(?, error_code), error_detail = COALESCE(?, error_detail),
@@ -281,21 +279,21 @@ interface MetaInboundPayload {
  *      'inbound', simulation 0)
  * Returns detail, or null when no lead matches the sender.
  */
-export function applyInboundMessageEvent(db: DB, payload: unknown, cfg?: Config): string | null {
+export async function applyInboundMessageEvent(db: DB, payload: unknown, cfg?: Config): Promise<string | null> {
   const p = (payload ?? {}) as MetaInboundPayload;
   const msg = p.value?.messages?.[0];
   if (!msg?.from || !msg.id) return null;
 
   const raw = msg.from.trim();
   const e164 = raw.startsWith('+') ? raw : `+${raw}`;
-  const lead = db
+  const lead = (await db
     .prepare(
       `SELECT id, display_name FROM businesses
         WHERE (whatsapp_e164 IS NOT NULL AND whatsapp_e164 = ?)
            OR (phone_e164 IS NOT NULL AND phone_e164 = ?)
         ORDER BY merged_into_id IS NULL DESC, created_at ASC LIMIT 1`,
     )
-    .get(e164, e164) as { id: string; display_name: string } | undefined;
+    .get(e164, e164)) as { id: string; display_name: string } | undefined;
   if (!lead) return null;
 
   const body = msg.type === 'text' ? (msg.text?.body ?? '') : '';
@@ -304,7 +302,7 @@ export function applyInboundMessageEvent(db: DB, payload: unknown, cfg?: Config)
 
   // 1. Suppression first: append-only and authoritative.
   if (optedOut) {
-    suppress(db, {
+    await suppress(db, {
       businessId: lead.id,
       scope: 'business',
       reason: 'opt_out',
@@ -319,7 +317,7 @@ export function applyInboundMessageEvent(db: DB, payload: unknown, cfg?: Config)
     msg.type === 'text'
       ? body.slice(0, 200)
       : `(non-text inbound: ${msg.type ?? 'unknown type'})`;
-  recordInteraction(db, {
+  await recordInteraction(db, {
     businessId: lead.id,
     kind: 'whatsapp_message',
     direction: 'inbound',
@@ -340,7 +338,7 @@ export function applyInboundMessageEvent(db: DB, payload: unknown, cfg?: Config)
   //     unsuppression explicitly in 11B).
   if (optedIn && cfg) {
     try {
-      notify(db, cfg, {
+      await notify(db, cfg, {
         kind: 'whatsapp_opt_in',
         severity: 'info',
         title: `WhatsApp opt-in from ${lead.display_name}`,

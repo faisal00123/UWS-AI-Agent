@@ -12,13 +12,14 @@ import { pendingMigrationFiles } from '../db/migrate.ts';
 import { getOperatingState, summarise } from '../domain/state/service.ts';
 import { countOwners } from '../domain/auth/service.ts';
 import { latestBackup, latestRestoreTest } from '../domain/backup/service.ts';
+import { osmLocalDatasetProblem, resolveOsmLocalDataset } from '../adapters/discovery/osm-local.ts';
 import { existsSync, accessSync, constants as fsConstants } from 'node:fs';
 
 const ok = (s: string): string => `  [ OK ] ${s}`;
 const warn = (s: string): string => `  [WARN] ${s}`;
 const bad = (s: string): string => `  [FAIL] ${s}`;
 
-function main(): void {
+async function main(): Promise<void> {
   let config;
   try {
     config = loadConfig();
@@ -46,27 +47,31 @@ function main(): void {
   try {
     db = openDatabase(config.databasePath);
     lines.push(ok(`open: ${config.databasePath}`));
-    const fk = db.prepare('PRAGMA foreign_keys').get() as { foreign_keys?: number } | undefined;
-    lines.push(fk?.foreign_keys === 1 ? ok('foreign_keys ON') : bad('foreign_keys OFF'));
-    const pending = pendingMigrationFiles(db);
+    if (db.dialect === 'sqlite') {
+      const fk = (await db.prepare('PRAGMA foreign_keys').get()) as { foreign_keys?: number } | undefined;
+      lines.push(fk?.foreign_keys === 1 ? ok('foreign_keys ON') : bad('foreign_keys OFF'));
+    } else {
+      // PostgreSQL: connection-level checks handled by the health endpoint
+    }
+    const pending = await pendingMigrationFiles(db);
     lines.push(
       pending.length > 0
         ? bad(`pending migrations: ${pending.join(', ')} - run: npm run migrate`)
         : ok('migrations up to date'),
     );
-    const owners = countOwners(db);
+    const owners = await countOwners(db);
     lines.push(owners > 0 ? ok(`${owners} active owner account(s)`) : warn('no owner account - run: npm run setup'));
-    const state = getOperatingState(db);
-    const summary = summarise(db);
+    const state = await getOperatingState(db);
+    const summary = await summarise(db);
     lines.push(ok(`mode=${state.mode} paused=${state.paused} emergencyStop=${state.emergencyStop}`));
     lines.push(`         outreach: ${summary.outreachEnabled ? 'ENABLED' : 'BLOCKED'} - ${summary.reason}`);
-    const counts = db
+    const counts = (await db
       .prepare(
         `SELECT (SELECT COUNT(*) FROM businesses) leads,
                 (SELECT COUNT(*) FROM suppression_list) suppressions,
                 (SELECT COUNT(*) FROM audit_events) audit_events`,
       )
-      .get() as { leads: number; suppressions: number; audit_events: number };
+      .get()) as { leads: number; suppressions: number; audit_events: number };
     lines.push(
       ok(`data: ${counts.leads} lead(s), ${counts.suppressions} suppression record(s), ${counts.audit_events} audit event(s)`),
     );
@@ -81,6 +86,19 @@ function main(): void {
     lines.push(
       marker(`${p.label.padEnd(26)} ${p.state}`) +
         (p.missing.length ? ` - missing: ${p.missing.join(', ')}` : ''),
+    );
+  }
+
+  // Offline OSM dataset (osm_local provider): WARN only — a missing dataset
+  // is a pending owner extraction step, not a broken installation, so it
+  // never changes the exit code. Same helper the adapter reports through, so
+  // doctor and the Integrations page can never disagree.
+  if ((process.env['DISCOVERY_PROVIDER'] ?? '').trim().toLowerCase() === 'osm_local') {
+    const problem = osmLocalDatasetProblem(process.env);
+    lines.push(
+      problem === null
+        ? ok(`local OSM dataset: ${resolveOsmLocalDataset(process.env)}`)
+        : warn(`local OSM dataset: ${problem.message}`),
     );
   }
 
@@ -151,7 +169,7 @@ function main(): void {
         ? ok('backup encryption configured (AES-256-GCM)')
         : warn('BACKUP_PASSPHRASE not set - backups are stored unencrypted (as is the live database)'),
     );
-    const last = db ? latestBackup(db) : null;
+    const last = db ? await latestBackup(db) : null;
     if (!last) {
       lines.push(warn('no backup taken yet - run: npm run backup'));
     } else if (last.status === 'failed') {
@@ -165,7 +183,7 @@ function main(): void {
           : warn(`last backup is ${Math.round(ageHours)}h old (> ${staleAfter}h) - is the scheduler running?`),
       );
     }
-    const test = db ? latestRestoreTest(db) : null;
+    const test = db ? await latestRestoreTest(db) : null;
     if (!test) {
       lines.push(warn('no restore test recorded yet - run: npm run backup -- test'));
     } else if (test.status === 'passed') {
@@ -176,11 +194,11 @@ function main(): void {
   }
 
   process.stdout.write(lines.join('\n') + '\n');
-  db?.close();
+  await db?.close();
 }
 
 try {
-  main();
+  await main();
 } catch (err) {
   process.stderr.write(`doctor failed: ${err instanceof Error ? err.message : String(err)}\n`);
   process.exitCode = 1;

@@ -159,7 +159,7 @@ export function attachGatewayMediaBridge(server: Server, deps: AppDeps): Gateway
   const wss = new WebSocketServer({ noServer: true, maxPayload: 4 * 1024 * 1024 });
   const active = new Map<string, DuplexSession>();
 
-  server.on('upgrade', (req, socket, head) => {
+  server.on('upgrade', async (req, socket, head) => {
     let url: URL;
     try {
       url = new URL(req.url ?? '/', 'http://localhost');
@@ -179,7 +179,7 @@ export function attachGatewayMediaBridge(server: Server, deps: AppDeps): Gateway
     };
 
     if (!config.duplex.enabled) return fail(503, 'Duplex Disabled');
-    if (!adapters || !duplexPorts(adapters.speech, adapters.ai)) return fail(503, 'Speech Or AI Not Configured');
+    if (!adapters || !(await duplexPorts(adapters.speech, adapters.ai))) return fail(503, 'Speech Or AI Not Configured');
 
     const callSid = url.searchParams.get('callSid') ?? '';
     const token = url.searchParams.get('token') ?? '';

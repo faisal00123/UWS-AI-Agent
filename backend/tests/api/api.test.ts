@@ -307,6 +307,17 @@ describe('API acceptance', () => {
     }
   });
 
+  test('the database filesystem path is owner-only', async () => {
+    const staff = await staffClient.get<{ database: { path: string | null; ok: boolean } }>('/api/system');
+    assert.equal(staff.status, 200, 'staff still gets health information');
+    assert.equal(staff.body.database.path, null, 'staff must not see the DB filesystem path');
+    assert.equal(typeof staff.body.database.ok, 'boolean', 'health fields stay visible');
+
+    const owner = await ownerClient.get<{ database: { path: string | null } }>('/api/system');
+    assert.equal(owner.status, 200);
+    assert.ok(owner.body.database.path && owner.body.database.path.length > 0, 'owner still sees the DB path');
+  });
+
   test('unknown API routes return JSON 404, not the SPA', async () => {
     const res = await server.client().get<ErrorBody>('/api/nope');
     assert.equal(res.status, 404);

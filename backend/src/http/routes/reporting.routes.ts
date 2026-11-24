@@ -50,15 +50,15 @@ export function reportingRoutes(): Router {
   router.get(
     '/notifications',
     requireRole('owner', 'staff'),
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const q = listQuery.parse(req.query ?? {});
-      const items = listNotifications(req.ctx.deps.db, {
+      const items = await listNotifications(req.ctx.deps.db, {
         status: q.status,
         channel: q.channel,
         unreadOnly: q.unread,
         limit: q.limit,
       });
-      res.json({ items, unread: unreadCount(req.ctx.deps.db) });
+      res.json({ items, unread: await unreadCount(req.ctx.deps.db) });
     }),
   );
 
@@ -66,9 +66,9 @@ export function reportingRoutes(): Router {
     '/notifications/read-all',
     requireCsrf,
     requireRole('owner', 'staff'),
-    asyncRoute((req, res) => {
-      const updated = markAllNotificationsRead(req.ctx.deps.db);
-      res.json({ updated, unread: unreadCount(req.ctx.deps.db) });
+    asyncRoute(async (req, res) => {
+      const updated = await markAllNotificationsRead(req.ctx.deps.db);
+      res.json({ updated, unread: await unreadCount(req.ctx.deps.db) });
     }),
   );
 
@@ -76,10 +76,10 @@ export function reportingRoutes(): Router {
     '/notifications/:id/read',
     requireCsrf,
     requireRole('owner', 'staff'),
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const id = z.string().min(1).max(64).parse(req.params.id);
-      const notification = markNotificationRead(req.ctx.deps.db, id);
-      res.json({ notification, unread: unreadCount(req.ctx.deps.db) });
+      const notification = await markNotificationRead(req.ctx.deps.db, id);
+      res.json({ notification, unread: await unreadCount(req.ctx.deps.db) });
     }),
   );
 
@@ -87,18 +87,18 @@ export function reportingRoutes(): Router {
   router.get(
     '/reports',
     requireRole('owner'),
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const q = reportQuery.parse(req.query ?? {});
-      res.json({ items: listReports(req.ctx.deps.db, q.limit ?? 30) });
+      res.json({ items: await listReports(req.ctx.deps.db, q.limit ?? 30) });
     }),
   );
 
   router.get(
     '/reports/:date',
     requireRole('owner'),
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const date = dateParam.parse(req.params.date);
-      res.json({ report: requireReport(req.ctx.deps.db, date) });
+      res.json({ report: await requireReport(req.ctx.deps.db, date) });
     }),
   );
 
@@ -106,13 +106,13 @@ export function reportingRoutes(): Router {
     '/reports/:date/generate',
     requireCsrf,
     requireRole('owner'),
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const date = dateParam.parse(req.params.date);
-      const report = generateDailyReport(req.ctx.deps.db, req.ctx.deps.config, {
+      const report = await generateDailyReport(req.ctx.deps.db, req.ctx.deps.config, {
         reportDate: date,
         generatedBy: req.ctx.user!.id,
       });
-      recordAudit(req.ctx.deps.db, {
+      await recordAudit(req.ctx.deps.db, {
         actorUserId: req.ctx.user!.id,
         actorLabel: req.ctx.user!.role,
         action: 'report.generate',

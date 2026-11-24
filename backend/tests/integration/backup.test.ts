@@ -68,9 +68,9 @@ function cfgWith(dir: string, extra: Record<string, string | undefined> = {}): C
   return loadConfig({ ...TEST_ENV, BACKUP_ENABLED: 'true', BACKUP_DIR: dir, ...extra });
 }
 
-function freshDb(cfg: Config): DB {
+async function freshDb(cfg: Config): Promise<DB> {
   const db = openDatabase(':memory:');
-  runMigrations(db);
+  await runMigrations(db);
   return db;
 }
 
@@ -84,29 +84,36 @@ async function seedOwnerIn(db: DB, cfg: Config): Promise<void> {
 }
 
 let phoneSeq = 0;
-function addLead(db: DB, name: string): string {
+async function addLead(db: DB, name: string): Promise<string> {
   phoneSeq += 1;
-  return createLead(db, { displayName: name, city: 'Karachi', phone: `+9230077${String(phoneSeq).padStart(5, '0')}` }, owner).id;
+  const result = await createLead(
+    db,
+    { displayName: name, city: 'Karachi', phone: `+9230077${String(phoneSeq).padStart(5, '0')}` },
+    owner,
+  );
+  return result.id;
 }
 
-function addSuppression(db: DB, bizId: string | null, at = nowIso(), reason = 'opt_out'): string {
+async function addSuppression(db: DB, bizId: string | null, at = nowIso(), reason = 'opt_out'): Promise<string> {
   const id = newId('sup');
-  db.prepare(
-    `INSERT INTO suppression_list (id, business_id, scope, phone_e164, whatsapp_e164, email,
-       reason, source, evidence, permanent, created_by, created_at)
-     VALUES (?, ?, 'business', NULL, NULL, NULL, ?, 'manual', NULL, 1, NULL, ?)`,
-  ).run(id, bizId, reason, at);
+  await db
+    .prepare(
+      `INSERT INTO suppression_list (id, business_id, scope, phone_e164, whatsapp_e164, email,
+         reason, source, evidence, permanent, created_by, created_at)
+       VALUES (?, ?, 'business', NULL, NULL, NULL, ?, 'manual', NULL, 1, NULL, ?)`,
+    )
+    .run(id, bizId, reason, at);
   return id;
 }
 
-function notificationsOf(db: DB, kind: string): { id: string; severity: string; title: string }[] {
-  return db
+async function notificationsOf(db: DB, kind: string): Promise<{ id: string; severity: string; title: string }[]> {
+  return (await db
     .prepare('SELECT id, severity, title FROM notifications WHERE kind = ? ORDER BY created_at')
-    .all(kind) as unknown as { id: string; severity: string; title: string }[];
+    .all(kind)) as unknown as { id: string; severity: string; title: string }[];
 }
 
-function ctxFor(db: DB, cfg: Config): JobContext {
-  return { db, config: cfg, logger: nullLogger, guard: summarise(db), now: new Date() };
+async function ctxFor(db: DB, cfg: Config): Promise<JobContext> {
+  return { db, config: cfg, logger: nullLogger, guard: await summarise(db), now: new Date() };
 }
 
 function sha256(buf: Buffer): string {
@@ -128,10 +135,10 @@ describe('runBackup', () => {
   test('a verified backup snapshots the data, hashes the file and records a manifest', async () => {
     const dir = tmpDir();
     const cfg = cfgWith(dir);
-    const db = freshDb(cfg);
+    const db = await freshDb(cfg);
     await seedOwnerIn(db, cfg);
-    const bizId = addLead(db, 'Alpha Traders');
-    addSuppression(db, bizId);
+    const bizId = await addLead(db, 'Alpha Traders');
+    await addSuppression(db, bizId);
 
     const record = await runBackup(db, cfg, { actor: owner });
 
@@ -163,7 +170,7 @@ describe('runBackup', () => {
     }
 
     // Audit trail records the creation.
-    const audit = db
+    const audit = await db
       .prepare(`SELECT 1 FROM audit_events WHERE action = 'backup.created' AND entity_id = ?`)
       .get(record.id);
     assert.ok(audit, 'backup.created audit row exists');
@@ -174,9 +181,9 @@ describe('runBackup', () => {
   test('with a passphrase the stored file is AES-encrypted and useless without it', async () => {
     const dir = tmpDir();
     const cfg = cfgWith(dir, { BACKUP_PASSPHRASE: 'test-pass-phrase-42' });
-    const db = freshDb(cfg);
+    const db = await freshDb(cfg);
     await seedOwnerIn(db, cfg);
-    addLead(db, 'SECRET_MARKER_LEAD');
+    await addLead(db, 'SECRET_MARKER_LEAD');
 
     const record = await runBackup(db, cfg, { actor: owner });
     assert.equal(record.status, 'verified');
@@ -206,33 +213,33 @@ describe('runBackup', () => {
     const blocked = join(dir, 'blocked');
     writeFileSync(blocked, 'not a directory');
     const cfg = cfgWith(join(blocked, 'backups'));
-    const db = freshDb(cfg);
+    const db = await freshDb(cfg);
     await seedOwnerIn(db, cfg);
 
     await assert.rejects(() => runBackup(db, cfg, { actor: owner }));
 
-    const row = db.prepare('SELECT status, error FROM backups').get() as { status: string; error: string };
+    const row = (await db.prepare('SELECT status, error FROM backups').get()) as { status: string; error: string };
     assert.equal(row.status, 'failed');
     assert.ok(row.error && row.error.length > 0, 'failure reason recorded');
 
-    const notes = notificationsOf(db, 'backup');
+    const notes = await notificationsOf(db, 'backup');
     assert.equal(notes.length, 1);
     assert.equal(notes[0]!.severity, 'critical');
 
-    const audit = db.prepare(`SELECT 1 FROM audit_events WHERE action = 'backup.failed'`).get();
+    const audit = await db.prepare(`SELECT 1 FROM audit_events WHERE action = 'backup.failed'`).get();
     assert.ok(audit, 'backup.failed audit row exists');
 
     // A second failure the same day (the job retries hourly): a second failed
     // ROW and audit event are recorded, but the alert is throttled to one per
     // day so a persistently broken backup cannot spam the owner.
     await assert.rejects(() => runBackup(db, cfg, { actor: owner }));
-    const rows = db.prepare('SELECT COUNT(*) c FROM backups WHERE status = ?').get('failed') as { c: number };
+    const rows = (await db.prepare('SELECT COUNT(*) c FROM backups WHERE status = ?').get('failed')) as { c: number };
     assert.equal(rows.c, 2, 'every failed attempt is recorded');
-    const audits = db
+    const audits = (await db
       .prepare(`SELECT COUNT(*) c FROM audit_events WHERE action = 'backup.failed'`)
-      .get() as { c: number };
+      .get()) as { c: number };
     assert.equal(audits.c, 2, 'every failed attempt is audited');
-    assert.equal(notificationsOf(db, 'backup').length, 1, 'alert deduped for the day');
+    assert.equal((await notificationsOf(db, 'backup')).length, 1, 'alert deduped for the day');
 
     db.close();
   });
@@ -243,7 +250,7 @@ describe('retention', () => {
   test('prunes backups older than the window but never the newest', async () => {
     const dir = tmpDir();
     const cfg = cfgWith(dir); // retention 30 days default
-    const db = freshDb(cfg);
+    const db = await freshDb(cfg);
     await seedOwnerIn(db, cfg);
 
     // Two old backups with files on disk (well past the 30-day window).
@@ -251,37 +258,43 @@ describe('retention', () => {
     for (const key of ['old1', 'old2']) {
       const path = join(dir, `uws-old-${key}.sqlite`);
       writeFileSync(path, 'placeholder');
-      db.prepare(
-        `INSERT INTO backups (id, path, size_bytes, sha256, encrypted, status, error, retention_until, created_at, verified_at)
-         VALUES (?, ?, 11, 'x', 0, 'verified', NULL, ?, ?, ?)`,
-      ).run(`bkp_${key}`, path, oldStamp, oldStamp, oldStamp);
+      await db
+        .prepare(
+          `INSERT INTO backups (id, path, size_bytes, sha256, encrypted, status, error, retention_until, created_at, verified_at)
+           VALUES (?, ?, 11, 'x', 0, 'verified', NULL, ?, ?, ?)`,
+        )
+        .run(`bkp_${key}`, path, oldStamp, oldStamp, oldStamp);
     }
     // A restore test attached to an old backup (must cascade away with it).
-    db.prepare(
-      `INSERT INTO restore_tests (id, backup_id, started_at, status, checks_json, performed_by)
-       VALUES ('rtst_old', 'bkp_old1', ?, 'passed', '[]', NULL)`,
-    ).run(oldStamp);
+    await db
+      .prepare(
+        `INSERT INTO restore_tests (id, backup_id, started_at, status, checks_json, performed_by)
+         VALUES ('rtst_old', 'bkp_old1', ?, 'passed', '[]', NULL)`,
+      )
+      .run(oldStamp);
 
     // The NEWEST backup is also past the window - it must still survive
     // (deleting the only remaining copy would be indefensible).
     const newestPath = join(dir, 'uws-old-newest.sqlite');
     writeFileSync(newestPath, 'placeholder');
-    db.prepare(
-      `INSERT INTO backups (id, path, size_bytes, sha256, encrypted, status, error, retention_until, created_at, verified_at)
-       VALUES ('bkp_newest', ?, 11, 'x', 0, 'verified', NULL, ?, ?, ?)`,
-    ).run(newestPath, oldStamp, '2026-01-02T00:00:00.000Z', oldStamp);
+    await db
+      .prepare(
+        `INSERT INTO backups (id, path, size_bytes, sha256, encrypted, status, error, retention_until, created_at, verified_at)
+         VALUES ('bkp_newest', ?, 11, 'x', 0, 'verified', NULL, ?, ?, ?)`,
+      )
+      .run(newestPath, oldStamp, '2026-01-02T00:00:00.000Z', oldStamp);
 
-    const result = pruneBackups(db, cfg);
+    const result = await pruneBackups(db, cfg);
     assert.equal(result.deleted, 2);
     assert.equal(existsSync(join(dir, 'uws-old-old1.sqlite')), false, 'old file removed');
     assert.equal(existsSync(join(dir, 'uws-old-old2.sqlite')), false, 'old file removed');
     assert.equal(existsSync(newestPath), true, 'newest file kept');
 
-    const ids = (db.prepare('SELECT id FROM backups').all() as unknown as { id: string }[]).map((r) => r.id);
+    const ids = ((await db.prepare('SELECT id FROM backups').all()) as unknown as { id: string }[]).map((r) => r.id);
     assert.deepEqual(ids, ['bkp_newest']);
 
     // The restore test row followed its deleted backup (FK cascade).
-    const remaining = db.prepare('SELECT COUNT(*) c FROM restore_tests').get() as { c: number };
+    const remaining = (await db.prepare('SELECT COUNT(*) c FROM restore_tests').get()) as { c: number };
     assert.equal(remaining.c, 0, 'restore_tests cascade with their backup');
 
     db.close();
@@ -293,13 +306,13 @@ describe('restore tests', () => {
   test('a restore test passes on a good backup and proves opt-outs survived', async () => {
     const dir = tmpDir();
     const cfg = cfgWith(dir);
-    const db = freshDb(cfg);
+    const db = await freshDb(cfg);
     await seedOwnerIn(db, cfg);
-    const bizId = addLead(db, 'Beta Traders');
-    addSuppression(db, bizId);
+    const bizId = await addLead(db, 'Beta Traders');
+    await addSuppression(db, bizId);
     const backup = await runBackup(db, cfg, { actor: owner });
 
-    const result = runRestoreTest(db, cfg, { backupId: backup.id });
+    const result = await runRestoreTest(db, cfg, { backupId: backup.id });
     assert.equal(result.status, 'passed');
     assert.equal(result.backupId, backup.id);
     const codes = result.checks.map((c) => c.code);
@@ -312,7 +325,7 @@ describe('restore tests', () => {
     assert.equal(backup.verifyResult?.counts.suppression_list, 1);
 
     // Audit trail records the restore test.
-    const audit = db.prepare(`SELECT 1 FROM audit_events WHERE action = 'backup.restore_test'`).get();
+    const audit = await db.prepare(`SELECT 1 FROM audit_events WHERE action = 'backup.restore_test'`).get();
     assert.ok(audit);
 
     db.close();
@@ -321,9 +334,9 @@ describe('restore tests', () => {
   test('a corrupted backup fails its restore test and raises a critical notification', async () => {
     const dir = tmpDir();
     const cfg = cfgWith(dir);
-    const db = freshDb(cfg);
+    const db = await freshDb(cfg);
     await seedOwnerIn(db, cfg);
-    addLead(db, 'Gamma Traders');
+    await addLead(db, 'Gamma Traders');
     const backup = await runBackup(db, cfg, { actor: owner });
 
     // Corrupt the stored file: keep only the first 200 bytes and fill the
@@ -332,17 +345,17 @@ describe('restore tests', () => {
     const junk = Buffer.concat([good.subarray(0, 200), Buffer.alloc(good.length - 200, 0xde)]);
     writeFileSync(backup.path, junk);
 
-    const result = runRestoreTest(db, cfg, { backupId: backup.id });
+    const result = await runRestoreTest(db, cfg, { backupId: backup.id });
     assert.equal(result.status, 'failed');
     assert.ok(result.error && result.error.startsWith('failed checks:'), 'failure reason names the failed checks');
     assert.ok(result.checks.some((c) => !c.passed), 'at least one check is red');
 
-    const notes = notificationsOf(db, 'restore_test');
+    const notes = await notificationsOf(db, 'restore_test');
     assert.equal(notes.length, 1, 'exactly one alert');
     assert.equal(notes[0]!.severity, 'critical');
 
     // The row is queryable for the dashboard.
-    const stored = latestRestoreTest(db);
+    const stored = await latestRestoreTest(db);
     assert.equal(stored?.status, 'failed');
 
     db.close();
@@ -351,24 +364,26 @@ describe('restore tests', () => {
   test('testing an unknown or unverified backup is refused with a clear error', async () => {
     const dir = tmpDir();
     const cfg = cfgWith(dir);
-    const db = freshDb(cfg);
+    const db = await freshDb(cfg);
     await seedOwnerIn(db, cfg);
 
-    assert.throws(
+    await assert.rejects(
       () => runRestoreTest(db, cfg, { backupId: 'bkp_missing' }),
       (err: unknown) => err instanceof AppError && err.code === 'not_found',
     );
 
     // A 'running' (not yet verified) backup cannot be tested.
-    db.prepare(
-      `INSERT INTO backups (id, path, size_bytes, sha256, encrypted, status, error, created_at)
-       VALUES ('bkp_running', '/tmp/x', NULL, NULL, 0, 'running', NULL, ?)`,
-    ).run(nowIso());
-    assert.throws(
+    await db
+      .prepare(
+        `INSERT INTO backups (id, path, size_bytes, sha256, encrypted, status, error, created_at)
+         VALUES ('bkp_running', '/tmp/x', NULL, NULL, 0, 'running', NULL, ?)`,
+      )
+      .run(nowIso());
+    await assert.rejects(
       () => runRestoreTest(db, cfg, { backupId: 'bkp_running' }),
       (err: unknown) => err instanceof AppError && err.code === 'validation_failed',
     );
-    assert.equal(latestRestoreTest(db), null);
+    assert.equal(await latestRestoreTest(db), null);
 
     db.close();
   });
@@ -379,9 +394,9 @@ describe('restore helpers', () => {
   test('restoreBackupTo refuses a corrupt backup with an explanation', async () => {
     const dir = tmpDir();
     const cfg = cfgWith(dir);
-    const db = freshDb(cfg);
+    const db = await freshDb(cfg);
     await seedOwnerIn(db, cfg);
-    addLead(db, 'Delta Traders');
+    await addLead(db, 'Delta Traders');
     const backup = await runBackup(db, cfg, { actor: owner });
 
     writeFileSync(backup.path, Buffer.alloc(512, 0xab));
@@ -398,19 +413,19 @@ describe('restore helpers', () => {
   test('late opt-outs are captured from the live DB and re-applied onto the restored copy (idempotent)', async () => {
     const dir = tmpDir();
     const cfg = cfgWith(dir);
-    const db = freshDb(cfg);
+    const db = await freshDb(cfg);
     await seedOwnerIn(db, cfg);
-    const bizId = addLead(db, 'Echo Traders');
-    addSuppression(db, bizId);
+    const bizId = await addLead(db, 'Echo Traders');
+    await addSuppression(db, bizId);
 
     const backup = await runBackup(db, cfg, { actor: owner });
 
     // An opt-out recorded AFTER the snapshot (distinct reason: a business may
     // carry several opt-outs, but only one per reason - ux_suppression_business_reason).
     const lateAt = new Date(Date.now() + 60_000).toISOString();
-    const lateId = addSuppression(db, bizId, lateAt, 'do_not_contact');
+    const lateId = await addSuppression(db, bizId, lateAt, 'do_not_contact');
 
-    const late = capturePostBackupSuppressions(db, backup.createdAt);
+    const late = await capturePostBackupSuppressions(db, backup.createdAt);
     assert.equal(late.length, 1, 'only the post-backup opt-out is late');
     assert.equal(late[0]!.id, lateId);
 
@@ -420,20 +435,26 @@ describe('restore helpers', () => {
     const restored = openDatabase(target);
     try {
       // The snapshot has the ORIGINAL opt-out only.
-      const beforeCount = (restored.prepare('SELECT COUNT(*) c FROM suppression_list').get() as { c: number }).c;
+      const beforeCount = (
+        (await restored.prepare('SELECT COUNT(*) c FROM suppression_list').get()) as { c: number }
+      ).c;
       assert.equal(beforeCount, 1);
 
-      const first = applyRestoredSuppressions(restored, late);
+      const first = await applyRestoredSuppressions(restored, late);
       assert.equal(first.applied, 1);
       assert.equal(first.skipped, 0);
-      const afterFirst = (restored.prepare('SELECT COUNT(*) c FROM suppression_list').get() as { c: number }).c;
+      const afterFirst = (
+        (await restored.prepare('SELECT COUNT(*) c FROM suppression_list').get()) as { c: number }
+      ).c;
       assert.equal(afterFirst, 2, 'late opt-out re-applied - a restore never resurrects a suppressed business');
 
       // Re-running the merge must be a no-op.
-      const second = applyRestoredSuppressions(restored, late);
+      const second = await applyRestoredSuppressions(restored, late);
       assert.equal(second.applied, 0);
       assert.equal(second.skipped, 1);
-      const afterSecond = (restored.prepare('SELECT COUNT(*) c FROM suppression_list').get() as { c: number }).c;
+      const afterSecond = (
+        (await restored.prepare('SELECT COUNT(*) c FROM suppression_list').get()) as { c: number }
+      ).c;
       assert.equal(afterSecond, 2);
     } finally {
       restored.close();
@@ -464,34 +485,34 @@ describe('restore helpers', () => {
     const livePath = join(dir, 'live.sqlite');
     const cfg = cfgWith(dir, { DATABASE_PATH: livePath });
     const db = openDatabase(livePath);
-    runMigrations(db);
+    await runMigrations(db);
     await seedOwnerIn(db, cfg);
-    const bizId = addLead(db, 'Foxtrot Traders');
-    addSuppression(db, bizId);
+    const bizId = await addLead(db, 'Foxtrot Traders');
+    await addSuppression(db, bizId);
 
     const backup = await runBackup(db, cfg, { actor: owner });
 
     // In-memory databases can never be swapped.
     const memoryCfg = cfgWith(dir, { DATABASE_PATH: ':memory:' });
-    assert.throws(
+    await assert.rejects(
       () => applyRestore(memoryCfg, { path: backup.path, createdAt: backup.createdAt }, {}),
       (err: unknown) => err instanceof AppError && err.code === 'validation_failed',
     );
 
     // While the live database is held exclusively, applyRestore refuses.
-    db.exec('BEGIN EXCLUSIVE');
-    assert.throws(
+    await db.exec('BEGIN EXCLUSIVE');
+    await assert.rejects(
       () => applyRestore(cfg, { path: backup.path, createdAt: backup.createdAt }, {}),
       (err: unknown) => err instanceof AppError && err.code === 'conflict',
     );
-    db.exec('ROLLBACK');
+    await db.exec('ROLLBACK');
 
     // An opt-out lands after the snapshot (distinct reason - see unique index).
     const lateAt = new Date(Date.now() + 60_000).toISOString();
-    addSuppression(db, bizId, lateAt, 'do_not_contact');
+    await addSuppression(db, bizId, lateAt, 'do_not_contact');
 
     db.close();
-    const result = applyRestore(cfg, { path: backup.path, createdAt: backup.createdAt }, {});
+    const result = await applyRestore(cfg, { path: backup.path, createdAt: backup.createdAt }, {});
     assert.equal(result.lateSuppressions.applied, 1, 'post-backup opt-out re-applied');
     assert.ok(existsSync(result.preserved.database), 'pre-restore database preserved, not deleted');
     assert.ok(result.verification.ok, 'live file verifies after the swap');
@@ -499,9 +520,11 @@ describe('restore helpers', () => {
     // The live database now holds the snapshot data PLUS the late opt-out.
     const reopened = openDatabase(livePath);
     try {
-      const leads = (reopened.prepare('SELECT COUNT(*) c FROM businesses').get() as { c: number }).c;
+      const leads = ((await reopened.prepare('SELECT COUNT(*) c FROM businesses').get()) as { c: number }).c;
       assert.equal(leads, 1);
-      const suppressions = (reopened.prepare('SELECT COUNT(*) c FROM suppression_list').get() as { c: number }).c;
+      const suppressions = (
+        (await reopened.prepare('SELECT COUNT(*) c FROM suppression_list').get()) as { c: number }
+      ).c;
       assert.equal(suppressions, 2, 'snapshot opt-out + late opt-out');
     } finally {
       reopened.close();
@@ -514,22 +537,22 @@ describe('backup jobs', () => {
   test('backup_job is silent when disabled, acts when due, and is silent while fresh', async () => {
     // Disabled (default env): no-op.
     const disabledCfg = loadConfig(TEST_ENV);
-    const disabledDb = freshDb(disabledCfg);
-    assert.equal(await backupJob.run(ctxFor(disabledDb, disabledCfg)), undefined);
+    const disabledDb = await freshDb(disabledCfg);
+    assert.equal(await backupJob.run(await ctxFor(disabledDb, disabledCfg)), undefined);
     disabledDb.close();
 
     // Enabled with no prior backup: takes one.
     const dir = tmpDir();
     const cfg = cfgWith(dir);
-    const db = freshDb(cfg);
+    const db = await freshDb(cfg);
     await seedOwnerIn(db, cfg);
-    const first = await backupJob.run(ctxFor(db, cfg));
+    const first = await backupJob.run(await ctxFor(db, cfg));
     assert.ok(first?.detail?.includes('verified'), `detail reports verification: ${first?.detail}`);
-    assert.equal(listBackups(db).length, 1);
+    assert.equal((await listBackups(db)).length, 1);
 
     // Immediately again: fresh within BACKUP_INTERVAL_HOURS -> silent.
-    assert.equal(await backupJob.run(ctxFor(db, cfg)), undefined);
-    assert.equal(listBackups(db).length, 1);
+    assert.equal(await backupJob.run(await ctxFor(db, cfg)), undefined);
+    assert.equal((await listBackups(db)).length, 1);
 
     db.close();
   });
@@ -537,18 +560,18 @@ describe('backup jobs', () => {
   test('restore_test_job runs once per interval against the newest verified backup', async () => {
     const dir = tmpDir();
     const cfg = cfgWith(dir);
-    const db = freshDb(cfg);
+    const db = await freshDb(cfg);
     await seedOwnerIn(db, cfg);
 
     // Nothing to test yet.
-    assert.equal(restoreTestJob.run(ctxFor(db, cfg)), undefined);
+    assert.equal(await restoreTestJob.run(await ctxFor(db, cfg)), undefined);
 
     await runBackup(db, cfg, { actor: owner });
-    const first = restoreTestJob.run(ctxFor(db, cfg)) as { detail?: string };
+    const first = (await restoreTestJob.run(await ctxFor(db, cfg))) as { detail?: string };
     assert.ok(first?.detail?.includes('passed'), `detail reports pass: ${first?.detail}`);
 
     // Fresh test -> silent.
-    assert.equal(restoreTestJob.run(ctxFor(db, cfg)), undefined);
+    assert.equal(await restoreTestJob.run(await ctxFor(db, cfg)), undefined);
 
     db.close();
   });
@@ -597,7 +620,9 @@ describe('monitoring routes', () => {
 
   test('staff cannot read backups; a triggered restore test runs and needs CSRF', async () => {
     // Staff creation requires an owner actor.
-    const ownerRow = server.db.prepare(`SELECT id FROM users WHERE role = 'owner' LIMIT 1`).get() as { id: string };
+    const ownerRow = (await server.db.prepare(`SELECT id FROM users WHERE role = 'owner' LIMIT 1`).get()) as {
+      id: string;
+    };
     const staffEmail = `staff-${Date.now()}@uws.test`;
     await createUser(
       server.db,

@@ -92,7 +92,7 @@ export function createCloudyVoiceAdapter(opts: CloudyVoiceOptions): TelephonyPor
     key: 'cloudyvoice',
     label: 'CloudyVoice (SIP via gateway)',
 
-    status(): AdapterStatus {
+    async status(): Promise<AdapterStatus> {
       const configured = Boolean(opts.baseUrl && opts.apiToken && opts.fromNumber);
       return {
         key: 'telephony',

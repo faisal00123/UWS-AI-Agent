@@ -52,7 +52,7 @@ export function createGeminiAdapter(opts: GeminiOptions): ConversationPort {
   return {
     key: 'gemini',
     label: 'AI conversation (Gemini)',
-    status(): AdapterStatus {
+    async status(): Promise<AdapterStatus> {
       const configured = Boolean(opts.apiKey && opts.model);
       return {
         key: 'ai',

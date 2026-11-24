@@ -18,7 +18,7 @@
  *
  * Nothing here performs outreach; it only produces due work and records state.
  */
-import type { SQLInputValue } from 'node:sqlite';
+import type { SqlParam } from '../../db/types.ts';
 import type { DB } from '../../db/index.ts';
 import type { Config } from '../../core/config.ts';
 import { newId } from '../../core/ids.ts';
@@ -169,8 +169,8 @@ export interface WindowConfig {
  * argument is accepted for future per-channel windows but is currently unused:
  * the owner sets one global calling schedule.
  */
-export function callingWindowFor(db: DB, cfg: Config, _channel: Channel): WindowConfig {
-  const raw = getSetting<{ startTime: string; endTime: string; days: number[]; timezone: string }>(
+export async function callingWindowFor(db: DB, cfg: Config, _channel: Channel): Promise<WindowConfig> {
+  const raw = await getSetting<{ startTime: string; endTime: string; days: number[]; timezone: string }>(
     db,
     'calling_schedule',
     cfg,
@@ -243,8 +243,8 @@ export interface ScheduleFollowupInput {
  * Create a single follow-up task. Throws a `conflict` error if an active task
  * of the same type already exists at that exact time for the lead.
  */
-export function scheduleFollowup(db: DB, cfg: Config, input: ScheduleFollowupInput): FollowupTask {
-  const lead = db.prepare('SELECT id FROM businesses WHERE id = ?').get(input.businessId);
+export async function scheduleFollowup(db: DB, cfg: Config, input: ScheduleFollowupInput): Promise<FollowupTask> {
+  const lead = await db.prepare('SELECT id FROM businesses WHERE id = ?').get(input.businessId);
   if (!lead) throw notFound('Lead');
 
   let scheduledFor = input.scheduledFor;
@@ -252,18 +252,20 @@ export function scheduleFollowup(db: DB, cfg: Config, input: ScheduleFollowupInp
     // 'manual' and unset channels still have to respect the calling window, so
     // fall back to the voice channel's window for placement.
     const windowChannel: Channel = input.channel && input.channel !== 'manual' ? input.channel : 'call';
-    const w = callingWindowFor(db, cfg, windowChannel);
+    const w = await callingWindowFor(db, cfg, windowChannel);
     scheduledFor = nextAllowedSlot(scheduledFor, w);
   }
 
   const id = newId('fup');
   const at = nowIso();
   try {
-    db.prepare(
-      `INSERT INTO followup_tasks (id, business_id, type, title, notes, scheduled_for, timezone, channel,
-         followup_sequence, status, requested_by_customer, created_by, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', ?, ?, ?, ?)`,
-    ).run(
+    await db
+      .prepare(
+        `INSERT INTO followup_tasks (id, business_id, type, title, notes, scheduled_for, timezone, channel,
+           followup_sequence, status, requested_by_customer, created_by, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', ?, ?, ?, ?)`,
+      )
+      .run(
       id,
       input.businessId,
       input.type,
@@ -289,14 +291,14 @@ export function scheduleFollowup(db: DB, cfg: Config, input: ScheduleFollowupInp
     }
     throw err;
   }
-  return getTask(db, id) as FollowupTask;
+  return (await getTask(db, id)) as FollowupTask;
 }
 
 /**
  * Expand a cadence of offset-days into concrete follow-up tasks, numbered by
  * sequence. Returns the created tasks in sequence order.
  */
-export function scheduleSequence(
+export async function scheduleSequence(
   db: DB,
   cfg: Config,
   input: {
@@ -308,12 +310,12 @@ export function scheduleSequence(
     startFrom?: string;
     createdBy?: string | null;
   },
-): FollowupTask[] {
+): Promise<FollowupTask[]> {
   const base = input.startFrom ? parseTime(input.startFrom) : Date.now();
   const out: FollowupTask[] = [];
-  input.offsetsDays.forEach((days, i) => {
+  for (const [i, days] of input.offsetsDays.entries()) {
     out.push(
-      scheduleFollowup(db, cfg, {
+      await scheduleFollowup(db, cfg, {
         businessId: input.businessId,
         type: input.type ?? 'followup_call',
         title: input.title,
@@ -323,12 +325,12 @@ export function scheduleSequence(
         createdBy: input.createdBy ?? null,
       }),
     );
-  });
+  }
   return out;
 }
 
-export function getTask(db: DB, id: string): FollowupTask | null {
-  const r = db.prepare('SELECT * FROM followup_tasks WHERE id = ?').get(id) as Row | undefined;
+export async function getTask(db: DB, id: string): Promise<FollowupTask | null> {
+  const r = (await db.prepare('SELECT * FROM followup_tasks WHERE id = ?').get(id)) as Row | undefined;
   return r ? toTask(r) : null;
 }
 
@@ -340,9 +342,9 @@ export interface TaskQuery {
   limit?: number;
 }
 
-export function listTasks(db: DB, q: TaskQuery): FollowupTask[] {
+export async function listTasks(db: DB, q: TaskQuery): Promise<FollowupTask[]> {
   const clauses: string[] = [];
-  const params: SQLInputValue[] = [];
+  const params: SqlParam[] = [];
   if (q.businessId) {
     clauses.push('business_id = ?');
     params.push(q.businessId);
@@ -357,9 +359,9 @@ export function listTasks(db: DB, q: TaskQuery): FollowupTask[] {
   }
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
   const limit = q.limit ?? 200;
-  const rows = db
+  const rows = (await db
     .prepare(`SELECT * FROM followup_tasks ${where} ORDER BY scheduled_for ASC LIMIT ?`)
-    .all(...params, limit) as unknown as Row[];
+    .all(...params, limit)) as Row[];
   return rows.map(toTask);
 }
 
@@ -367,12 +369,12 @@ export function listTasks(db: DB, q: TaskQuery): FollowupTask[] {
  * Transition a scheduled/due task to `due`. Kept separate from execution so a
  * scheduler tick can simply mark work that has arrived.
  */
-export function markDue(db: DB, id: string): FollowupTask | null {
-  const t = getTask(db, id);
+export async function markDue(db: DB, id: string): Promise<FollowupTask | null> {
+  const t = await getTask(db, id);
   if (!t) return null;
   if (t.status !== 'scheduled' && t.status !== 'due') return t;
   const at = nowIso();
-  db.prepare(`UPDATE followup_tasks SET status = 'due', updated_at = ? WHERE id = ?`).run(at, id);
+  await db.prepare(`UPDATE followup_tasks SET status = 'due', updated_at = ? WHERE id = ?`).run(at, id);
   return getTask(db, id);
 }
 
@@ -387,12 +389,12 @@ export interface CompleteInput {
  * required evidence and the interaction is not real customer contact, this
  * refuses — a completed follow-up must have a real outcome on record.
  */
-export function completeTask(db: DB, input: CompleteInput): FollowupTask {
-  const t = getTask(db, input.taskId);
+export async function completeTask(db: DB, input: CompleteInput): Promise<FollowupTask> {
+  const t = await getTask(db, input.taskId);
   if (!t) throw notFound('Follow-up task');
   if (t.status === 'completed') return t;
 
-  const inter = db.prepare('SELECT id, kind, business_id, simulation FROM interactions WHERE id = ?').get(input.interactionId) as
+  const inter = (await db.prepare('SELECT id, kind, business_id, simulation FROM interactions WHERE id = ?').get(input.interactionId)) as
     | { id: string; kind: string; business_id: string; simulation: number }
     | undefined;
   if (!inter) throw new AppError('validation_failed', 'Completion interaction not found');
@@ -420,24 +422,28 @@ export function completeTask(db: DB, input: CompleteInput): FollowupTask {
   }
 
   const at = nowIso();
-  db.prepare(
-    `UPDATE followup_tasks SET status = 'completed', completed_at = ?, completed_interaction_id = ?, updated_at = ? WHERE id = ?`,
-  ).run(at, input.interactionId, at, t.id);
-  return getTask(db, input.taskId) as FollowupTask;
+  await db
+    .prepare(
+      `UPDATE followup_tasks SET status = 'completed', completed_at = ?, completed_interaction_id = ?, updated_at = ? WHERE id = ?`,
+    )
+    .run(at, input.interactionId, at, t.id);
+  return (await getTask(db, input.taskId)) as FollowupTask;
 }
 
 /** Cancel a pending task with a reason. Completed tasks cannot be cancelled. */
-export function cancelTask(db: DB, taskId: string, reason: string): FollowupTask {
-  const t = getTask(db, taskId);
+export async function cancelTask(db: DB, taskId: string, reason: string): Promise<FollowupTask> {
+  const t = await getTask(db, taskId);
   if (!t) throw notFound('Follow-up task');
   if (t.status === 'completed') {
     throw new AppError('validation_failed', 'A completed follow-up cannot be cancelled');
   }
   const at = nowIso();
-  db.prepare(
-    `UPDATE followup_tasks SET status = 'cancelled', cancel_reason = ?, updated_at = ? WHERE id = ?`,
-  ).run(reason.trim(), at, taskId);
-  return getTask(db, taskId) as FollowupTask;
+  await db
+    .prepare(
+      `UPDATE followup_tasks SET status = 'cancelled', cancel_reason = ?, updated_at = ? WHERE id = ?`,
+    )
+    .run(reason.trim(), at, taskId);
+  return (await getTask(db, taskId)) as FollowupTask;
 }
 
 export interface DueEvaluation {
@@ -458,25 +464,27 @@ export interface DueEvaluation {
  *  - ineligible     -> suppressed / no destination / channel disabled. The task
  *                      is moved to 'blocked' and will not run.
  */
-export function evaluateDueTasks(db: DB, cfg: Config, dueBefore: string): DueEvaluation[] {
+export async function evaluateDueTasks(db: DB, cfg: Config, dueBefore: string): Promise<DueEvaluation[]> {
   // Promote first: a scheduled task whose time has arrived becomes 'due'. The
   // engine used to only read 'due' rows, so nothing scheduled could ever be
   // reached (nothing else performs the promotion). The partial unique index
   // treats scheduled and due alike, so this cannot create a duplicate.
   const at = nowIso();
-  db.prepare(
-    `UPDATE followup_tasks SET status = 'due', updated_at = ?
-     WHERE status = 'scheduled' AND scheduled_for <= ?`,
-  ).run(at, dueBefore);
+  await db
+    .prepare(
+      `UPDATE followup_tasks SET status = 'due', updated_at = ?
+       WHERE status = 'scheduled' AND scheduled_for <= ?`,
+    )
+    .run(at, dueBefore);
 
-  const due = listTasks(db, { status: 'due', dueBefore, limit: 500 });
+  const due = await listTasks(db, { status: 'due', dueBefore, limit: 500 });
   const out: DueEvaluation[] = [];
   for (const task of due) {
     if (!task.channel || task.channel === 'manual') {
       out.push({ taskId: task.id, decision: 'eligible', blockedReason: null });
       continue;
     }
-    const decision = evaluateEligibility(db, cfg, task.businessId, task.channel as Channel);
+    const decision = await evaluateEligibility(db, cfg, task.businessId, task.channel as Channel);
     if (decision.decision === 'eligible') {
       out.push({ taskId: task.id, decision: 'eligible', blockedReason: null });
       continue;
@@ -489,9 +497,11 @@ export function evaluateDueTasks(db: DB, cfg: Config, dueBefore: string): DueEva
       // the owner can record consent and let the follow-up proceed. The task
       // is not executed until that happens (the executor re-checks).
       const reason = `needs_review: ${decision.reasons[0] ?? 'consent unconfirmed'}`;
-      db.prepare(
-        `UPDATE followup_tasks SET blocked_reason = ?, updated_at = ? WHERE id = ? AND status = 'due'`,
-      ).run(reason, at, task.id);
+      await db
+        .prepare(
+          `UPDATE followup_tasks SET blocked_reason = ?, updated_at = ? WHERE id = ? AND status = 'due'`,
+        )
+        .run(reason, at, task.id);
       out.push({ taskId: task.id, decision: 'needs_review', blockedReason: reason });
       continue;
     }
@@ -499,9 +509,11 @@ export function evaluateDueTasks(db: DB, cfg: Config, dueBefore: string): DueEva
     // A hard 'ineligible' (suppressed, no destination, channel disabled) stops
     // the task outright.
     const reason = `ineligible: ${decision.reasons[0] ?? 'not eligible'}`;
-    db.prepare(
-      `UPDATE followup_tasks SET status = 'blocked', blocked_reason = ?, updated_at = ? WHERE id = ?`,
-    ).run(reason, at, task.id);
+    await db
+      .prepare(
+        `UPDATE followup_tasks SET status = 'blocked', blocked_reason = ?, updated_at = ? WHERE id = ?`,
+      )
+      .run(reason, at, task.id);
     out.push({ taskId: task.id, decision: 'ineligible', blockedReason: reason });
   }
   return out;

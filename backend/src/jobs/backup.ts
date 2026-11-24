@@ -29,7 +29,7 @@ export const backupJob: JobDefinition = {
   async run(ctx) {
     const { db, config } = ctx;
     if (!config.backup.enabled) return undefined;
-    const last = latestBackup(db);
+    const last = await latestBackup(db);
     if (
       last &&
       last.status === 'verified' &&
@@ -47,15 +47,15 @@ export const backupJob: JobDefinition = {
 export const restoreTestJob: JobDefinition = {
   name: 'restore_test',
   intervalMs: HOUR_MS,
-  run(ctx) {
+  async run(ctx) {
     const { db, config } = ctx;
     if (!config.backup.enabled) return undefined;
-    if (!latestVerifiedBackup(db)) return undefined; // nothing worth testing yet
-    const last = latestRestoreTest(db);
+    if (!(await latestVerifiedBackup(db))) return undefined; // nothing worth testing yet
+    const last = await latestRestoreTest(db);
     if (last && Date.now() - Date.parse(last.startedAt) < config.backup.restoreTestDays * DAY_MS) {
       return undefined; // tested recently (passed or failed — both are records)
     }
-    const test = runRestoreTest(db, config);
+    const test = await runRestoreTest(db, config);
     return { detail: `restore test ${test.status} for backup ${test.backupId}` };
   },
 };

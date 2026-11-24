@@ -31,10 +31,10 @@ export function healthRoutes(deps: AppDeps): Router {
 
   router.get(
     '/health',
-    asyncRoute((_req, res) => {
+    asyncRoute(async (_req, res) => {
       let dbOk = true;
       try {
-        deps.db.prepare('SELECT 1').get();
+        await deps.db.prepare('SELECT 1').get();
       } catch {
         dbOk = false;
       }
@@ -49,20 +49,20 @@ export function healthRoutes(deps: AppDeps): Router {
   router.get(
     '/system',
     requireAuth,
-    asyncRoute((_req, res) => {
+    asyncRoute(async (req, res) => {
       let dbOk = true;
       let pendingMigrations = false;
       try {
-        deps.db.prepare('SELECT 1').get();
-        pendingMigrations = hasPendingMigrations(deps.db);
+        await deps.db.prepare('SELECT 1').get();
+        pendingMigrations = await hasPendingMigrations(deps.db);
       } catch {
         dbOk = false;
       }
-      const state = getOperatingState(deps.db);
-      const summary = summarise(deps.db);
-      const lastBackup = latestBackup(deps.db);
-      const lastRestoreTest = latestRestoreTest(deps.db);
-      const incidents = deps.db
+      const state = await getOperatingState(deps.db);
+      const summary = await summarise(deps.db);
+      const lastBackup = await latestBackup(deps.db);
+      const lastRestoreTest = await latestRestoreTest(deps.db);
+      const incidents = await deps.db
         .prepare(
           `SELECT id, component, severity, title, status, detected_at
              FROM incidents
@@ -74,7 +74,13 @@ export function healthRoutes(deps: AppDeps): Router {
         status: dbOk && !pendingMigrations ? 'ok' : 'degraded',
         node: process.version,
         uptimeSeconds: Math.round(process.uptime()),
-        database: { ok: dbOk, pendingMigrations, path: deps.config.databasePath },
+        database: {
+          ok: dbOk,
+          pendingMigrations,
+          // Filesystem paths are OWNER-ONLY (same rule as /api/backups):
+          // staff need health, not infrastructure detail.
+          path: req.ctx.user?.role === 'owner' ? deps.config.databasePath : null,
+        },
         operatingState: state,
         summary,
         providers: deps.config.providers,
@@ -96,7 +102,7 @@ export function healthRoutes(deps: AppDeps): Router {
             : null,
         },
         incidents,
-        recentJobs: listJobRuns(deps.db, 10),
+        recentJobs: await listJobRuns(deps.db, 10),
         ephemeralSessionSecret: deps.config.ephemeralSessionSecret,
         timestamp: new Date().toISOString(),
       });
@@ -115,14 +121,14 @@ export function healthRoutes(deps: AppDeps): Router {
   router.get(
     '/integrations',
     requireAuth,
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const adapters = req.ctx.deps.adapters;
       const db = req.ctx.deps.db;
       const cfg = req.ctx.deps.config;
 
       let emailQueue = { pending: 0, failed: 0, sent: 0 };
       try {
-        const row = db
+        const row = (await db
           .prepare(
             `SELECT
                SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending,
@@ -130,23 +136,23 @@ export function healthRoutes(deps: AppDeps): Router {
                SUM(CASE WHEN status = 'sent'    THEN 1 ELSE 0 END) AS sent
              FROM notifications WHERE channel = 'email'`,
           )
-          .get() as { pending: number | null; failed: number | null; sent: number | null };
+          .get()) as { pending: number | null; failed: number | null; sent: number | null };
         emailQueue = { pending: row.pending ?? 0, failed: row.failed ?? 0, sent: row.sent ?? 0 };
       } catch {
         /* table missing (fresh dev db): report zeros */
       }
 
       res.json({
-        adapters: adapters ? adapters.statuses() : [],
+        adapters: adapters ? await adapters.statuses() : [],
         credentialPresence: cfg.providers,
-        operatingMode: getOperatingState(db).mode,
+        operatingMode: (await getOperatingState(db)).mode,
         // Phase 11A fields:
-        health: lastHealthChecks(db),
-        usage: usageSummary(db, 7),
-        toggles: getToggles(db, cfg),
+        health: await lastHealthChecks(db),
+        usage: await usageSummary(db, 7),
+        toggles: await getToggles(db, cfg),
         // Phase 11B fields: onboarding verification state per integration
         // (pending|verified|failed — never credentials, only outcomes).
-        onboarding: getOnboardingState(db),
+        onboarding: await getOnboardingState(db),
         portfolioTemplate: adapters?.portfolioTemplate
           ? { name: adapters.portfolioTemplate.name, language: adapters.portfolioTemplate.language }
           : null,

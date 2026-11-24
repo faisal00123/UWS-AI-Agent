@@ -66,8 +66,8 @@ export interface NotifyResult {
 
 /** Channels configured by the owner. Dashboard is the guaranteed fallback: a
  *  notification is never silently dropped when email/WhatsApp are unset. */
-export function resolveDestinations(db: DB, cfg: Config): NotificationChannel[] {
-  const d = getSetting<NotificationDestinations>(db, 'notification_destinations', cfg);
+export async function resolveDestinations(db: DB, cfg: Config): Promise<NotificationChannel[]> {
+  const d = await getSetting<NotificationDestinations>(db, 'notification_destinations', cfg);
   const channels: NotificationChannel[] = [];
   if (d.dashboard) channels.push('in_app');
   if (emailDestination(d, cfg)) channels.push('email');
@@ -77,15 +77,15 @@ export function resolveDestinations(db: DB, cfg: Config): NotificationChannel[] 
 }
 
 /** Create one notification row per destination channel (idempotent per key). */
-export function notify(db: DB, cfg: Config, input: NotifyInput): NotifyResult {
-  const channels = input.channels ?? resolveDestinations(db, cfg);
+export async function notify(db: DB, cfg: Config, input: NotifyInput): Promise<NotifyResult> {
+  const channels = input.channels ?? (await resolveDestinations(db, cfg));
   const created: string[] = [];
   const skipped: string[] = [];
   const at = nowIso();
   for (const channel of channels) {
     const dedupe = input.dedupeKey ? `${input.dedupeKey}:${channel}` : null;
     if (dedupe) {
-      const existing = db.prepare('SELECT id FROM notifications WHERE dedupe_key = ?').get(dedupe);
+      const existing = await db.prepare('SELECT id FROM notifications WHERE dedupe_key = ?').get(dedupe);
       if (existing) {
         skipped.push(channel);
         continue;
@@ -93,22 +93,24 @@ export function notify(db: DB, cfg: Config, input: NotifyInput): NotifyResult {
     }
     try {
       const id = newId('ntf');
-      db.prepare(
-        `INSERT INTO notifications (id, kind, severity, title, body, channel, status, status_source,
-           entity_type, entity_id, dedupe_key, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'pending', 'none', ?, ?, ?, ?)`,
-      ).run(
-        id,
-        input.kind,
-        input.severity ?? 'info',
-        input.title,
-        input.body,
-        channel,
-        input.entityType ?? null,
-        input.entityId ?? null,
-        dedupe,
-        at,
-      );
+      await db
+        .prepare(
+          `INSERT INTO notifications (id, kind, severity, title, body, channel, status, status_source,
+             entity_type, entity_id, dedupe_key, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, 'pending', 'none', ?, ?, ?, ?)`,
+        )
+        .run(
+          id,
+          input.kind,
+          input.severity ?? 'info',
+          input.title,
+          input.body,
+          channel,
+          input.entityType ?? null,
+          input.entityId ?? null,
+          dedupe,
+          at,
+        );
       created.push(id);
     } catch {
       // Unique-index race with a concurrent writer: the other writer won.
@@ -146,55 +148,59 @@ export async function deliverPendingNotifications(
   cfg: Config,
   opts: { email?: EmailPort | null },
 ): Promise<DeliveryResult> {
-  const rows = db
+  const rows = (await db
     .prepare(
       `SELECT * FROM notifications WHERE status = 'pending' AND channel IN ('email','whatsapp')
-        ORDER BY created_at, rowid LIMIT 50`,
+        ORDER BY created_at, id LIMIT 50`,
     )
-    .all() as unknown as NotificationRow[];
+    .all()) as NotificationRow[];
   const result: DeliveryResult = { sent: 0, failed: 0, skipped: 0 };
 
   for (const row of rows) {
     if (row.channel === 'whatsapp') {
-      db.prepare(`UPDATE notifications SET status = 'skipped', status_source = 'none', error_detail = ? WHERE id = ?`).run(
-        'WhatsApp delivery requires a Meta-approved template; no notification template is approved. Free-form text to a number that has not messaged us first is never permitted. In-app/email delivery used instead.',
-        row.id,
-      );
+      await db
+        .prepare(`UPDATE notifications SET status = 'skipped', status_source = 'none', error_detail = ? WHERE id = ?`)
+        .run(
+          'WhatsApp delivery requires a Meta-approved template; no notification template is approved. Free-form text to a number that has not messaged us first is never permitted. In-app/email delivery used instead.',
+          row.id,
+        );
       result.skipped += 1;
       continue;
     }
     const dest = emailDestination(
-      getSetting<NotificationDestinations>(db, 'notification_destinations', cfg),
+      await getSetting<NotificationDestinations>(db, 'notification_destinations', cfg),
       cfg,
     );
     if (!dest) {
-      db.prepare(`UPDATE notifications SET status = 'skipped', status_source = 'none', error_detail = ? WHERE id = ?`).run(
-        'No notification email address is configured (notification_destinations.email or NOTIFY_OWNER_EMAIL).',
-        row.id,
-      );
+      await db
+        .prepare(`UPDATE notifications SET status = 'skipped', status_source = 'none', error_detail = ? WHERE id = ?`)
+        .run(
+          'No notification email address is configured (notification_destinations.email or NOTIFY_OWNER_EMAIL).',
+          row.id,
+        );
       result.skipped += 1;
       continue;
     }
     if (!opts.email) {
-      db.prepare(`UPDATE notifications SET status = 'skipped', status_source = 'none', error_detail = ? WHERE id = ?`).run(
-        'SMTP is not configured (SMTP_HOST/SMTP_USER/SMTP_PASS); the notification stays visible on the dashboard.',
-        row.id,
-      );
+      await db
+        .prepare(`UPDATE notifications SET status = 'skipped', status_source = 'none', error_detail = ? WHERE id = ?`)
+        .run(
+          'SMTP is not configured (SMTP_HOST/SMTP_USER/SMTP_PASS); the notification stays visible on the dashboard.',
+          row.id,
+        );
       result.skipped += 1;
       continue;
     }
     try {
       const res = await opts.email.send({ to: dest, subject: row.title, text: row.body });
-      db.prepare(`UPDATE notifications SET status = 'sent', status_source = 'none', provider_ref = ?, error_detail = NULL WHERE id = ?`).run(
-        res.messageId,
-        row.id,
-      );
+      await db
+        .prepare(`UPDATE notifications SET status = 'sent', status_source = 'none', provider_ref = ?, error_detail = NULL WHERE id = ?`)
+        .run(res.messageId, row.id);
       result.sent += 1;
     } catch (err) {
-      db.prepare(`UPDATE notifications SET status = 'failed', status_source = 'none', error_detail = ? WHERE id = ?`).run(
-        truncateError(err),
-        row.id,
-      );
+      await db
+        .prepare(`UPDATE notifications SET status = 'failed', status_source = 'none', error_detail = ? WHERE id = ?`)
+        .run(truncateError(err), row.id);
       result.failed += 1;
     }
   }
@@ -260,7 +266,7 @@ export interface NotificationQuery {
   limit?: number;
 }
 
-export function listNotifications(db: DB, q: NotificationQuery = {}): NotificationView[] {
+export async function listNotifications(db: DB, q: NotificationQuery = {}): Promise<NotificationView[]> {
   const where: string[] = [];
   const params: (string | number)[] = [];
   if (q.status) {
@@ -273,14 +279,14 @@ export function listNotifications(db: DB, q: NotificationQuery = {}): Notificati
   }
   if (q.unreadOnly) where.push('read_at IS NULL');
   const sql = `SELECT * FROM notifications ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
-    ORDER BY created_at DESC, rowid DESC LIMIT ?`;
+    ORDER BY created_at DESC, id DESC LIMIT ?`;
   params.push(Math.min(Math.max(q.limit ?? 50, 1), 200));
-  return (db.prepare(sql).all(...params) as unknown as NotificationRow[]).map(toView);
+  return ((await db.prepare(sql).all(...params)) as NotificationRow[]).map(toView);
 }
 
 /** Unread count across every channel (dashboard badge). */
-export function unreadCount(db: DB): number {
-  const row = db.prepare('SELECT COUNT(*) c FROM notifications WHERE read_at IS NULL').get() as { c: number };
+export async function unreadCount(db: DB): Promise<number> {
+  const row = (await db.prepare('SELECT COUNT(*) c FROM notifications WHERE read_at IS NULL').get()) as { c: number };
   return row.c;
 }
 
@@ -289,25 +295,21 @@ export function unreadCount(db: DB): number {
  * sent keeps status `sent` (read_at carries the read), while in-app rows move
  * `pending` -> `read` to match the status vocabulary.
  */
-export function markNotificationRead(db: DB, id: string): NotificationView {
-  const row = db.prepare('SELECT * FROM notifications WHERE id = ?').get(id) as unknown as
-    | NotificationRow
-    | undefined;
+export async function markNotificationRead(db: DB, id: string): Promise<NotificationView> {
+  const row = (await db.prepare('SELECT * FROM notifications WHERE id = ?').get(id)) as NotificationRow | undefined;
   if (!row) throw notFound('Notification');
   if (row.read_at) return toView(row);
   const at = nowIso();
   if (row.channel === 'in_app') {
-    db.prepare(`UPDATE notifications SET status = 'read', read_at = ? WHERE id = ?`).run(at, id);
+    await db.prepare(`UPDATE notifications SET status = 'read', read_at = ? WHERE id = ?`).run(at, id);
   } else {
-    db.prepare(`UPDATE notifications SET read_at = ? WHERE id = ?`).run(at, id);
+    await db.prepare(`UPDATE notifications SET read_at = ? WHERE id = ?`).run(at, id);
   }
-  return toView(
-    db.prepare('SELECT * FROM notifications WHERE id = ?').get(id) as unknown as NotificationRow,
-  );
+  return toView((await db.prepare('SELECT * FROM notifications WHERE id = ?').get(id)) as NotificationRow);
 }
 
-export function markAllNotificationsRead(db: DB): number {
-  const res = db
+export async function markAllNotificationsRead(db: DB): Promise<number> {
+  const res = await db
     .prepare(`UPDATE notifications SET read_at = ?, status = CASE WHEN channel = 'in_app' THEN 'read' ELSE status END WHERE read_at IS NULL`)
     .run(nowIso());
   return Number(res.changes);

@@ -37,7 +37,7 @@ export function createOpenAIConversationAdapter(opts: OpenAIConversationOptions)
     key: 'openai_chat',
     label: 'AI conversation (OpenAI-compatible)',
 
-    status(): AdapterStatus {
+    async status(): Promise<AdapterStatus> {
       const configured = Boolean(opts.apiKey && opts.model);
       return {
         key: 'ai',

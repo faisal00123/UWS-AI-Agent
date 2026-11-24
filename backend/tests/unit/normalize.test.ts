@@ -6,6 +6,7 @@ import {
   normalizePhone,
   normalizeWebsite,
   nameSimilarity,
+  isMachineMailbox,
 } from '../../src/domain/leads/normalize.ts';
 
 describe('phone normalisation', () => {
@@ -86,5 +87,56 @@ describe('name similarity', () => {
     assert.equal(nameSimilarity('karachi clinic', 'karachi clinic'), 1);
     assert.ok(nameSimilarity('karachi clinic', 'karachi clinics') > 0.85);
     assert.ok(nameSimilarity('karachi clinic', 'lahore restaurant') < 0.5);
+  });
+});
+
+describe('machine mailbox guard (Phase 5)', () => {
+  test('noreply-style local parts are rejected, in any spelling/case', () => {
+    const machine = [
+      'noreply@clinic.pk',
+      'NO_REPLY@clinic.pk',
+      'no-reply@clinic.pk',
+      'no.reply@clinic.pk',
+      'no_reply@clinic.pk',
+      'donotreply@clinic.pk',
+      'do-not-reply@clinic.pk',
+      'do.not.reply@clinic.pk',
+      'postmaster@clinic.pk',
+      'abuse@clinic.pk',
+      '  NoReply@Clinic.pk  ',
+    ];
+    for (const addr of machine) {
+      assert.equal(isMachineMailbox(addr), true, `${addr} must be treated as a machine mailbox`);
+    }
+  });
+
+  test('real mailboxes are never caught — matching is exact, not a prefix guess', () => {
+    const human = [
+      'abuse.team@clinic.pk', // team mailbox, not the role address
+      'noreplys@clinic.pk', // a different word
+      'sales@clinic.pk',
+      'info@clinic.pk',
+      'reception@clinic.pk',
+      'newsletter@clinic.pk',
+      'a.noreply@clinic.pk', // local part is "a.noreply", not "noreply"
+    ];
+    for (const addr of human) {
+      assert.equal(isMachineMailbox(addr), false, `${addr} must stay contactable`);
+    }
+    // Only the local part is inspected, never the domain: `noreply@noreply.pk`
+    // is still a machine mailbox because its local part is exactly "noreply".
+    assert.equal(isMachineMailbox('noreply@noreply.pk'), true, 'the domain plays no part');
+  });
+
+  test('inputs without a usable local part are never flagged', () => {
+    assert.equal(isMachineMailbox(null), false);
+    assert.equal(isMachineMailbox(undefined), false);
+    assert.equal(isMachineMailbox(''), false);
+    assert.equal(isMachineMailbox('noreply'), false); // no @ at all
+    assert.equal(isMachineMailbox('@clinic.pk'), false); // empty local part
+    // The guard answers "is this LOCAL PART a machine mailbox?" — address
+    // validity is normalizeEmail's job, and every caller runs the guard only
+    // on addresses that already passed format validation.
+    assert.equal(isMachineMailbox('noreply@'), true, 'local part is noreply; format is checked elsewhere');
   });
 });

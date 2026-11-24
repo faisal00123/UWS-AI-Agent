@@ -47,18 +47,18 @@ const staff = { userId: null, label: 'staff' as const };
 // ineligible via is_live_record. Counter makes both unique while keeping every
 // number a valid PK mobile shape (0300 + 7 digits).
 let leadSeq = 0;
-function makeLead(name = 'Pipeline Co'): string {
+async function makeLead(name = 'Pipeline Co'): Promise<string> {
   const seq = leadSeq++;
   const phone = `0300${String(1000000 + seq).slice(-7)}`;
-  const res = createLead(db, { displayName: `${name} ${seq}`, city: 'Karachi', phone }, owner);
+  const res = await createLead(db, { displayName: `${name} ${seq}`, city: 'Karachi', phone }, owner);
   return res.id;
 }
 
 describe('pipeline interactions', () => {
-  before(() => {
+  before(async () => {
     cfg = loadConfig({ NODE_ENV: 'test', SESSION_SECRET: 'test'.padEnd(48, '0'), DATABASE_PATH: ':memory:' });
     db = openDatabase(':memory:');
-    runMigrations(db);
+    await runMigrations(db);
   });
   after(() => db.close());
 
@@ -99,14 +99,14 @@ describe('pipeline interactions', () => {
 });
 
 describe('follow-up scheduling', () => {
-  before(() => {
+  before(async () => {
     cfg = loadConfig({ NODE_ENV: 'test', SESSION_SECRET: 'test'.padEnd(48, '0'), DATABASE_PATH: ':memory:' });
     db = openDatabase(':memory:');
-    runMigrations(db);
+    await runMigrations(db);
     // Enable voice so the call channel is available; without this the
     // channel_enabled check hard-fails and masks the consent decision these
     // tests are actually about.
-    const res = updateSettings(
+    const res = await updateSettings(
       db,
       cfg,
       { eligible_channels: { call: true, whatsappMessage: false, whatsappCall: false, email: false, sms: false } },
@@ -283,10 +283,10 @@ describe('follow-up scheduling', () => {
 });
 
 describe('pipeline stage transitions', () => {
-  before(() => {
+  before(async () => {
     cfg = loadConfig({ NODE_ENV: 'test', SESSION_SECRET: 'test'.padEnd(48, '0'), DATABASE_PATH: ':memory:' });
     db = openDatabase(':memory:');
-    runMigrations(db);
+    await runMigrations(db);
   });
   after(() => db.close());
 

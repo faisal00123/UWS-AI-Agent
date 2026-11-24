@@ -50,7 +50,7 @@ export function gatewayRoutes(): Router {
   // ------------------------------------------------------- answer fetch -----
   router.get(
     '/telephony/gateway/answer',
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const { adapters, config, db, logger } = req.ctx.deps;
       if (!adapters?.telephony) throw new AppError('not_found', 'Telephony webhooks are not configured');
 
@@ -68,11 +68,11 @@ export function gatewayRoutes(): Router {
       };
       const callId = query('callId');
       const duplexReady =
-        config.duplex.enabled && duplexPorts(adapters.speech, adapters.ai) && callId !== null;
+        config.duplex.enabled && (await duplexPorts(adapters.speech, adapters.ai)) && callId !== null;
 
       if (duplexReady && callId) {
         try {
-          const resolved = resolveCallForAnswer(db, {
+          const resolved = await resolveCallForAnswer(db, {
             callSid: callId,
             from: query('from'),
             to: query('to'),
@@ -106,7 +106,7 @@ export function gatewayRoutes(): Router {
   // ---------------------------------------------------- lifecycle events ----
   router.post(
     '/telephony/gateway/events',
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const adapters = req.ctx.deps.adapters;
       if (!adapters?.telephony) throw new AppError('not_found', 'Telephony webhooks are not configured');
 
@@ -134,7 +134,7 @@ export function gatewayRoutes(): Router {
         return;
       }
       const status = typeof body.status === 'string' ? body.status : 'unknown';
-      const outcome = ingestProviderEvent(
+      const outcome = await ingestProviderEvent(
         req.ctx.deps.db,
         {
           provider: GATEWAY_PROVIDER,

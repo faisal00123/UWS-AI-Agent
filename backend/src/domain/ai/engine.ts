@@ -29,7 +29,7 @@ export interface ConversationPolicy {
   humanHandoffOnRequest: boolean;
 }
 
-export function loadConversationPolicy(db: DB, cfg: Config): ConversationPolicy {
+export async function loadConversationPolicy(db: DB, cfg: Config): Promise<ConversationPolicy> {
   // getSetting falls back to the definition default on a missing/corrupt row.
   return getSetting<ConversationPolicy>(db, 'conversation_policy', cfg);
 }

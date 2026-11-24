@@ -98,22 +98,22 @@ export function pipelineRoutes(): Router {
   // ----------------------------------------------------------- timeline --
   router.get(
     '/:id/timeline',
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const id = idParam.parse(req.params.id);
       res.json({
-        interactions: timeline(req.ctx.deps.db, id),
-        counts: interactionCounts(req.ctx.deps.db, id),
+        interactions: await timeline(req.ctx.deps.db, id),
+        counts: await interactionCounts(req.ctx.deps.db, id),
       });
     }),
   );
 
   router.get(
     '/:id/interactions',
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const id = idParam.parse(req.params.id);
       const kind = req.query.kind ? z.enum(INTERACTION_KINDS).parse(req.query.kind) : undefined;
       const order = req.query.order === 'asc' ? 'asc' : 'desc';
-      res.json({ items: listInteractions(req.ctx.deps.db, { businessId: id, kind, order }) });
+      res.json({ items: await listInteractions(req.ctx.deps.db, { businessId: id, kind, order }) });
     }),
   );
 
@@ -123,13 +123,13 @@ export function pipelineRoutes(): Router {
     '/:id/interactions',
     requireCsrf,
     requireRole('owner', 'staff'),
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const id = idParam.parse(req.params.id);
       const body = interactionSchema.parse(req.body);
-      const exists = req.ctx.deps.db.prepare('SELECT id FROM businesses WHERE id = ?').get(id);
+      const exists = await req.ctx.deps.db.prepare('SELECT id FROM businesses WHERE id = ?').get(id);
       if (!exists) throw notFound('Lead');
 
-      const inter = recordInteraction(req.ctx.deps.db, {
+      const inter = await recordInteraction(req.ctx.deps.db, {
         businessId: id,
         kind: body.kind,
         direction: body.direction ?? null,
@@ -138,7 +138,7 @@ export function pipelineRoutes(): Router {
         evidence: body.evidence ?? null,
         createdBy: req.ctx.user!.id,
       });
-      recordAudit(req.ctx.deps.db, {
+      await recordAudit(req.ctx.deps.db, {
         actorUserId: req.ctx.user!.id,
         actorLabel: req.ctx.user!.role,
         action: 'interaction.record',
@@ -158,10 +158,10 @@ export function pipelineRoutes(): Router {
     '/:id/advance',
     requireCsrf,
     requireRole('owner', 'staff'),
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const id = idParam.parse(req.params.id);
       const body = advanceSchema.parse(req.body);
-      const result = advanceStage(req.ctx.deps.db, req.ctx.deps.config, {
+      const result = await advanceStage(req.ctx.deps.db, req.ctx.deps.config, {
         businessId: id,
         toStage: body.toStage,
         reason: body.reason,
@@ -172,7 +172,7 @@ export function pipelineRoutes(): Router {
         autoSchedule: body.autoSchedule,
         actor: { userId: req.ctx.user!.id, label: req.ctx.user!.role },
       });
-      recordAudit(req.ctx.deps.db, {
+      await recordAudit(req.ctx.deps.db, {
         actorUserId: req.ctx.user!.id,
         actorLabel: req.ctx.user!.role,
         action: 'lead.stage_advanced',
@@ -194,14 +194,14 @@ export function pipelineRoutes(): Router {
   // ---------------------------------------------------------- follow-ups --
   router.get(
     '/:id/followups',
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const id = idParam.parse(req.params.id);
       const status = req.query.status
         ? z
             .enum(['scheduled', 'due', 'running', 'completed', 'cancelled', 'blocked', 'failed', 'missed'])
             .parse(req.query.status)
         : undefined;
-      res.json({ items: listTasks(req.ctx.deps.db, { businessId: id, status }) });
+      res.json({ items: await listTasks(req.ctx.deps.db, { businessId: id, status }) });
     }),
   );
 
@@ -209,10 +209,10 @@ export function pipelineRoutes(): Router {
     '/:id/followups',
     requireCsrf,
     requireRole('owner', 'staff'),
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const id = idParam.parse(req.params.id);
       const body = scheduleSchema.parse(req.body);
-      const task = scheduleFollowup(req.ctx.deps.db, req.ctx.deps.config, {
+      const task = await scheduleFollowup(req.ctx.deps.db, req.ctx.deps.config, {
         businessId: id,
         type: body.type,
         title: body.title,
@@ -223,7 +223,7 @@ export function pipelineRoutes(): Router {
         respectWindow: body.respectWindow,
         createdBy: req.ctx.user!.id,
       });
-      recordAudit(req.ctx.deps.db, {
+      await recordAudit(req.ctx.deps.db, {
         actorUserId: req.ctx.user!.id,
         actorLabel: req.ctx.user!.role,
         action: 'followup.schedule',
@@ -240,10 +240,10 @@ export function pipelineRoutes(): Router {
     '/:id/followups/sequence',
     requireCsrf,
     requireRole('owner', 'staff'),
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const id = idParam.parse(req.params.id);
       const body = sequenceSchema.parse(req.body);
-      const tasks = scheduleSequence(req.ctx.deps.db, req.ctx.deps.config, {
+      const tasks = await scheduleSequence(req.ctx.deps.db, req.ctx.deps.config, {
         businessId: id,
         title: body.title,
         offsetsDays: body.offsetsDays,
@@ -252,7 +252,7 @@ export function pipelineRoutes(): Router {
         startFrom: body.startFrom,
         createdBy: req.ctx.user!.id,
       });
-      recordAudit(req.ctx.deps.db, {
+      await recordAudit(req.ctx.deps.db, {
         actorUserId: req.ctx.user!.id,
         actorLabel: req.ctx.user!.role,
         action: 'followup.sequence',
@@ -282,7 +282,7 @@ export function followupRoutes(): Router {
   router.get(
     '/',
     requireRole('owner', 'staff'),
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const q = z
         .object({
           status: z.enum(FOLLOWUP_STATUSES).optional(),
@@ -290,7 +290,7 @@ export function followupRoutes(): Router {
           limit: z.coerce.number().int().min(1).max(500).optional(),
         })
         .parse(req.query ?? {});
-      res.json({ items: listTasks(req.ctx.deps.db, q) });
+      res.json({ items: await listTasks(req.ctx.deps.db, q) });
     }),
   );
 
@@ -300,13 +300,13 @@ export function followupRoutes(): Router {
     '/evaluate-due',
     requireCsrf,
     requireRole('owner', 'staff'),
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const body = z
         .object({ dueBefore: z.string().min(4).max(40).optional() })
         .parse(req.body ?? {});
       const dueBefore = body.dueBefore ?? new Date(Date.now() + 86_400_000).toISOString();
-      const evaluations = evaluateDueTasks(req.ctx.deps.db, req.ctx.deps.config, dueBefore);
-      recordAudit(req.ctx.deps.db, {
+      const evaluations = await evaluateDueTasks(req.ctx.deps.db, req.ctx.deps.config, dueBefore);
+      await recordAudit(req.ctx.deps.db, {
         actorUserId: req.ctx.user!.id,
         actorLabel: req.ctx.user!.role,
         action: 'followup.evaluate_due',
@@ -325,9 +325,9 @@ export function followupRoutes(): Router {
 
   router.get(
     '/:id',
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const id = idParam.parse(req.params.id);
-      const task = getTask(req.ctx.deps.db, id);
+      const task = await getTask(req.ctx.deps.db, id);
       if (!task) throw notFound('Follow-up task');
       res.json(task);
     }),
@@ -337,15 +337,15 @@ export function followupRoutes(): Router {
     '/:id/complete',
     requireCsrf,
     requireRole('owner', 'staff'),
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const id = idParam.parse(req.params.id);
       const body = completeSchema.parse(req.body);
-      const task = completeTask(req.ctx.deps.db, {
+      const task = await completeTask(req.ctx.deps.db, {
         taskId: id,
         interactionId: body.interactionId,
         actor: { userId: req.ctx.user!.id, label: req.ctx.user!.role },
       });
-      recordAudit(req.ctx.deps.db, {
+      await recordAudit(req.ctx.deps.db, {
         actorUserId: req.ctx.user!.id,
         actorLabel: req.ctx.user!.role,
         action: 'followup.complete',
@@ -362,11 +362,11 @@ export function followupRoutes(): Router {
     '/:id/cancel',
     requireCsrf,
     requireRole('owner', 'staff'),
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const id = idParam.parse(req.params.id);
       const body = cancelSchema.parse(req.body);
-      const task = cancelTask(req.ctx.deps.db, id, body.reason);
-      recordAudit(req.ctx.deps.db, {
+      const task = await cancelTask(req.ctx.deps.db, id, body.reason);
+      await recordAudit(req.ctx.deps.db, {
         actorUserId: req.ctx.user!.id,
         actorLabel: req.ctx.user!.role,
         action: 'followup.cancel',

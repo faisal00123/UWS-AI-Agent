@@ -5,6 +5,7 @@ import type { Config } from '../core/config.ts';
 import type { Logger } from '../core/logger.ts';
 import type { PublicUser, SessionInfo } from '../domain/auth/service.ts';
 import type { AdapterRegistry } from '../adapters/registry.ts';
+import type { FetchLike } from '../adapters/http.ts';
 
 export interface AppDeps {
   config: Config;
@@ -16,6 +17,12 @@ export interface AppDeps {
    * fetch) so no test can reach a real provider.
    */
   adapters?: AdapterRegistry;
+  /**
+   * Transport for free helpers that fetch a URL outside the adapter registry
+   * (the lead-verify homepage probe). Absent in production = real fetch;
+   * tests inject a fake so no test can ever reach the network.
+   */
+  fetchImpl?: FetchLike;
 }
 
 export interface RequestContext {

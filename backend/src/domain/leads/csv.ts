@@ -48,9 +48,13 @@ export function sniffDelimiter(headerLine: string): ',' | ';' | '\t' | '|' {
   return best;
 }
 
-export function parseCsv(input: string, options: { delimiter?: string } = {}): CsvParseResult {
+export function parseCsv(
+  input: string,
+  options: { delimiter?: string; maxRows?: number } = {},
+): CsvParseResult {
   const { text, hadBom } = stripBom(input);
   const errors: { line: number; message: string }[] = [];
+  const maxRows = options.maxRows;
 
   // Determine delimiter from the first non-empty line.
   const firstLineEnd = text.search(/\r\n|\n|\r/);
@@ -64,9 +68,13 @@ export function parseCsv(input: string, options: { delimiter?: string } = {}): C
   let line = 1;
   let rowStartLine = 1;
   let fieldWasQuoted = false;
+  /** Index where an over-limit read stopped, or -1 when the file was fully read. */
+  let stopIndex = -1;
 
   const pushField = (): void => {
-    cells.push(field);
+    // Symmetric with the export writer: a formula-guard apostrophe added by
+    // leadsToCsv is removed here, so export → import round-trips exactly.
+    cells.push(stripFormulaGuard(field));
     field = '';
     fieldWasQuoted = false;
   };
@@ -81,6 +89,14 @@ export function parseCsv(input: string, options: { delimiter?: string } = {}): C
   };
 
   for (let i = 0; i < text.length; i++) {
+    // Row cap: stop reading once the limit is filled so a hostile multi-MB
+    // file cannot build millions of row objects before any policy check runs.
+    // The check sits at the top of the loop, so a file that ends exactly on
+    // the limit is read to completion — only genuinely unread rows flag a stop.
+    if (maxRows !== undefined && rows.length >= maxRows) {
+      stopIndex = i;
+      break;
+    }
     const c = text[i]!;
     if (inQuotes) {
       if (c === '"') {
@@ -124,11 +140,26 @@ export function parseCsv(input: string, options: { delimiter?: string } = {}): C
     field += c;
   }
 
-  if (inQuotes) {
-    errors.push({ line: rowStartLine, message: 'Unterminated quoted field at end of file' });
-  }
-  if (field !== '' || cells.length > 0) {
-    pushRow();
+  if (stopIndex === -1) {
+    if (inQuotes) {
+      errors.push({ line: rowStartLine, message: 'Unterminated quoted field at end of file' });
+    }
+    if (field !== '' || cells.length > 0) {
+      pushRow();
+    }
+  } else {
+    // Over-limit stop: report it only when real content was left unread — a
+    // file ending exactly on the limit plus trailing blank lines is complete,
+    // not truncated.
+    let j = stopIndex;
+    while (j < text.length) {
+      const cc = text.charCodeAt(j);
+      if (cc !== 10 && cc !== 13 && cc !== 9 && cc !== 32 && cc !== 12 && cc !== 11) break;
+      j++;
+    }
+    if (j < text.length) {
+      errors.push({ line: rowStartLine, message: `Row limit of ${maxRows} reached — the rest of the file was not read` });
+    }
   }
 
   if (rows.length === 0) {
@@ -173,4 +204,124 @@ export function mapByHeader(result: CsvParseResult, requiredHeaders: string[]): 
     records.push({ line: row.line, values });
   }
   return { headers, records, errors };
+}
+
+/* ------------------------------------------------------------------ export -- */
+
+/**
+ * Export column order. Every header here resolves through COLUMN_ALIASES on
+ * re-import EXCEPT the read-only bookkeeping columns (Stage, Score, Interest
+ * Level, Duplicate Status, Source Type, Discovered), which the import mapper
+ * deliberately ignores — so an export → import round trip preserves exactly
+ * the editable record (name, category, city, address, coordinates, contact
+ * details, requirements, source URL) and never fights over derived fields.
+ */
+export const LEAD_EXPORT_HEADERS = [
+  'Name',
+  'Category',
+  'City',
+  'Address',
+  'Lat',
+  'Lon',
+  'Website',
+  'Phone',
+  'WhatsApp',
+  'Email',
+  'Contact Person',
+  'Requirements',
+  'Stage',
+  'Score',
+  'Interest Level',
+  'Duplicate Status',
+  'Source Type',
+  'Source URL',
+  'Discovered',
+] as const;
+
+/**
+ * Spreadsheet formula markers (CSV/formula injection, OWASP). Lead data is
+ * UNTRUSTED: OSM tags are publicly editable and CSV values are typed by
+ * anyone, so a cell like `=cmd|'/C calc'!A0`, `+…`, `-…` or `@SUM(…)` would
+ * be EVALUATED by Excel/LibreOffice/Sheets when the exported file is opened.
+ */
+const FORMULA_MARKERS = new Set(['=', '+', '-', '@']);
+/** Leading whitespace + control characters — a formula can hide behind them. */
+const LEADING_TRIM_RE = /^[\u0000-\u0020\u007f]+/;
+
+/** The first character a spreadsheet would treat as the cell's content. */
+function firstContentChar(s: string): string {
+  return s.replace(LEADING_TRIM_RE, '').charAt(0);
+}
+
+/**
+ * Neutralise formula-shaped values with a single leading apostrophe — the
+ * universal spreadsheet "this is text" marker. Excel renders the ORIGINAL
+ * value (the apostrophe is never displayed) and never evaluates it; our own
+ * parser strips it again (see stripFormulaGuard), so export → import keeps
+ * the exact value. Ordinary cells are returned untouched.
+ */
+function neutralizeFormula(s: string): string {
+  return FORMULA_MARKERS.has(firstContentChar(s)) ? `'${s}` : s;
+}
+
+/**
+ * Remove ONE safety apostrophe written by neutralizeFormula. Applied by the
+ * parser so the export round-trips byte-faithfully, and so a hand-made file
+ * using Excel's own apostrophe text marker (`'+92300…`) imports as the value
+ * its author saw on screen. A leading apostrophe NOT followed (after
+ * whitespace/control characters) by a formula marker is kept as data.
+ */
+function stripFormulaGuard(s: string): string {
+  if (!s.startsWith("'")) return s;
+  return FORMULA_MARKERS.has(firstContentChar(s.slice(1))) ? s.slice(1) : s;
+}
+
+/** RFC 4180 cell: formula-guard first, then quote on delimiter/quote/newline/edge space. */
+function csvCell(value: unknown): string {
+  if (value === null || value === undefined) return '';
+  // The apostrophe is part of the cell's data, so it must be added BEFORE
+  // deciding what to quote (it can never trigger quoting itself).
+  const s = neutralizeFormula(String(value));
+  return /[",\r\n]/.test(s) || s !== s.trim() ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+/**
+ * Serialise raw `businesses` rows (as selected by `selectLeadsForExport`)
+ * to CSV. Pure: no database access, no formatting of derived values beyond
+ * String() — coordinates and score are written exactly as stored, and an
+ * absent value is an empty cell, never a placeholder.
+ *
+ * Line endings are CRLF per RFC 4180 (Excel + our own parser accept both);
+ * the trailing CRLF terminates the last row.
+ */
+export function leadsToCsv(rows: readonly Record<string, unknown>[]): string {
+  const lines: string[] = [LEAD_EXPORT_HEADERS.join(',')];
+  for (const r of rows) {
+    lines.push(
+      [
+        r.display_name,
+        r.category,
+        r.city,
+        r.address,
+        r.latitude,
+        r.longitude,
+        r.website_url,
+        r.phone_e164,
+        r.whatsapp_e164,
+        r.email,
+        r.contact_person_name,
+        r.requirements,
+        r.stage,
+        r.score,
+        r.interest_level,
+        r.duplicate_status,
+        r.source_type,
+        r.source_url,
+        r.discovered_at,
+      ]
+        .map(csvCell)
+        .join(','),
+    );
+  }
+  return `${lines.join('\r\n')}\r\n`;
 }

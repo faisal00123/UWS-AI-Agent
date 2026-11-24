@@ -51,7 +51,7 @@ export function createWhatsAppCloudAdapter(opts: WhatsAppCloudOptions): WhatsApp
     key: 'whatsapp_cloud',
     label: 'WhatsApp Business (Cloud API)',
 
-    status(): AdapterStatus {
+    async status(): Promise<AdapterStatus> {
       const configured = Boolean(opts.phoneNumberId && opts.accessToken && opts.appSecret);
       return {
         key: 'whatsapp',

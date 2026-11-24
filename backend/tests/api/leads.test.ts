@@ -293,4 +293,66 @@ describe('leads API', () => {
     const invalid = await ownerClient.post<ErrorBody>('/api/leads', { displayName: '' });
     assert.equal(invalid.status, 400);
   });
+
+  // ---- HIGH#3 regression: unbounded import rows × fuzzy dedupe. Every row
+  // ---- costs a duplicate lookup (2 similarity computations + DB queries)
+  // ---- and its raw values are retained for the preview — the8 MB body cap
+  // ---- alone allowed millions of rows.
+
+  test('an import above the row cap is rejected with a clear 400', async () => {
+    const lines = ['Business Name,City'];
+    for (let i = 0; i <= 5000; i++) lines.push(`Bulk Cap ${i},Karachi`);
+    const res = await ownerClient.request<ErrorBody>('/api/leads/import/preview', {
+      method: 'POST',
+      rawBody: `${lines.join('\n')}\n`,
+      headers: { 'content-type': 'text/csv', 'x-import-filename': 'huge.csv' },
+    });
+    assert.equal(res.status, 400, res.raw);
+    assert.equal(res.body.error.code, 'validation_failed');
+    assert.match(res.body.error.message, /maximum per import is 5000/);
+    const list = await ownerClient.get<ListBody>('/api/leads');
+    assert.ok(list.body.total < 100, 'a rejected import must not create leads');
+  });
+
+  test('preview bounds the row list but keeps every count exact', async () => {
+    const lines = ['Business Name,City,Phone'];
+    for (let i = 0; i < 520; i++) lines.push(`Bulk Preview ${i},City${i},0300${1000000 + i}`);
+    const res = await ownerClient.request<{
+      totalRows: number;
+      imported: number;
+      rowsTruncated: boolean;
+      rows: unknown[];
+    }>('/api/leads/import/preview', {
+      method: 'POST',
+      rawBody: `${lines.join('\n')}\n`,
+      headers: { 'content-type': 'text/csv', 'x-import-filename': 'bulk-preview.csv' },
+    });
+    assert.equal(res.status, 200, res.raw);
+    assert.equal(res.body.totalRows, 520, 'counts cover ALL rows, not the returned slice');
+    assert.equal(res.body.imported, 520);
+    assert.ok(res.body.rows.length <= 500, `row list must be bounded (got ${res.body.rows.length})`);
+    assert.equal(res.body.rowsTruncated, true);
+  });
+
+  test('commit responses bound the row list too', async () => {
+    const lines = ['Business Name,City,Phone'];
+    for (let i = 0; i < 510; i++) lines.push(`Bulk Commit ${i},City${i},0301${2000000 + i}`);
+    const res = await ownerClient.request<{
+      committed: boolean;
+      totalRows: number;
+      imported: number;
+      rowsTruncated: boolean;
+      rows: unknown[];
+    }>('/api/leads/import', {
+      method: 'POST',
+      rawBody: `${lines.join('\n')}\n`,
+      headers: { 'content-type': 'text/csv', 'x-import-filename': 'bulk-commit.csv' },
+    });
+    assert.equal(res.status, 200, res.raw);
+    assert.equal(res.body.committed, true);
+    assert.equal(res.body.totalRows, 510);
+    assert.equal(res.body.imported, 510);
+    assert.ok(res.body.rows.length <= 500, `row list must be bounded (got ${res.body.rows.length})`);
+    assert.equal(res.body.rowsTruncated, true);
+  });
 });

@@ -55,16 +55,33 @@ export function analysisRoutes(deps: AppDeps): Router {
     requireRole('owner', 'staff'),
     asyncRoute(async (req, res) => {
       const id = z.string().min(1).parse(req.params.id);
-      const lead = req.ctx.deps.db.prepare('SELECT website_url FROM businesses WHERE id = ?').get(id) as
+      const lead = (await req.ctx.deps.db.prepare('SELECT website_url FROM businesses WHERE id = ?').get(id)) as
         | { website_url: string | null }
         | undefined;
       if (!lead) throw notFound('Lead');
 
-      const record = await analyzeWebsite(req.ctx.deps.db, {
-        businessId: id,
-        websiteUrl: lead.website_url,
-      });
-      recordAudit(req.ctx.deps.db, {
+      const record = await analyzeWebsite(
+        req.ctx.deps.db,
+        {
+          businessId: id,
+          websiteUrl: lead.website_url,
+        },
+        // Test-injected transport (same one the verify route uses): in
+        // production deps.fetchImpl is absent and this stays the real fetch.
+        // The adapter wrapper bridges FetchLike (string URL) to the
+        // fetcher's standard `typeof fetch` signature.
+        req.ctx.deps.fetchImpl
+          ? { fetchImpl: (url: string | URL | Request, init?: RequestInit) => req.ctx.deps.fetchImpl!(String(url), init ?? {}) }
+          : {},
+      );
+      // Phase 6: a fresh analysis (plus any contact enrichment it performed
+      // from the same page) supersedes the evidence a stored score was
+      // computed from — refresh it when one exists. A score is never
+      // CREATED here: the Score action owns that decision.
+      if ((await latestScore(req.ctx.deps.db, id)) !== null) {
+        await recordScore(req.ctx.deps.db, req.ctx.deps.config, { businessId: id });
+      }
+      await recordAudit(req.ctx.deps.db, {
         actorUserId: req.ctx.user!.id,
         actorLabel: req.ctx.user!.role,
         action: 'lead.analyze',
@@ -79,11 +96,11 @@ export function analysisRoutes(deps: AppDeps): Router {
 
   router.get(
     '/:id/analysis',
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const id = z.string().min(1).parse(req.params.id);
       res.json({
-        latest: latestAnalysis(req.ctx.deps.db, id),
-        history: analysisHistory(req.ctx.deps.db, id),
+        latest: await latestAnalysis(req.ctx.deps.db, id),
+        history: await analysisHistory(req.ctx.deps.db, id),
       });
     }),
   );
@@ -93,18 +110,18 @@ export function analysisRoutes(deps: AppDeps): Router {
     '/:id/score',
     requireCsrf,
     requireRole('owner', 'staff'),
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const id = z.string().min(1).parse(req.params.id);
-      const result = recordScore(req.ctx.deps.db, req.ctx.deps.config, { businessId: id });
+      const result = await recordScore(req.ctx.deps.db, req.ctx.deps.config, { businessId: id });
       res.json(result);
     }),
   );
 
   router.get(
     '/:id/score',
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const id = z.string().min(1).parse(req.params.id);
-      res.json({ latest: latestScore(req.ctx.deps.db, id) });
+      res.json({ latest: await latestScore(req.ctx.deps.db, id) });
     }),
   );
 
@@ -114,28 +131,28 @@ export function analysisRoutes(deps: AppDeps): Router {
     '/:id/eligibility',
     requireCsrf,
     requireRole('owner', 'staff'),
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const id = z.string().min(1).parse(req.params.id);
       const channel = channelSchema.parse((req.body as { channel?: string } | undefined)?.channel ?? 'call');
-      res.json(evaluateEligibility(req.ctx.deps.db, req.ctx.deps.config, id, channel));
+      res.json(await evaluateEligibility(req.ctx.deps.db, req.ctx.deps.config, id, channel));
     }),
   );
 
   router.get(
     '/:id/eligibility',
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const id = z.string().min(1).parse(req.params.id);
       const channel = channelSchema.parse(req.query.channel ?? 'call');
-      res.json({ latest: latestEligibility(req.ctx.deps.db, id, channel as Channel) });
+      res.json({ latest: await latestEligibility(req.ctx.deps.db, id, channel as Channel) });
     }),
   );
 
   // ----------------------------------------------------------- suppression --
   router.get(
     '/:id/suppression',
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const id = z.string().min(1).parse(req.params.id);
-      res.json({ items: listSuppression(req.ctx.deps.db, id) });
+      res.json({ items: await listSuppression(req.ctx.deps.db, id) });
     }),
   );
 
@@ -144,10 +161,10 @@ export function analysisRoutes(deps: AppDeps): Router {
     '/:id/suppression',
     requireCsrf,
     requireRole('owner'),
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const id = z.string().min(1).parse(req.params.id);
       const body = suppressSchema.parse(req.body);
-      const result = suppress(req.ctx.deps.db, {
+      const result = await suppress(req.ctx.deps.db, {
         businessId: id,
         scope: body.scope,
         reason: body.reason,
@@ -156,7 +173,7 @@ export function analysisRoutes(deps: AppDeps): Router {
         permanent: body.permanent,
         createdBy: req.ctx.user!.id,
       });
-      recordAudit(req.ctx.deps.db, {
+      await recordAudit(req.ctx.deps.db, {
         actorUserId: req.ctx.user!.id,
         actorLabel: req.ctx.user!.role,
         action: 'lead.suppress',

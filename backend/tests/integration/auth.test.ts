@@ -9,6 +9,9 @@ import {
   loadSession,
   login,
 } from '../../src/domain/auth/service.ts';
+import { sessionPurgeJob } from '../../src/jobs/sessions.ts';
+import { summarise } from '../../src/domain/state/service.ts';
+import { createLogger } from '../../src/core/logger.ts';
 
 let server: TestServer;
 
@@ -196,5 +199,117 @@ describe('authentication service', () => {
     assert.ok(revoked >= 1);
     assert.notEqual(loadSession(server.db, b.session.token), null, 'kept session survives');
     assert.equal(loadSession(server.db, a.session.token), null, 'other session revoked');
+  });
+
+  // ---- lockout hardening: no re-arm DoS, no account-existence oracle ----
+
+  test('lockout rejections do not re-arm the rate-limit window', async () => {
+    const owner = await seedOwner(server, { email: 'rearm@uws.test' });
+    const attempt = (password: string): Promise<unknown> =>
+      login(server.db, server.config, { email: owner.email, password, ipHash: 'h10', userAgent: null });
+
+    // Burn the per-account budget (LOGIN_MAX_ATTEMPTS = 3 for this suite).
+    for (let i = 0; i < 3; i++) {
+      await assert.rejects(() => attempt('wrong-password-x'), /Incorrect email or password/);
+    }
+    // Spam while locked out: every rejection must still be RECORDED for the
+    // audit trail...
+    for (let i = 0; i < 5; i++) {
+      await assert.rejects(() => attempt('wrong-password-x'), /Too many failed sign-in attempts/);
+    }
+    const recorded = server.db
+      .prepare(`SELECT COUNT(*) c FROM login_attempts WHERE email = ? AND reason = 'rate_limited'`)
+      .get(owner.email) as { c: number };
+    assert.ok(recorded.c >= 5, 'rejections must be recorded for audit');
+
+    // ...but must never COUNT towards the window: once the 3 genuine failures
+    // age out, the account must be usable again even though 5 rejections
+    // happened inside the window. (Before the fix those rows were counted,
+    // so an attacker who knows the email could re-arm the window forever.)
+    const aged = new Date(Date.now() - 16 * 60_000).toISOString();
+    server.db
+      .prepare(
+        `UPDATE login_attempts SET created_at = ?
+          WHERE email = ? AND succeeded = 0
+            AND COALESCE(reason, '') NOT IN ('rate_limited', 'account_locked')`,
+      )
+      .run(aged, owner.email);
+
+    const res = await login(server.db, server.config, {
+      email: owner.email,
+      password: owner.password,
+      ipHash: 'h10',
+      userAgent: null,
+    });
+    assert.equal(res.user.email, owner.email, 'expired window must allow the correct password again');
+  });
+
+  test('a wrong password on a locked account is indistinguishable from a non-existent one', async () => {
+    const owner = await seedOwner(server, { email: 'locked-oracle@uws.test' });
+    server.db
+      .prepare('UPDATE users SET locked_until = ? WHERE id = ?')
+      .run(new Date(Date.now() + 10 * 60_000).toISOString(), owner.user.id);
+
+    const messageOf = async (email: string, password: string): Promise<string> => {
+      try {
+        await login(server.db, server.config, { email, password, ipHash: 'h11', userAgent: null });
+        return '(unexpected success)';
+      } catch (e) {
+        return e instanceof Error ? e.message : String(e);
+      }
+    };
+
+    const lockedMsg = await messageOf(owner.email, 'Wrong-Password-99!');
+    const ghostMsg = await messageOf('ghost@uws.test', 'Wrong-Password-99!');
+    assert.equal(lockedMsg, 'Incorrect email or password.');
+    assert.equal(lockedMsg, ghostMsg, 'a lock must not reveal whether the account exists');
+  });
+
+  test('only the correct password learns when a lock expires, and spam cannot extend it', async () => {
+    const owner = await seedOwner(server, { email: 'lock-expiry@uws.test' });
+    const lockedUntil = new Date(Date.now() + 10 * 60_000).toISOString();
+    server.db.prepare('UPDATE users SET locked_until = ? WHERE id = ?').run(lockedUntil, owner.user.id);
+
+    for (let i = 0; i < 3; i++) {
+      await assert.rejects(
+        () => login(server.db, server.config, { email: owner.email, password: 'wrong-again-123', ipHash: 'h12', userAgent: null }),
+        /Incorrect email or password/,
+      );
+    }
+    const row = server.db.prepare('SELECT locked_until FROM users WHERE id = ?').get(owner.user.id) as {
+      locked_until: string | null;
+    };
+    assert.equal(row.locked_until, lockedUntil, 'wrong-password spam must not push the lock further out');
+
+    await assert.rejects(
+      () => login(server.db, server.config, { email: owner.email, password: owner.password, ipHash: 'h12', userAgent: null }),
+      /Too many failed sign-in attempts/,
+      'the correct password is told when the lock expires',
+    );
+  });
+
+  test('session_purge job deletes expired session rows but keeps live ones', async () => {
+    const owner = await seedOwner(server, { email: 'purge@uws.test' });
+    const creds = { email: owner.email, password: owner.password, ipHash: 'h13', userAgent: null };
+    const keep = await login(server.db, server.config, creds);
+    const drop = await login(server.db, server.config, creds);
+
+    const expired = new Date(Date.now() - 60_000).toISOString();
+    server.db
+      .prepare('UPDATE sessions SET expires_at = ? WHERE id = ?')
+      .run(expired, hashToken(drop.session.token));
+
+    const result = await sessionPurgeJob.run({
+      db: server.db,
+      config: server.config,
+      logger: createLogger('error', false),
+      guard: summarise(server.db),
+      now: new Date(),
+    });
+    const detail = (result as { detail?: string } | undefined)?.detail;
+
+    assert.equal(loadSession(server.db, drop.session.token), null, 'expired session row must be deleted');
+    assert.notEqual(loadSession(server.db, keep.session.token), null, 'live session must survive');
+    assert.match(String(detail ?? ''), /expired session\(s\) purged/, 'the job reports what it removed');
   });
 });

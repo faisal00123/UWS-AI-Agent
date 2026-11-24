@@ -162,6 +162,26 @@ export function normalizeEmail(raw: string | null | undefined): { email: string 
 }
 
 /**
+ * Machine mailboxes (noreply-style, postmaster, abuse) can never reach a
+ * human being. They are rejected by every entry point that writes an email
+ * onto a lead — import, manual/discovery creation and enrichment — so a
+ * dead-end address is never presented as a contactable one.
+ *
+ * Matches the LOCAL PART only, exactly (after separator normalisation):
+ * `noreply@`, `no-reply@`, `donotreply@`, `postmaster@`, `abuse@`, plus the
+ * dotted/scored spellings. Deliberately NOT a prefix match — a real mailbox
+ * like `abuse.team@` or `noreplys@` is not covered, because guessing would
+ * reject legitimate addresses the business published.
+ */
+export function isMachineMailbox(email: string | null | undefined): boolean {
+  const value = (email ?? '').trim().toLowerCase();
+  const at = value.lastIndexOf('@');
+  if (at <= 0) return false;
+  const local = value.slice(0, at);
+  return /^(noreply|no[-_.]?reply|donotreply|do[-_.]?not[-_.]?reply|postmaster|abuse)$/.test(local);
+}
+
+/**
  * Damerau-free Levenshtein similarity in [0,1] - used for *flagging*
  * uncertain duplicates only (never for automatic merging).
  */

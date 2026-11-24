@@ -18,7 +18,7 @@ import {
   recordMerge,
   type LeadCandidate,
 } from './dedupe.ts';
-import { normalizeCity, normalizeEmail, normalizeName, normalizePhone, normalizeWebsite } from './normalize.ts';
+import { isMachineMailbox, normalizeCity, normalizeEmail, normalizeName, normalizePhone, normalizeWebsite } from './normalize.ts';
 
 export type LeadStage =
   | 'new_lead'
@@ -75,6 +75,8 @@ export interface LeadListItem {
   displayName: string;
   category: string | null;
   city: string | null;
+  /** Physical address when the source record carried one (never invented). */
+  address: string | null;
   websiteUrl: string | null;
   phoneE164: string | null;
   email: string | null;
@@ -98,14 +100,20 @@ export interface LeadListResult {
   totalPages: number;
 }
 
-export function listLeads(db: DB, query: LeadListQuery = {}): LeadListResult {
+export async function listLeads(db: DB, query: LeadListQuery = {}): Promise<LeadListResult> {
   const where: string[] = [];
   const params: unknown[] = [];
 
   if (!query.includeMerged) where.push('merged_into_id IS NULL');
   if (query.q) {
-    where.push('(display_name LIKE ? OR city LIKE ? OR website_host LIKE ? OR phone_e164 LIKE ?)');
-    const like = `%${query.q.replace(/[%_]/g, '')}%`;
+    where.push(
+      "(display_name LIKE ? ESCAPE '\\' OR city LIKE ? ESCAPE '\\'" +
+        " OR website_host LIKE ? ESCAPE '\\' OR phone_e164 LIKE ? ESCAPE '\\')",
+    );
+    // Escape LIKE wildcards (and the escape char itself) so the user's `%`
+    // and `_` are matched LITERALLY: deleting them instead made `50%` search
+    // for `50` and `a_b` match `ab`.
+    const like = `%${query.q.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
     params.push(like, like, like, like);
   }
   if (query.stage) {
@@ -141,7 +149,7 @@ export function listLeads(db: DB, query: LeadListQuery = {}): LeadListResult {
 
   const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const total = (
-    db.prepare(`SELECT COUNT(*) c FROM businesses ${clause}`).get(...(params as never[])) as {
+    (await db.prepare(`SELECT COUNT(*) c FROM businesses ${clause}`).get(...(params as never[]))) as {
       c: number;
     }
   ).c;
@@ -168,9 +176,9 @@ export function listLeads(db: DB, query: LeadListQuery = {}): LeadListResult {
   const page = Math.max(query.page ?? 1, 1);
   const offset = (page - 1) * pageSize;
 
-  const rows = db
+  const rows = (await db
     .prepare(
-      `SELECT id, display_name, category, city, website_url, phone_e164, email, stage, score,
+      `SELECT id, display_name, category, city, address, website_url, phone_e164, email, stage, score,
               score_band, eligibility_state, interest_level, qualification_status,
               duplicate_status, source_type, discovered_at, updated_at
          FROM businesses
@@ -178,7 +186,7 @@ export function listLeads(db: DB, query: LeadListQuery = {}): LeadListResult {
          ORDER BY ${orderBy}
          LIMIT ? OFFSET ?`,
     )
-    .all(...([...params, pageSize, offset] as never[])) as unknown as Record<string, unknown>[];
+    .all(...([...params, pageSize, offset] as never[]))) as unknown as Record<string, unknown>[];
 
   return {
     items: rows.map(
@@ -187,6 +195,7 @@ export function listLeads(db: DB, query: LeadListQuery = {}): LeadListResult {
         displayName: String(r.display_name),
         category: (r.category as string | null) ?? null,
         city: (r.city as string | null) ?? null,
+        address: (r.address as string | null) ?? null,
         websiteUrl: (r.website_url as string | null) ?? null,
         phoneE164: (r.phone_e164 as string | null) ?? null,
         email: (r.email as string | null) ?? null,
@@ -207,6 +216,26 @@ export function listLeads(db: DB, query: LeadListQuery = {}): LeadListResult {
     pageSize,
     totalPages: Math.max(1, Math.ceil(total / pageSize)),
   };
+}
+
+/**
+ * Every LIVE lead (merged rows excluded) as raw rows for the CSV export —
+ * a whitelisted column set, ordered by name so two exports of the same data
+ * are byte-identical. No page cap: the export is the owner's full data-out
+ * path, unlike the paginated list.
+ */
+export async function selectLeadsForExport(db: DB): Promise<Record<string, unknown>[]> {
+  return (await db
+    .prepare(
+      `SELECT display_name, category, city, address, latitude, longitude,
+              website_url, phone_e164, whatsapp_e164, email, contact_person_name,
+              requirements, stage, score, interest_level, duplicate_status,
+              source_type, source_url, discovered_at
+       FROM businesses
+       WHERE merged_into_id IS NULL
+       ORDER BY display_name COLLATE NOCASE ASC`,
+    )
+    .all()) as unknown as Record<string, unknown>[];
 }
 
 export interface LeadDetail {
@@ -230,46 +259,52 @@ export interface LeadDetail {
   proposals: unknown[];
 }
 
-export function getLeadDetail(db: DB, id: string): LeadDetail {
-  const business = db.prepare('SELECT * FROM businesses WHERE id = ?').get(id) as
+export async function getLeadDetail(db: DB, id: string): Promise<LeadDetail> {
+  const business = (await db.prepare('SELECT * FROM businesses WHERE id = ?').get(id)) as
     | Record<string, unknown>
     | undefined;
   if (!business) throw notFound('Lead');
 
-  const q = (sql: string, ...args: unknown[]): unknown[] =>
-    db.prepare(sql).all(...(args as never[])) as unknown[];
+  const q = async (sql: string, ...args: unknown[]): Promise<unknown[]> =>
+    (await db.prepare(sql).all(...(args as never[]))) as unknown[];
+
+  // The scores map runs a per-row query, so it is a for...of loop: Array.map
+  // callbacks cannot await (order and result shape are unchanged).
+  const scoreRows = (await q(
+    'SELECT * FROM lead_scores WHERE business_id = ? ORDER BY computed_at DESC LIMIT 5',
+    id,
+  )) as Record<string, unknown>[];
+  const scores: { score: Record<string, unknown>; factors: unknown[] }[] = [];
+  for (const score of scoreRows) {
+    scores.push({
+      score,
+      factors: await q('SELECT * FROM score_factors WHERE score_id = ?', String(score.id)),
+    });
+  }
 
   return {
     business,
-    sources: q('SELECT * FROM lead_sources WHERE business_id = ? ORDER BY imported_at DESC', id),
-    contactPoints: q('SELECT * FROM contact_points WHERE business_id = ? ORDER BY kind', id),
-    fieldVerifications: q('SELECT * FROM field_verifications WHERE business_id = ? ORDER BY field, checked_at DESC', id),
-    analyses: q('SELECT * FROM website_analyses WHERE business_id = ? ORDER BY created_at DESC LIMIT 10', id),
-    scores: (
-      q('SELECT * FROM lead_scores WHERE business_id = ? ORDER BY computed_at DESC LIMIT 5', id) as Record<
-        string,
-        unknown
-      >[]
-    ).map((score) => ({
-      score,
-      factors: q('SELECT * FROM score_factors WHERE score_id = ?', String(score.id)),
-    })),
-    eligibility: q('SELECT * FROM eligibility_checks WHERE business_id = ? ORDER BY checked_at DESC LIMIT 10', id),
-    stageHistory: q('SELECT * FROM lead_stage_history WHERE business_id = ? ORDER BY changed_at DESC LIMIT 50', id),
-    interactions: q('SELECT * FROM interactions WHERE business_id = ? ORDER BY occurred_at DESC LIMIT 50', id),
-    followups: q('SELECT * FROM followup_tasks WHERE business_id = ? ORDER BY scheduled_for ASC LIMIT 50', id),
-    calls: q('SELECT * FROM calls WHERE business_id = ? ORDER BY created_at DESC LIMIT 50', id),
-    messages: q('SELECT * FROM messages WHERE business_id = ? ORDER BY created_at DESC LIMIT 50', id),
-    duplicates: q(
+    sources: await q('SELECT * FROM lead_sources WHERE business_id = ? ORDER BY imported_at DESC', id),
+    contactPoints: await q('SELECT * FROM contact_points WHERE business_id = ? ORDER BY kind', id),
+    fieldVerifications: await q('SELECT * FROM field_verifications WHERE business_id = ? ORDER BY field, checked_at DESC', id),
+    analyses: await q('SELECT * FROM website_analyses WHERE business_id = ? ORDER BY created_at DESC LIMIT 10', id),
+    scores,
+    eligibility: await q('SELECT * FROM eligibility_checks WHERE business_id = ? ORDER BY checked_at DESC LIMIT 10', id),
+    stageHistory: await q('SELECT * FROM lead_stage_history WHERE business_id = ? ORDER BY changed_at DESC LIMIT 50', id),
+    interactions: await q('SELECT * FROM interactions WHERE business_id = ? ORDER BY occurred_at DESC LIMIT 50', id),
+    followups: await q('SELECT * FROM followup_tasks WHERE business_id = ? ORDER BY scheduled_for ASC LIMIT 50', id),
+    calls: await q('SELECT * FROM calls WHERE business_id = ? ORDER BY created_at DESC LIMIT 50', id),
+    messages: await q('SELECT * FROM messages WHERE business_id = ? ORDER BY created_at DESC LIMIT 50', id),
+    duplicates: await q(
       `SELECT * FROM duplicate_candidates WHERE business_id_a = ? OR business_id_b = ? ORDER BY created_at DESC`,
       id,
       id,
     ),
-    merges: q('SELECT * FROM merge_history WHERE survivor_id = ? OR merged_id = ? ORDER BY performed_at DESC', id, id),
-    suppression: q('SELECT * FROM suppression_list WHERE business_id = ?', id),
-    deals: q('SELECT * FROM deals WHERE business_id = ? ORDER BY created_at DESC', id),
-    meetings: q('SELECT * FROM meetings WHERE business_id = ? ORDER BY starts_at DESC', id),
-    proposals: q('SELECT * FROM proposals WHERE business_id = ? ORDER BY created_at DESC', id),
+    merges: await q('SELECT * FROM merge_history WHERE survivor_id = ? OR merged_id = ? ORDER BY performed_at DESC', id, id),
+    suppression: await q('SELECT * FROM suppression_list WHERE business_id = ?', id),
+    deals: await q('SELECT * FROM deals WHERE business_id = ? ORDER BY created_at DESC', id),
+    meetings: await q('SELECT * FROM meetings WHERE business_id = ? ORDER BY starts_at DESC', id),
+    proposals: await q('SELECT * FROM proposals WHERE business_id = ? ORDER BY created_at DESC', id),
   };
 }
 
@@ -277,6 +312,11 @@ export interface CreateLeadInput {
   displayName: string;
   category?: string | null;
   city?: string | null;
+  /** Physical address as recorded by the source (never invented). */
+  address?: string | null;
+  /** WGS84 coordinates from the source; validated, never fabricated. */
+  latitude?: number | null;
+  longitude?: number | null;
   websiteUrl?: string | null;
   phone?: string | null;
   email?: string | null;
@@ -293,11 +333,11 @@ export interface CreateLeadResult {
   problems: { field: string; message: string }[];
 }
 
-export function createLead(
+export async function createLead(
   db: DB,
   input: CreateLeadInput,
   actor: { userId: string | null; label: 'owner' | 'staff' | 'system' | 'scheduler'; sourceType?: string },
-): CreateLeadResult {
+): Promise<CreateLeadResult> {
   const problems: { field: string; message: string }[] = [];
   const name = (input.displayName ?? '').trim();
   if (name.length < 2) problems.push({ field: 'displayName', message: 'Business name is required (min 2 characters)' });
@@ -314,9 +354,29 @@ export function createLead(
   if ((input.email ?? '') !== '' && !mail.valid) {
     problems.push({ field: 'email', message: `Email is not valid (${mail.reason})` });
   }
+  // Same rule as import and enrichment: a machine mailbox can never reach a
+  // human, so it is never written onto a lead (reported, not silently kept).
+  const usableEmail = mail.valid && mail.email !== null && !isMachineMailbox(mail.email);
+  if ((input.email ?? '') !== '' && mail.valid && !usableEmail) {
+    problems.push({ field: 'email', message: 'Email is an automated mailbox (noreply-style) - it cannot reach a human' });
+  }
   const whatsapp = normalizePhone(input.whatsapp ?? '');
   if ((input.whatsapp ?? '') !== '' && !whatsapp.valid) {
     problems.push({ field: 'whatsapp', message: `WhatsApp number is not usable (${whatsapp.reason})` });
+  }
+
+  // Coordinates come from evidence (OSM/CSV) — out-of-range values are
+  // rejected as a warning and stored as NULL, never silently corrupted.
+  const address = (input.address ?? '').trim().slice(0, 300) || null;
+  let latitude = input.latitude ?? null;
+  let longitude = input.longitude ?? null;
+  if (latitude !== null && (!Number.isFinite(latitude) || latitude < -90 || latitude > 90)) {
+    problems.push({ field: 'latitude', message: 'Latitude must be a number between -90 and 90' });
+    latitude = null;
+  }
+  if (longitude !== null && (!Number.isFinite(longitude) || longitude < -180 || longitude > 180)) {
+    problems.push({ field: 'longitude', message: 'Longitude must be a number between -180 and 180' });
+    longitude = null;
   }
 
   if (problems.some((p) => p.field === 'displayName')) {
@@ -327,38 +387,51 @@ export function createLead(
     displayName: name,
     category: input.category?.trim() || null,
     city: input.city?.trim() || null,
+    address,
+    latitude,
+    longitude,
     websiteUrl: site.valid ? site.url : null,
     websiteHost: site.valid ? site.host : null,
     phoneE164: phone.valid ? phone.e164 : null,
     phoneRaw: input.phone?.trim() || null,
-    email: mail.valid ? mail.email : null,
+    email: usableEmail ? mail.email : null,
     whatsappE164: whatsapp.valid ? whatsapp.e164 : null,
     contactPersonName: input.contactPersonName?.trim() || null,
     sourceUrl: input.sourceUrl?.trim() || null,
     requirements: input.requirements?.trim() || null,
   };
 
-  const duplicate = findDuplicate(db, candidate);
+  const duplicate = await findDuplicate(db, candidate);
   const at = nowIso();
   const id = newId('biz');
   const mergedIntoId = duplicate?.autoMerge ? duplicate.businessId : null;
   const hasWarnings = problems.length > 0;
 
-  db.prepare(
+  await db.prepare(
     `INSERT INTO businesses (
        id, display_name, normalized_name, category, city, country,
+       address, latitude, longitude,
        website_url, website_host, phone_e164, phone_raw, email, whatsapp_e164,
        contact_person_name, source_type, source_url, discovered_at, last_checked_at,
        stage, stage_changed_at, stage_change_reason, eligibility_state,
        duplicate_status, merged_into_id, created_by, created_at, updated_at
-     ) VALUES (?, ?, ?, ?, ?, 'PK', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-               'new_lead', ?, ?, 'unknown', ?, ?, ?, ?, ?)`,
+     ) VALUES (
+       ?, ?, ?, ?, ?, 'PK',
+       ?, ?, ?,
+       ?, ?, ?, ?, ?, ?,
+       ?, ?, ?, ?, ?,
+       'new_lead', ?, ?, 'unknown',
+       ?, ?, ?, ?, ?
+     )`,
   ).run(
     id,
     name,
     normalizeName(name) || name.toLowerCase(),
     candidate.category,
     candidate.city,
+    candidate.address ?? null,
+    candidate.latitude ?? null,
+    candidate.longitude ?? null,
     candidate.websiteUrl,
     candidate.websiteHost,
     candidate.phoneE164,
@@ -379,7 +452,7 @@ export function createLead(
     at,
   );
 
-  db.prepare(
+  await db.prepare(
     `INSERT INTO lead_sources (id, business_id, source_type, source_url, source_ref, raw_payload_json, imported_by, imported_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
@@ -394,8 +467,8 @@ export function createLead(
   );
 
   if (duplicate?.autoMerge) {
-    const outcome = reconcileSurvivor(db, duplicate.businessId, id);
-    recordMerge(
+    const outcome = await reconcileSurvivor(db, duplicate.businessId, id);
+    await recordMerge(
       db,
       {
         survivorId: duplicate.businessId,
@@ -408,10 +481,10 @@ export function createLead(
       outcome,
     );
   } else if (duplicate) {
-    flagForReview(db, id, duplicate, { userId: actor.userId, label: actor.label });
+    await flagForReview(db, id, duplicate, { userId: actor.userId, label: actor.label });
   }
 
-  recordAudit(db, {
+  await recordAudit(db, {
     actorUserId: actor.userId,
     actorLabel: actor.label,
     action: 'lead.create',
@@ -440,6 +513,7 @@ const EDITABLE_FIELDS: Record<string, string> = {
   displayName: 'display_name',
   category: 'category',
   city: 'city',
+  address: 'address',
   websiteUrl: 'website_url',
   phone: 'phone_e164',
   email: 'email',
@@ -450,15 +524,18 @@ const EDITABLE_FIELDS: Record<string, string> = {
   serviceInterest: 'service_interest',
   preferredLanguage: 'preferred_language',
   timeline: 'timeline',
+  // latitude/longitude are deliberately NOT editable: they are source
+  // evidence (OSM/CSV), not free text — editing them would break the audit
+  // back to the source record.
 };
 
-export function updateLead(
+export async function updateLead(
   db: DB,
   id: string,
   updates: UpdateLeadInput[],
   actor: { userId: string | null; label: 'owner' | 'staff' | 'system' | 'scheduler' },
-): Record<string, unknown> {
-  const existing = db.prepare('SELECT * FROM businesses WHERE id = ?').get(id) as
+): Promise<Record<string, unknown>> {
+  const existing = (await db.prepare('SELECT * FROM businesses WHERE id = ?').get(id)) as
     | Record<string, unknown>
     | undefined;
   if (!existing) throw notFound('Lead');
@@ -483,7 +560,7 @@ export function updateLead(
         }
         if (update.field === 'phone') {
           // keep raw alongside normalised value
-          db.prepare('UPDATE businesses SET phone_raw = ? WHERE id = ?').run(value, id);
+          await db.prepare('UPDATE businesses SET phone_raw = ? WHERE id = ?').run(value, id);
         }
         value = p.valid ? p.e164 : null;
       } else if (update.field === 'websiteUrl') {
@@ -492,7 +569,7 @@ export function updateLead(
           problems.push({ field: update.field, message: `Website URL is not usable (${w.reason})` });
           continue;
         }
-        db.prepare('UPDATE businesses SET website_host = ? WHERE id = ?').run(w.valid ? w.host : null, id);
+        await db.prepare('UPDATE businesses SET website_host = ? WHERE id = ?').run(w.valid ? w.host : null, id);
         value = w.valid ? w.url : null;
       } else if (update.field === 'email') {
         const e = normalizeEmail(value);
@@ -508,7 +585,7 @@ export function updateLead(
           problems.push({ field: update.field, message: 'Business name is too short' });
           continue;
         }
-        db.prepare('UPDATE businesses SET normalized_name = ? WHERE id = ?').run(normalizeName(value), id);
+        await db.prepare('UPDATE businesses SET normalized_name = ? WHERE id = ?').run(normalizeName(value), id);
         value = value.trim();
       } else {
         value = value.trim() || null;
@@ -518,7 +595,7 @@ export function updateLead(
     const current = existing[column];
     if (String(current ?? '') === String(value ?? '')) continue;
     changes[update.field] = { from: current ?? null, to: value };
-    db.prepare(`UPDATE businesses SET ${column} = ?, updated_at = ? WHERE id = ?`).run(
+    await db.prepare(`UPDATE businesses SET ${column} = ?, updated_at = ? WHERE id = ?`).run(
       value as never,
       nowIso(),
       id,
@@ -534,7 +611,7 @@ export function updateLead(
   }
 
   if (Object.keys(changes).length > 0) {
-    recordAudit(db, {
+    await recordAudit(db, {
       actorUserId: actor.userId,
       actorLabel: actor.label,
       action: 'lead.update',
@@ -545,7 +622,7 @@ export function updateLead(
     });
   }
 
-  const fresh = db.prepare('SELECT * FROM businesses WHERE id = ?').get(id) as Record<string, unknown>;
+  const fresh = (await db.prepare('SELECT * FROM businesses WHERE id = ?').get(id)) as Record<string, unknown>;
   return { business: fresh, changes, rejected: problems };
 }
 
@@ -554,16 +631,16 @@ export function updateLead(
  *   - contacted / interested / qualified require an interaction id
  *   - won / lost require a reason AND owner confirmation semantics
  */
-export function changeStage(
+export async function changeStage(
   db: DB,
   id: string,
   toStage: LeadStage,
   opts: { reason: string; evidenceInteractionId?: string | null; actor: { userId: string | null; label: 'owner' | 'staff' | 'system' | 'scheduler' } },
-): { from: string; to: LeadStage } {
+): Promise<{ from: string; to: LeadStage }> {
   if (!LEAD_STAGES.includes(toStage)) {
     throw new AppError('validation_failed', `Unknown stage "${toStage}"`, { allowed: LEAD_STAGES });
   }
-  const existing = db.prepare('SELECT stage FROM businesses WHERE id = ?').get(id) as
+  const existing = (await db.prepare('SELECT stage FROM businesses WHERE id = ?').get(id)) as
     | { stage: string }
     | undefined;
   if (!existing) throw notFound('Lead');
@@ -578,7 +655,7 @@ export function changeStage(
     );
   }
   if (opts.evidenceInteractionId) {
-    const exists = db
+    const exists = await db
       .prepare('SELECT id FROM interactions WHERE id = ? AND business_id = ?')
       .get(opts.evidenceInteractionId, id);
     if (!exists) {
@@ -590,15 +667,15 @@ export function changeStage(
   }
 
   const at = nowIso();
-  db.prepare(
+  await db.prepare(
     `INSERT INTO lead_stage_history (business_id, from_stage, to_stage, reason, evidence_interaction_id, changed_by, changed_at)
      VALUES (?, ?, ?, ?, ?, ?, ?)`,
   ).run(id, from, toStage, opts.reason.trim(), opts.evidenceInteractionId ?? null, opts.actor.userId, at);
-  db.prepare(
+  await db.prepare(
     `UPDATE businesses SET stage = ?, stage_changed_at = ?, stage_change_reason = ?, updated_at = ? WHERE id = ?`,
   ).run(toStage, at, opts.reason.trim(), at, id);
 
-  recordAudit(db, {
+  await recordAudit(db, {
     actorUserId: opts.actor.userId,
     actorLabel: opts.actor.label,
     action: 'lead.stage_change',

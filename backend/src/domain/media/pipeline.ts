@@ -86,22 +86,22 @@ function speechLang(lang: ConversationLang): SpeechLanguage | undefined {
   return undefined;
 }
 
-function loadConversation(db: DB, conversationId: string): ConversationRow {
-  const row = db.prepare('SELECT * FROM conversations WHERE id = ?').get(conversationId) as
+async function loadConversation(db: DB, conversationId: string): Promise<ConversationRow> {
+  const row = (await db.prepare('SELECT * FROM conversations WHERE id = ?').get(conversationId)) as
     | ConversationRow
     | undefined;
   if (!row) throw new AppError('not_found', 'Conversation not found');
   return row;
 }
 
-function nextSeq(db: DB, conversationId: string): number {
-  const row = db.prepare('SELECT COALESCE(MAX(seq), 0) AS m FROM transcript_segments WHERE conversation_id = ?').get(
-    conversationId,
-  ) as { m: number };
+async function nextSeq(db: DB, conversationId: string): Promise<number> {
+  const row = (await db
+    .prepare('SELECT COALESCE(MAX(seq), 0) AS m FROM transcript_segments WHERE conversation_id = ?')
+    .get(conversationId)) as { m: number };
   return row.m + 1;
 }
 
-function insertSegment(
+async function insertSegment(
   db: DB,
   conversationId: string,
   input: {
@@ -111,9 +111,9 @@ function insertSegment(
     confidence?: number | null;
     source: 'stt' | 'typed' | 'simulated' | 'structured_outcome';
   },
-): number {
-  const seq = nextSeq(db, conversationId);
-  db.prepare(
+): Promise<number> {
+  const seq = await nextSeq(db, conversationId);
+  await db.prepare(
     `INSERT INTO transcript_segments (conversation_id, seq, speaker, text, language, confidence, source, occurred_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
@@ -143,26 +143,28 @@ export interface StartConversationInput {
  * conversation policy's single configured language, or 'unknown' when the
  * policy allows several (the prospect's language is learned, not assumed).
  */
-export function startConversation(db: DB, cfg: Config, input: StartConversationInput): string {
-  const policy = loadConversationPolicy(db, cfg);
+export async function startConversation(db: DB, cfg: Config, input: StartConversationInput): Promise<string> {
+  const policy = await loadConversationPolicy(db, cfg);
   const language: ConversationLang =
     input.language ??
     (policy.languages.length === 1 && (policy.languages[0] === 'ur' || policy.languages[0] === 'roman_ur' || policy.languages[0] === 'en')
       ? policy.languages[0]
       : 'unknown');
 
-  const lead = db.prepare('SELECT id FROM businesses WHERE id = ?').get(input.businessId) as
+  const lead = (await db.prepare('SELECT id FROM businesses WHERE id = ?').get(input.businessId)) as
     | { id: string }
     | undefined;
   if (!lead) throw new AppError('not_found', 'Lead not found');
 
   const id = newId('cnv');
   const at = nowIso();
-  db.prepare(
-    `INSERT INTO conversations (id, call_id, business_id, language, ai_identity_disclosed, human_requested,
+  await db
+    .prepare(
+      `INSERT INTO conversations (id, call_id, business_id, language, ai_identity_disclosed, human_requested,
        transcript_state, summary, extracted_json, started_at, ended_at, created_at)
      VALUES (?, ?, ?, ?, 1, 0, 'none', NULL, NULL, ?, NULL, ?)`,
-  ).run(id, input.callId ?? null, input.businessId, language, at, at);
+    )
+    .run(id, input.callId ?? null, input.businessId, language, at, at);
   return id;
 }
 
@@ -184,7 +186,7 @@ export async function ingestProspectAudio(
   conversationId: string,
   input: { audio: Uint8Array; mimeType?: string; filename?: string; signal?: AbortSignal },
 ): Promise<ProspectTurn> {
-  const conversation = loadConversation(db, conversationId);
+  const conversation = await loadConversation(db, conversationId);
   if (conversation.ended_at) {
     throw new AppError('conflict', 'Conversation has already ended');
   }
@@ -203,34 +205,34 @@ export async function ingestProspectAudio(
   if (!trimmed) {
     throw new AppError('provider_unavailable', 'Transcription returned no text — nothing was recorded.');
   }
-  const seq = insertSegment(db, conversationId, {
+  const seq = await insertSegment(db, conversationId, {
     speaker: 'prospect',
     text: trimmed,
     language: conversation.language,
     source: 'stt',
   });
-  db.prepare(`UPDATE conversations SET transcript_state = 'partial' WHERE id = ? AND transcript_state = 'none'`).run(
-    conversationId,
-  );
+  await db
+    .prepare(`UPDATE conversations SET transcript_state = 'partial' WHERE id = ? AND transcript_state = 'none'`)
+    .run(conversationId);
   return { segmentSeq: seq, text: trimmed };
 }
 
 /**
  * Append a prospect turn captured as text (e.g. typed by an operator). */
-export function ingestProspectText(db: DB, conversationId: string, text: string): ProspectTurn {
-  const conversation = loadConversation(db, conversationId);
+export async function ingestProspectText(db: DB, conversationId: string, text: string): Promise<ProspectTurn> {
+  const conversation = await loadConversation(db, conversationId);
   if (conversation.ended_at) throw new AppError('conflict', 'Conversation has already ended');
   const trimmed = text.trim();
   if (!trimmed) throw new AppError('validation_failed', 'Prospect text is required');
-  const seq = insertSegment(db, conversationId, {
+  const seq = await insertSegment(db, conversationId, {
     speaker: 'prospect',
     text: trimmed,
     language: conversation.language,
     source: 'typed',
   });
-  db.prepare(`UPDATE conversations SET transcript_state = 'partial' WHERE id = ? AND transcript_state = 'none'`).run(
-    conversationId,
-  );
+  await db
+    .prepare(`UPDATE conversations SET transcript_state = 'partial' WHERE id = ? AND transcript_state = 'none'`)
+    .run(conversationId);
   return { segmentSeq: seq, text: trimmed };
 }
 
@@ -239,20 +241,20 @@ export function ingestProspectText(db: DB, conversationId: string, text: string)
  * segments are evidence, not speech: they are excluded from the engine's
  * history and from qualification extraction.
  */
-export function ingestSystemNote(db: DB, conversationId: string, text: string): ProspectTurn {
-  const conversation = loadConversation(db, conversationId);
+export async function ingestSystemNote(db: DB, conversationId: string, text: string): Promise<ProspectTurn> {
+  const conversation = await loadConversation(db, conversationId);
   if (conversation.ended_at) throw new AppError('conflict', 'Conversation has already ended');
   const trimmed = text.trim();
   if (!trimmed) throw new AppError('validation_failed', 'System note is required');
-  const seq = insertSegment(db, conversationId, {
+  const seq = await insertSegment(db, conversationId, {
     speaker: 'system',
     text: trimmed,
     language: null,
     source: 'typed',
   });
-  db.prepare(`UPDATE conversations SET transcript_state = 'partial' WHERE id = ? AND transcript_state = 'none'`).run(
-    conversationId,
-  );
+  await db
+    .prepare(`UPDATE conversations SET transcript_state = 'partial' WHERE id = ? AND transcript_state = 'none'`)
+    .run(conversationId);
   return { segmentSeq: seq, text: trimmed };
 }
 
@@ -270,14 +272,17 @@ export interface AgentTurn {
 }
 
 /** Full transcript as engine history (oldest first): prospect=user, agent=assistant. */
-export function conversationHistory(db: DB, conversationId: string): { role: 'user' | 'assistant'; content: string }[] {
-  const rows = db
+export async function conversationHistory(
+  db: DB,
+  conversationId: string,
+): Promise<{ role: 'user' | 'assistant'; content: string }[]> {
+  const rows = (await db
     .prepare(
       `SELECT seq, speaker, text, language FROM transcript_segments
         WHERE conversation_id = ? AND speaker IN ('agent','prospect')
         ORDER BY seq ASC`,
     )
-    .all(conversationId) as unknown as SegmentRow[];
+    .all(conversationId)) as unknown as SegmentRow[];
   return rows.map((r) => ({
     role: r.speaker === 'agent' ? 'assistant' : 'user',
     content: r.text,
@@ -304,20 +309,20 @@ export async function generateAgentReply(
   conversationId: string,
   opts: { speechFormat?: 'mp3' | 'pcm'; signal?: AbortSignal } = {},
 ): Promise<AgentTurn> {
-  const conversation = loadConversation(db, conversationId);
+  const conversation = await loadConversation(db, conversationId);
   if (conversation.ended_at) throw new AppError('conflict', 'Conversation has already ended');
   if (!deps.ai) {
     throw new AppError('provider_unavailable', 'No AI provider is configured — no reply can be generated.');
   }
 
-  const lead = db
+  const lead = (await db
     .prepare('SELECT display_name, city, category, website_url FROM businesses WHERE id = ?')
-    .get(conversation.business_id) as
+    .get(conversation.business_id)) as
     | { display_name: string; city: string | null; category: string | null; website_url: string | null }
     | undefined;
   if (!lead) throw new AppError('not_found', 'Lead not found');
 
-  const policy = loadConversationPolicy(db, cfg);
+  const policy = await loadConversationPolicy(db, cfg);
   const { text, model } = await generateTurn(deps.ai, {
     policy,
     context: {
@@ -327,13 +332,13 @@ export async function generateAgentReply(
       leadCity: lead.city,
       leadBusiness: lead.category,
     },
-    history: conversationHistory(db, conversationId),
+    history: await conversationHistory(db, conversationId),
   });
 
   const reply = text.trim();
   if (!reply) throw new AppError('internal_error', 'AI provider returned an empty reply — nothing was recorded.');
 
-  const seq = insertSegment(db, conversationId, {
+  const seq = await insertSegment(db, conversationId, {
     speaker: 'agent',
     text: reply,
     language: conversation.language,
@@ -343,7 +348,7 @@ export async function generateAgentReply(
   let audio: Uint8Array | null = null;
   let contentType: string | null = null;
   let sampleRate: number | null = null;
-  if (deps.speech && deps.speech.status().state !== 'unconfigured') {
+  if (deps.speech && (await deps.speech.status()).state !== 'unconfigured') {
     const language = speechLang(conversation.language);
     const synthesized = await deps.speech.synthesize({
       text: reply,
@@ -382,13 +387,13 @@ function looksLikeHumanRequest(text: string): boolean {
  * `needs_review` result is stored and a human looks at it.
  */
 export async function finishConversation(db: DB, conversationId: string): Promise<FinishedConversation> {
-  const conversation = loadConversation(db, conversationId);
-  const segments = db
+  const conversation = await loadConversation(db, conversationId);
+  const segments = (await db
     .prepare(
       `SELECT seq, speaker, text, language FROM transcript_segments
         WHERE conversation_id = ? ORDER BY seq ASC`,
     )
-    .all(conversationId) as unknown as SegmentRow[];
+    .all(conversationId)) as unknown as SegmentRow[];
 
   const spoken = segments.filter((s) => s.speaker !== 'system');
   const transcript = spoken.map((s) => `${s.speaker}: ${s.text}`).join('\n');
@@ -400,38 +405,40 @@ export async function finishConversation(db: DB, conversationId: string): Promis
   const at = nowIso();
   const segmentCount = segments.length;
 
-  db.prepare(
-    `UPDATE conversations
+  await db
+    .prepare(
+      `UPDATE conversations
         SET ended_at = COALESCE(ended_at, ?),
             transcript_state = ?,
             extracted_json = ?,
             summary = ?,
             human_requested = ?
       WHERE id = ?`,
-  ).run(
-    at,
-    segmentCount > 0 ? 'complete' : 'unavailable',
-    JSON.stringify({
-      simulated: false,
-      ...qualification,
-      extractedAt: at,
-    }),
-    segmentCount > 0
-      ? `Live conversation — ${segmentCount} transcript turns; assessment: ${qualification.qualification} / ${qualification.interestLevel}.`
-      : 'Live conversation ended with no transcript turns.',
-    humanRequested ? 1 : 0,
-    conversationId,
-  );
+    )
+    .run(
+      at,
+      segmentCount > 0 ? 'complete' : 'unavailable',
+      JSON.stringify({
+        simulated: false,
+        ...qualification,
+        extractedAt: at,
+      }),
+      segmentCount > 0
+        ? `Live conversation — ${segmentCount} transcript turns; assessment: ${qualification.qualification} / ${qualification.interestLevel}.`
+        : 'Live conversation ended with no transcript turns.',
+      humanRequested ? 1 : 0,
+      conversationId,
+    );
 
   // Lead update (canonical enums straight from the extraction).
-  db.prepare(
-    `UPDATE businesses SET interest_level = ?, qualification_status = ? WHERE id = ?`,
-  ).run(qualification.interestLevel, qualification.qualification, conversation.business_id);
+  await db
+    .prepare(`UPDATE businesses SET interest_level = ?, qualification_status = ? WHERE id = ?`)
+    .run(qualification.interestLevel, qualification.qualification, conversation.business_id);
 
   // Opt-out expressed on the call: suppression is append-only and wins.
   let suppressed = false;
   if (qualification.interestLevel === 'opted_out') {
-    const res = suppress(db, {
+    const res = await suppress(db, {
       businessId: conversation.business_id,
       scope: 'business',
       reason: 'opt_out',

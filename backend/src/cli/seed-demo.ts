@@ -69,21 +69,21 @@ const DEMO_LEADS: DemoLead[] = [
   },
 ];
 
-function existingNames(db: DB): Set<string> {
-  const rows = db.prepare('SELECT display_name FROM businesses').all() as { display_name: string }[];
+async function existingNames(db: DB): Promise<Set<string>> {
+  const rows = (await db.prepare('SELECT display_name FROM businesses').all()) as { display_name: string }[];
   return new Set(rows.map((r) => r.display_name));
 }
 
-function main(): void {
+async function main(): Promise<void> {
   const config = loadConfig();
   const db = openDatabase(config.databasePath);
 
-  const migrated = runMigrations(db);
+  const migrated = await runMigrations(db);
   if (migrated.applied.length > 0) {
     process.stdout.write(`Applied ${migrated.applied.length} migration(s).\n`);
   }
 
-  const present = existingNames(db);
+  const present = await existingNames(db);
   let created = 0;
   let skipped = 0;
 
@@ -93,7 +93,7 @@ function main(): void {
       continue;
     }
     try {
-      const result = createLead(
+      const result = await createLead(
         db,
         {
           displayName: lead.displayName,
@@ -120,9 +120,9 @@ function main(): void {
     }
   }
 
-  const total = (db.prepare('SELECT COUNT(*) AS n FROM businesses').get() as { n: number }).n;
+  const total = ((await db.prepare('SELECT COUNT(*) AS n FROM businesses').get()) as { n: number }).n;
   process.stdout.write(`done: ${created} created, ${skipped} skipped; businesses table now has ${total} row(s).\n`);
   process.stdout.write('No outreach was triggered; operating mode is unchanged.\n');
 }
 
-main();
+await main();

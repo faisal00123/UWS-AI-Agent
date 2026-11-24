@@ -111,7 +111,7 @@ function toInteraction(r: Row): Interaction {
 }
 
 /** Record one interaction and return it. */
-export function recordInteraction(db: DB, input: RecordInteractionInput): Interaction {
+export async function recordInteraction(db: DB, input: RecordInteractionInput): Promise<Interaction> {
   const id = newId('int');
   const occurredAt = input.occurredAt ?? nowIso();
   const summary = input.summary.trim();
@@ -119,26 +119,28 @@ export function recordInteraction(db: DB, input: RecordInteractionInput): Intera
     // A validation_failed AppError maps to 400, not a generic 500.
     throw new AppError('validation_failed', 'Interaction summary must not be empty');
   }
-  db.prepare(
-    `INSERT INTO interactions (id, business_id, kind, direction, summary, outcome, evidence_json, occurred_at, created_by, simulation)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    id,
-    input.businessId,
-    input.kind,
-    input.direction ?? null,
-    summary,
-    input.outcome ?? null,
-    input.evidence ? JSON.stringify(input.evidence) : null,
-    occurredAt,
-    input.createdBy ?? null,
-    input.simulation ? 1 : 0,
-  );
-  return getInteraction(db, id) as Interaction;
+  await db
+    .prepare(
+      `INSERT INTO interactions (id, business_id, kind, direction, summary, outcome, evidence_json, occurred_at, created_by, simulation)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      id,
+      input.businessId,
+      input.kind,
+      input.direction ?? null,
+      summary,
+      input.outcome ?? null,
+      input.evidence ? JSON.stringify(input.evidence) : null,
+      occurredAt,
+      input.createdBy ?? null,
+      input.simulation ? 1 : 0,
+    );
+  return (await getInteraction(db, id)) as Interaction;
 }
 
-export function getInteraction(db: DB, id: string): Interaction | null {
-  const r = db.prepare('SELECT * FROM interactions WHERE id = ?').get(id) as Row | undefined;
+export async function getInteraction(db: DB, id: string): Promise<Interaction | null> {
+  const r = (await db.prepare('SELECT * FROM interactions WHERE id = ?').get(id)) as Row | undefined;
   return r ? toInteraction(r) : null;
 }
 
@@ -151,18 +153,18 @@ export interface InteractionQuery {
 }
 
 /** Timeline for a lead, newest first by default. */
-export function listInteractions(db: DB, q: InteractionQuery): Interaction[] {
+export async function listInteractions(db: DB, q: InteractionQuery): Promise<Interaction[]> {
   const limit = q.limit ?? 100;
   const order = q.order === 'asc' ? 'ASC' : 'DESC';
   const rows = (
     q.kind
-      ? db
-          .prepare(`SELECT * FROM interactions WHERE business_id = ? AND kind = ? ORDER BY occurred_at ${order}, rowid ${order} LIMIT ?`)
+      ? await db
+          .prepare(`SELECT * FROM interactions WHERE business_id = ? AND kind = ? ORDER BY occurred_at ${order}, id ${order} LIMIT ?`)
           .all(q.businessId, q.kind, limit)
-      : db
-          .prepare(`SELECT * FROM interactions WHERE business_id = ? ORDER BY occurred_at ${order}, rowid ${order} LIMIT ?`)
+      : await db
+          .prepare(`SELECT * FROM interactions WHERE business_id = ? ORDER BY occurred_at ${order}, id ${order} LIMIT ?`)
           .all(q.businessId, limit)
-  ) as unknown as Row[];
+  ) as Row[];
   return rows.map(toInteraction);
 }
 
@@ -173,13 +175,13 @@ export function listInteractions(db: DB, q: InteractionQuery): Interaction[] {
  * Simulated (rehearsal) contact is excluded: nothing was said to a real
  * person, so it cannot move a lead to `contacted` or beyond.
  */
-export function hasContactEvidence(db: DB, businessId: string): boolean {
+export async function hasContactEvidence(db: DB, businessId: string): Promise<boolean> {
   const placeholders = CONTACT_EVIDENCE_KINDS.map(() => '?').join(',');
-  const row = db
+  const row = (await db
     .prepare(
       `SELECT COUNT(*) c FROM interactions
         WHERE business_id = ? AND kind IN (${placeholders}) AND simulation = 0`,
     )
-    .get(businessId, ...CONTACT_EVIDENCE_KINDS) as { c: number };
+    .get(businessId, ...CONTACT_EVIDENCE_KINDS)) as { c: number };
   return row.c > 0;
 }

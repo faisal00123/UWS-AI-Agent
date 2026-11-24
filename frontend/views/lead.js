@@ -19,12 +19,34 @@ function kv(rows) {
   return html ? `<dl class="kv">${html}</dl>` : '<p class="muted">Nothing recorded.</p>';
 }
 
+/** Source URLs are shown as links (new tab, no referrer) when they are real URLs. */
+function sourceLink(url) {
+  if (!url) return '';
+  if (!/^https?:\/\//i.test(String(url))) return esc(String(url));
+  return `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(url)}</a>`;
+}
+
+/**
+ * Coordinates render exactly as recorded — 4 decimals (~11 m) is plenty for a
+ * business location and keeps the row readable. Half a pair (the warning
+ * path from import) still shows the value that was kept; nothing is
+ * invented to fill the missing half.
+ */
+function coordText(b) {
+  const lat = (b.latitude === null || b.latitude === undefined) ? null : Number(b.latitude).toFixed(4);
+  const lon = (b.longitude === null || b.longitude === undefined) ? null : Number(b.longitude).toFixed(4);
+  if (lat === null && lon === null) return null;
+  if (lat !== null && lon !== null) return `${lat}, ${lon}`;
+  return lat ?? lon;
+}
+
 function businessRows(b) {
   return [
     ['Business', b.display_name],
     ['Category', b.category],
     ['City', b.city],
     ['Address', b.address],
+    ['Coordinates', coordText(b)],
     ['Website', b.website_url],
     ['Phone', b.phone_e164],
     ['WhatsApp', b.whatsapp_e164],
@@ -45,7 +67,7 @@ function businessRows(b) {
 function overviewTab(d) {
   const sources = (d.sources ?? []).map(
     (s) => `<tr><td>${esc(s.source_type ?? s.platform ?? '')}</td>
-      <td class="small">${esc(s.source_url ?? '')}</td>
+      <td class="small">${sourceLink(s.source_url)}</td>
       <td class="muted small">${esc(fmtDateTime(s.discovered_at ?? s.created_at))}</td></tr>`,
   );
   const contacts = (d.contactPoints ?? []).map(
@@ -103,7 +125,10 @@ function analysisTab(d, id, ctx) {
   return `
     <div class="card tight"><div class="btn-row">
       <button class="btn primary" data-action="analyze">Analyze website now</button>
-      <span class="muted small">An unreachable site is a real finding, not an error — it is recorded as such.</span>
+      <button class="btn" data-action="verify">Verify website (free)</button>
+      <span class="muted small">Verify fetches the lead's OWN published page once (hard timeout + size cap) and records
+      what it finds as per-field evidence — it fills missing phone/email only, never overwrites. An unreachable site
+      is recorded as a real finding, not an error.</span>
     </div></div>
     ${items || '<div class="empty">No analysis yet. Run one to measure the website.</div>'}`;
 }
@@ -375,6 +400,7 @@ async function editLead(d, after) {
       { name: 'displayName', label: 'Business name', type: 'text', value: b.display_name ?? '' },
       { name: 'category', label: 'Category', type: 'text', value: b.category ?? '' },
       { name: 'city', label: 'City', type: 'text', value: b.city ?? '' },
+      { name: 'address', label: 'Address', type: 'text', value: b.address ?? '' },
       { name: 'websiteUrl', label: 'Website URL', type: 'text', value: b.website_url ?? '' },
       { name: 'phoneE164', label: 'Phone (E.164)', type: 'text', value: b.phone_e164 ?? '' },
       { name: 'email', label: 'Email', type: 'text', value: b.email ?? '' },
@@ -382,9 +408,14 @@ async function editLead(d, after) {
     ],
   });
   if (!input) return;
+  // The API's editable-field names are camelCase (repository.EDITABLE_FIELDS);
+  // phoneE164 edits are sent as `phone` and normalised server-side.
+  // latitude/longitude are deliberately absent: they are source evidence
+  // (OSM/CSV), never free text.
   const fieldMap = {
-    displayName: 'display_name', category: 'category', city: 'city', websiteUrl: 'website_url',
-    phoneE164: 'phone_e164', email: 'email', contactPersonName: 'contact_person_name',
+    displayName: 'displayName', category: 'category', city: 'city', address: 'address',
+    websiteUrl: 'websiteUrl', phoneE164: 'phone', email: 'email',
+    contactPersonName: 'contactPersonName',
   };
   const updates = Object.entries(input)
     .filter(([k]) => fieldMap[k])
@@ -413,6 +444,32 @@ function bindTab(body, id, ctx, reload) {
     } catch (err) {
       toast('Analysis failed', errMsg(err), 'err');
       analyze.disabled = false;
+    }
+  });
+
+  // verify: free single fetch of the lead's own page -> evidence + gap-fill
+  const verify = act('verify');
+  if (verify) verify.addEventListener('click', async () => {
+    verify.disabled = true;
+    try {
+      const res = await api('POST', `/api/leads/${encodeURIComponent(id)}/verify`);
+      if (res.ok) {
+        const filled = [];
+        if (res.enrichment?.emailFilled) filled.push('email');
+        if (res.enrichment?.phoneFilled) filled.push('phone');
+        toast(
+          'Website verified',
+          `${(res.phones ?? []).length} phone(s), ${(res.emails ?? []).length} email(s) found` +
+            (filled.length ? ` — filled: ${filled.join(', ')}` : ' — nothing new to fill') +
+            '. Evidence recorded on the lead.',
+        );
+      } else {
+        toast('Verify failed', 'The page could not be fetched — the failure is recorded as evidence on this lead.', 'warn');
+      }
+      reload();
+    } catch (err) {
+      toast('Verify failed', errMsg(err), 'err');
+      verify.disabled = false;
     }
   });
 

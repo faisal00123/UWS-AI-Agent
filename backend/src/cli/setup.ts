@@ -10,17 +10,23 @@
  * printed ONCE to this console (it is never stored in code or logs).
  * Creating an owner always requires an interactive confirmation in CI-free
  * local use; the account must change its password after first sign-in.
+ *
+ * Database identity gate (db/identity.ts): in production this command
+ * refuses to touch an EMPTY database unless DB_INIT_CONFIRM=1 — silently
+ * initialising a fresh database is exactly the failure mode that destroys
+ * data. `npm run db:init` is the explicit opt-in path.
  */
 import { randomBytes } from 'node:crypto';
 import { loadConfig } from '../core/config.ts';
-import { openDatabase } from '../db/index.ts';
+import { openFromConfig, assertBootableDatabase, assertDatabaseIdentity } from '../db/index.ts';
 import { runMigrations } from '../db/migrate.ts';
 import { countOwners, createUser } from '../domain/auth/service.ts';
 import { SETTING_DEFINITIONS, configVersion } from '../domain/settings/service.ts';
 import { nowIso } from '../core/time.ts';
+import { newId } from '../core/ids.ts';
 
 const config = loadConfig();
-const db = openDatabase(config.databasePath);
+const db = openFromConfig(config);
 
 function generatePassword(): string {
   // 24 url-safe chars satisfies the length + character-class policy.
@@ -28,15 +34,29 @@ function generatePassword(): string {
 }
 
 async function main(): Promise<void> {
-  const result = runMigrations(db);
+  const production = config.nodeEnv === 'production';
+
+  // BEFORE migrations: never create a schema on an empty production database
+  // by accident (DB_INIT_CONFIRM=1 / npm run db:init is the explicit opt-in).
+  await assertBootableDatabase(db, { production, allowInit: config.dbInitConfirm });
+
+  const result = await runMigrations(db);
   if (result.applied.length > 0) {
     process.stdout.write(`Applied ${result.applied.length} migration(s).\n`);
   }
 
-  const existingOwners = countOwners(db);
+  // AFTER migrations: prove this is the expected database (or seed the
+  // identity row on a legacy database that predates app_identity).
+  await assertDatabaseIdentity(db, {
+    production,
+    allowInit: config.dbInitConfirm,
+    makeInstanceId: () => newId('inst'),
+  });
+
+  const existingOwners = await countOwners(db);
   if (existingOwners > 0) {
     process.stdout.write(`Owner account already exists (${existingOwners} active owner(s)). Nothing to do.\n`);
-    process.stdout.write(`Config version: ${configVersion(db)}\n`);
+    process.stdout.write(`Config version: ${await configVersion(db)}\n`);
     return;
   }
 
@@ -59,11 +79,13 @@ async function main(): Promise<void> {
 
   // Seed default settings rows so the dashboard shows explicit versions.
   for (const def of SETTING_DEFINITIONS) {
-    db.prepare(
-      `INSERT INTO settings (key, value_json, version, updated_by, updated_at)
-       VALUES (?, ?, 1, NULL, ?)
-       ON CONFLICT(key) DO NOTHING`,
-    ).run(def.key, JSON.stringify(def.default(config)), nowIso());
+    await db
+      .prepare(
+        `INSERT INTO settings (key, value_json, version, updated_by, updated_at)
+         VALUES (?, ?, 1, NULL, ?)
+         ON CONFLICT(key) DO NOTHING`,
+      )
+      .run(def.key, JSON.stringify(def.default(config)), nowIso());
   }
 
   process.stdout.write('\nOwner account created.\n');
@@ -73,7 +95,7 @@ async function main(): Promise<void> {
   } else {
     process.stdout.write('  password: (from OWNER_PASSWORD in .env)\n');
   }
-  process.stdout.write(`  config version: ${configVersion(db)}\n\n`);
+  process.stdout.write(`  config version: ${await configVersion(db)}\n\n`);
 }
 
 main()
@@ -82,5 +104,5 @@ main()
     process.exitCode = 1;
   })
   .finally(() => {
-    db.close();
+    void db.close();
   });

@@ -23,27 +23,29 @@ export function clientIp(req: Request): string {
 /** Attaches `req.ctx` and, when a valid session cookie exists, the user. */
 export function createContext(deps: AppDeps): RequestHandler {
   return (req: Request, res: Response, next: NextFunction) => {
-    req.ctx = {
-      deps,
-      ip: clientIp(req),
-      ipHash: hashIp(clientIp(req), deps.config.sessionSecret),
-      userAgent: req.get('user-agent') ?? null,
-      startedAt: Date.now(),
-    };
+    void (async () => {
+      req.ctx = {
+        deps,
+        ip: clientIp(req),
+        ipHash: hashIp(clientIp(req), deps.config.sessionSecret),
+        userAgent: req.get('user-agent') ?? null,
+        startedAt: Date.now(),
+      };
 
-    const cookies = parseCookies(req.headers.cookie);
-    const token = cookies[SESSION_COOKIE];
-    if (token) {
-      const loaded = loadSession(deps.db, token);
-      if (loaded) {
-        req.ctx.user = loaded.user;
-        req.ctx.session = loaded.session;
-      } else {
-        // Stale/invalid cookie: clear it so the browser stops sending it.
-        res.append('Set-Cookie', serializeCookie(SESSION_COOKIE, '', { maxAgeSeconds: 0, path: '/' }));
+      const cookies = parseCookies(req.headers.cookie);
+      const token = cookies[SESSION_COOKIE];
+      if (token) {
+        const loaded = await loadSession(deps.db, token);
+        if (loaded) {
+          req.ctx.user = loaded.user;
+          req.ctx.session = loaded.session;
+        } else {
+          // Stale/invalid cookie: clear it so the browser stops sending it.
+          res.append('Set-Cookie', serializeCookie(SESSION_COOKIE, '', { maxAgeSeconds: 0, path: '/' }));
+        }
       }
-    }
-    next();
+      next();
+    })().catch(next);
   };
 }
 
@@ -122,18 +124,21 @@ export const requireCsrf: RequestHandler = (req, _res, next) => {
 };
 
 /**
- * Re-authentication gate for sensitive actions (live activation, budget
- * changes, emergency resume). The session records a short-lived grant after the
- * owner re-enters their password.
+ * `Secure` flag for session cookies: https per configuration OR per the
+ * ACTUAL request transport — so a deployment behind TLS with a mis-set
+ * `PUBLIC_BASE_URL` still gets Secure cookies (the config-only check would
+ * ship them without Secure in exactly that case).
  */
-export const REAUTH_HEADER = 'x-reauth-token';
+function cookiesSecure(res: Response, deps: AppDeps): boolean {
+  return deps.config.publicBaseUrl.startsWith('https://') || res.req?.protocol === 'https';
+}
 
 export function setSessionCookies(
   res: Response,
   deps: AppDeps,
   tokens: { token: string; csrfToken: string; expiresAt: string },
 ): void {
-  const secure = deps.config.publicBaseUrl.startsWith('https://');
+  const secure = cookiesSecure(res, deps);
   const maxAge = Math.max(1, Math.floor((Date.parse(tokens.expiresAt) - Date.now()) / 1000));
   res.append(
     'Set-Cookie',
@@ -159,7 +164,7 @@ export function setSessionCookies(
 }
 
 export function clearSessionCookies(res: Response, deps: AppDeps): void {
-  const secure = deps.config.publicBaseUrl.startsWith('https://');
+  const secure = cookiesSecure(res, deps);
   res.append('Set-Cookie', serializeCookie(SESSION_COOKIE, '', { httpOnly: true, secure, path: '/', maxAgeSeconds: 0, sameSite: 'Strict' }));
   res.append('Set-Cookie', serializeCookie(CSRF_COOKIE, '', { httpOnly: false, secure, path: '/', maxAgeSeconds: 0, sameSite: 'Strict' }));
 }

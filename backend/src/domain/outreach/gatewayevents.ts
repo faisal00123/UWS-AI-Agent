@@ -99,10 +99,10 @@ const TERMINAL = ['completed', 'busy', 'no_answer', 'failed', 'cancelled'];
  * Apply one gateway lifecycle event. Returns detail, or null when nothing
  * matched (unknown call, or neither the status nor the cause recognised).
  */
-export function applyGatewayCallEvent(db: DB, payload: unknown): string | null {
+export async function applyGatewayCallEvent(db: DB, payload: unknown): Promise<string | null> {
   const p = (payload ?? {}) as GatewayCallEvent;
   if (!p.callId) return null;
-  const call = db.prepare('SELECT id, status FROM calls WHERE provider_call_id = ?').get(p.callId) as
+  const call = (await db.prepare('SELECT id, status FROM calls WHERE provider_call_id = ?').get(p.callId)) as
     | { id: string; status: string }
     | undefined;
   if (!call) return null;
@@ -133,7 +133,7 @@ export function applyGatewayCallEvent(db: DB, payload: unknown): string | null {
     else if (mapped === 'failed') outcome = 'failed';
   }
 
-  db.prepare(
+  await db.prepare(
     `UPDATE calls
         SET status = ?,
             answered_at = CASE WHEN ? = 1 AND answered_at IS NULL THEN ? ELSE answered_at END,

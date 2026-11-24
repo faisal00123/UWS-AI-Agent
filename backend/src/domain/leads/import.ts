@@ -18,6 +18,7 @@ import {
   normalizeName,
   normalizePhone,
   normalizeWebsite,
+  isMachineMailbox,
 } from './normalize.ts';
 import {
   findDuplicate,
@@ -47,6 +48,14 @@ export interface AnalyzedRow {
   problems: FieldProblem[];
   duplicate: DuplicateMatch | null;
   status: ImportStatus;
+  /**
+   * Contact values that were OBSERVED but deliberately NOT applied (invalid
+   * format or a machine mailbox). Keyed off the mapped header (any casing),
+   * so commit can always record them as failed field_verifications — "no
+   * email on this lead" stays traceable to an observed value that was
+   * rejected, with the real reason.
+   */
+  rejectedValues?: { field: string; value: string }[];
 }
 
 export interface ImportAnalysis {
@@ -79,6 +88,15 @@ import { COLUMN_ALIASES, headerKey } from './headers.ts';
 export { COLUMN_ALIASES, headerKey } from './headers.ts';
 
 const REQUIRED_COLUMNS = ['name'];
+
+/**
+ * Hard cap on data rows per import file. Bounds the two costs that scale per
+ * row: the fuzzy duplicate lookup (two similarity computations + DB queries
+ * per row) and the retained raw values for the preview. A file above the cap
+ * is REJECTED with a 400 — never silently truncated, so no row is imported
+ * without having been analysed.
+ */
+export const MAX_IMPORT_ROWS = 5000;
 
 interface MappedHeaders {
   /** logical field -> column index */
@@ -117,12 +135,24 @@ function pick(values: Record<string, string>, headers: string[], map: Record<str
 }
 
 /** Analyse parsed rows: alias mapping + validation + duplicate lookup (read-only). */
-export function analyzeRecords(
+export async function analyzeRecords(
   db: DB,
   headers: string[],
   records: { line: number; values: Record<string, string> }[],
   parseErrors: { line: number; message: string }[] = [],
-): ImportAnalysis {
+): Promise<ImportAnalysis> {
+  // Resource guard first: everything below scales with row count (per-row
+  // normalisation, fuzzy dedupe, retained raw values), so an oversized file
+  // is rejected before any of that work happens — for every caller (route,
+  // CLI, xlsx sheet).
+  if (records.length > MAX_IMPORT_ROWS) {
+    throw new AppError(
+      'validation_failed',
+      `Import has ${records.length} data rows; the maximum per import is ${MAX_IMPORT_ROWS}. Split the file into smaller batches.`,
+      { totalRows: records.length, maxRows: MAX_IMPORT_ROWS },
+    );
+  }
+
   const { map, unmapped } = mapHeaders(headers);
   const missingRequired = REQUIRED_COLUMNS.filter((f) => map[f] === undefined);
 
@@ -164,6 +194,9 @@ export function analyzeRecords(
     const contactRaw = pick(values, headers, map, 'contactPerson');
     const sourceUrlRaw = pick(values, headers, map, 'sourceUrl');
     const notesRaw = pick(values, headers, map, 'requirements');
+    const addressRaw = pick(values, headers, map, 'address');
+    const latRaw = pick(values, headers, map, 'latitude');
+    const lonRaw = pick(values, headers, map, 'longitude');
 
     const problems: FieldProblem[] = [];
 
@@ -192,13 +225,72 @@ export function analyzeRecords(
       problems.push({ field: 'website', message: `Website URL is not usable (${site.reason ?? 'invalid'})`, severity: 'warning' });
     }
     const mail = normalizeEmail(emailRaw);
+    // A machine mailbox (noreply-style) is dropped exactly like an invalid
+    // format: it is a dead end that can never reach a human, so it must not
+    // be presented as a contactable address on the lead.
+    const usableEmail = mail.valid && mail.email !== null && !isMachineMailbox(mail.email);
     if (emailRaw !== '' && !mail.valid) {
       problems.push({ field: 'email', message: `Email is not valid (${mail.reason ?? 'invalid'})`, severity: 'warning' });
+    } else if (emailRaw !== '' && !usableEmail) {
+      problems.push({
+        field: 'email',
+        message: 'Email is an automated mailbox (noreply-style) - it cannot reach a human (value ignored)',
+        severity: 'warning',
+      });
     }
-    if (phoneRaw === '' && websiteRaw === '' && emailRaw === '') {
+    // "Can be contacted" means a USABLE contact point: a row whose only
+    // contact detail failed validation (or is a machine mailbox) is exactly
+    // as uncontactable as one with none at all.
+    if (!phone.valid && !site.valid && !usableEmail) {
       problems.push({
         field: 'contact',
-        message: 'No phone, website or email provided - lead cannot be contacted yet',
+        message: 'No usable phone, website or email provided - lead cannot be contacted yet',
+        severity: 'warning',
+      });
+    }
+
+    // Coordinates are evidence: a malformed/out-of-range value is reported
+    // and ignored (NULL) — never coerced, never guessed.
+    let latitude: number | null = null;
+    if (latRaw !== '') {
+      const n = Number(latRaw);
+      if (Number.isFinite(n) && n >= -90 && n <= 90) latitude = n;
+      else {
+        problems.push({
+          field: 'latitude',
+          message: 'Latitude must be a number between -90 and 90 (value ignored)',
+          severity: 'warning',
+        });
+      }
+    }
+    let longitude: number | null = null;
+    if (lonRaw !== '') {
+      const n = Number(lonRaw);
+      if (Number.isFinite(n) && n >= -180 && n <= 180) longitude = n;
+      else {
+        problems.push({
+          field: 'longitude',
+          message: 'Longitude must be a number between -180 and 180 (value ignored)',
+          severity: 'warning',
+        });
+      }
+    }
+    // Coordinates are only meaningful as a pair: one without the other is
+    // incomplete evidence. The present value is kept (it is still evidence),
+    // but the row goes to review instead of silently looking geolocated.
+    if ((latitude !== null) !== (longitude !== null)) {
+      problems.push({
+        field: latitude === null ? 'latitude' : 'longitude',
+        message: 'Coordinate pair incomplete: latitude and longitude must be supplied together (value kept, flagged for review)',
+        severity: 'warning',
+      });
+    }
+    // Explicit over the silent slice in the candidate below: truncation is
+    // data loss the owner must see, not something to discover later.
+    if (addressRaw.length > 300) {
+      problems.push({
+        field: 'address',
+        message: 'Address is longer than 300 characters and was truncated to fit',
         severity: 'warning',
       });
     }
@@ -215,25 +307,34 @@ export function analyzeRecords(
       displayName: name,
       category: categoryRaw === '' ? null : categoryRaw.slice(0, 80),
       city: cityRaw === '' ? null : cityRaw.slice(0, 80),
+      address: addressRaw === '' ? null : addressRaw.slice(0, 300),
+      latitude,
+      longitude,
       websiteUrl: site.url,
       websiteHost: site.host,
       phoneE164: phone.valid ? phone.e164 : null,
       phoneRaw: phoneRaw === '' ? null : phoneRaw.slice(0, 40),
-      email: mail.valid ? mail.email : null,
+      email: usableEmail ? mail.email : null,
       whatsappE164: whatsapp.valid ? whatsapp.e164 : null,
       contactPersonName: contactRaw === '' ? null : contactRaw.slice(0, 120),
       sourceUrl: sourceUrlRaw === '' ? null : sourceUrlRaw.slice(0, 500),
       requirements: notesRaw === '' ? null : notesRaw.slice(0, 2000),
     };
 
-    const duplicate = findDuplicate(db, candidate);
+    // Observed-but-rejected contact values (see AnalyzedRow.rejectedValues).
+    const rejectedValues: { field: string; value: string }[] = [];
+    if (phoneRaw !== '' && !phone.valid) rejectedValues.push({ field: 'phone', value: phoneRaw.slice(0, 40) });
+    if (websiteRaw !== '' && !site.valid) rejectedValues.push({ field: 'website', value: websiteRaw.slice(0, 200) });
+    if (emailRaw !== '' && !usableEmail) rejectedValues.push({ field: 'email', value: emailRaw.slice(0, 254) });
+
+    const duplicate = await findDuplicate(db, candidate);
     let status: ImportStatus;
     if (duplicate?.autoMerge) status = 'merged';
     else if (duplicate) status = 'needs_review';
     else if (hasWarning) status = 'needs_review';
     else status = 'imported';
 
-    rows.push({ line: record.line, raw: values, candidate, problems, duplicate, status });
+    rows.push({ line: record.line, raw: values, candidate, problems, duplicate, status, rejectedValues });
   }
 
   return { rows, parseErrors, headers, unmappedHeaders: unmapped };
@@ -260,7 +361,7 @@ export function summaryFromRows(rows: AnalyzedRow[], parseErrors: { line: number
 }
 
 /** Analyse an already-parsed CSV (preview endpoint). */
-export function analyzeCsv(db: DB, parsed: CsvParseResult): ImportAnalysis {
+export async function analyzeCsv(db: DB, parsed: CsvParseResult): Promise<ImportAnalysis> {
   if (parsed.rows.length === 0) {
     return {
       rows: [],
@@ -278,11 +379,11 @@ export function analyzeCsv(db: DB, parsed: CsvParseResult): ImportAnalysis {
     });
     return { line: r.line, values };
   });
-  return analyzeRecords(db, headers, records, parsed.errors);
+  return await analyzeRecords(db, headers, records, parsed.errors);
 }
 
 /** Commit an analysis in a single transaction. */
-export function commitImport(db: DB, _cfg: Config, analysis: ImportAnalysis, meta: ImportMeta): ImportSummary {
+export async function commitImport(db: DB, _cfg: Config, analysis: ImportAnalysis, meta: ImportMeta): Promise<ImportSummary> {
   // Structural problems (e.g. the file has no business-name column) are not a
   // partial import - nothing is written and the caller gets a 400.
   const structural = analysis.parseErrors.filter((e) => /Missing required column|No rows found/.test(e.message));
@@ -298,6 +399,7 @@ export function commitImport(db: DB, _cfg: Config, analysis: ImportAnalysis, met
   const insertRow = db.prepare(
     `INSERT INTO businesses (
        id, display_name, normalized_name, category, city, country,
+       address, latitude, longitude,
        website_url, website_host, phone_e164, phone_raw, email, whatsapp_e164,
        contact_person_name, source_type, source_url, discovered_at, last_checked_at,
        stage, stage_changed_at, stage_change_reason,
@@ -305,6 +407,7 @@ export function commitImport(db: DB, _cfg: Config, analysis: ImportAnalysis, met
        created_by, created_at, updated_at
      ) VALUES (
        ?, ?, ?, ?, ?, 'PK',
+       ?, ?, ?,
        ?, ?, ?, ?, ?, ?, ?,
        ?, ?, ?, ?,
        'new_lead', ?, ?,
@@ -329,7 +432,7 @@ export function commitImport(db: DB, _cfg: Config, analysis: ImportAnalysis, met
      VALUES (?, ?, 'import', 'internal', ?, ?, ?, ?)`,
   );
 
-  const run = (): ImportSummary => {
+  const run = async (): Promise<ImportSummary> => {
     const rows: AnalyzedRow[] = [];
     for (const row of analysis.rows) {
       if (row.status === 'rejected' || !row.candidate) {
@@ -345,7 +448,7 @@ export function commitImport(db: DB, _cfg: Config, analysis: ImportAnalysis, met
       // repeated three times in one file merges into the first occurrence
       // instead of tripping the unique index. This also closes the gap where a
       // lead is imported between preview and commit.
-      const duplicate = findDuplicate(db, c) ?? row.duplicate;
+      const duplicate = (await findDuplicate(db, c)) ?? row.duplicate;
 
       let mergedIntoId: string | null = null;
       let status = row.status;
@@ -355,12 +458,15 @@ export function commitImport(db: DB, _cfg: Config, analysis: ImportAnalysis, met
         status = 'merged';
       }
 
-      insertRow.run(
+      await insertRow.run(
         id,
         c.displayName.trim(),
         normName,
         c.category,
         c.city,
+        c.address ?? null,
+        c.latitude ?? null,
+        c.longitude ?? null,
         c.websiteUrl,
         c.websiteHost,
         c.phoneE164,
@@ -386,7 +492,7 @@ export function commitImport(db: DB, _cfg: Config, analysis: ImportAnalysis, met
       );
 
       // Provenance: keep the original row verbatim.
-      insertSource.run(
+      await insertSource.run(
         newId('src'),
         id,
         meta.sourceType,
@@ -400,20 +506,31 @@ export function commitImport(db: DB, _cfg: Config, analysis: ImportAnalysis, met
       // Per-field verification states (format checks only - never claims of
       // ownership or reachability).
       if (c.phoneE164) {
-        insertVerification.run(newId('fv'), id, 'phone', c.phoneE164, 'verified', 'format_check', 'E.164/PK format valid', at);
-      } else if (row.raw.phone) {
-        insertVerification.run(newId('fv'), id, 'phone', String(row.raw.phone).slice(0, 40), 'failed', 'format_check', 'could not normalise to E.164', at);
+        await insertVerification.run(newId('fv'), id, 'phone', c.phoneE164, 'verified', 'format_check', 'E.164/PK format valid', at);
       }
       if (c.websiteHost) {
-        insertVerification.run(newId('fv'), id, 'website', c.websiteHost, 'verified', 'format_check', 'hostname parsed', at);
-      } else if (row.raw.website) {
-        insertVerification.run(newId('fv'), id, 'website', String(row.raw.website).slice(0, 200), 'failed', 'format_check', 'unparseable URL', at);
+        await insertVerification.run(newId('fv'), id, 'website', c.websiteHost, 'verified', 'format_check', 'hostname parsed', at);
       }
       if (c.email) {
-        insertVerification.run(newId('fv'), id, 'email', c.email, 'verified', 'format_check', 'address format valid', at);
+        await insertVerification.run(newId('fv'), id, 'email', c.email, 'verified', 'format_check', 'address format valid', at);
+      }
+      // Present but deliberately NOT applied (bad format or a machine
+      // mailbox): recorded as a FAILED check with the real reason, so the
+      // absence of a value on the lead is traceable to an observed value
+      // that was rejected — never mistaken for "nothing was seen".
+      for (const rejected of row.rejectedValues ?? []) {
+        const evidence =
+          rejected.field === 'phone'
+            ? 'could not normalise to E.164'
+            : rejected.field === 'website'
+              ? 'unparseable URL'
+              : isMachineMailbox(rejected.value)
+                ? 'automated mailbox (noreply-style): cannot reach a human'
+                : 'address format invalid';
+        await insertVerification.run(newId('fv'), id, rejected.field, rejected.value, 'failed', 'format_check', evidence, at);
       }
 
-      insertInteraction.run(
+      await insertInteraction.run(
         newId('itx'),
         id,
         `Lead imported from ${meta.sourceLabel ?? meta.sourceType} (line ${row.line})`,
@@ -426,8 +543,8 @@ export function commitImport(db: DB, _cfg: Config, analysis: ImportAnalysis, met
         const survivorId = mergedIntoId;
         // merged_into_id is written as part of insert for auto-merges, so the
         // survivor can now be reconciled from the retained incoming row.
-        const outcome = reconcileSurvivor(db, survivorId, id);
-        recordMerge(
+        const outcome = await reconcileSurvivor(db, survivorId, id);
+        await recordMerge(
           db,
           {
             survivorId,
@@ -440,14 +557,14 @@ export function commitImport(db: DB, _cfg: Config, analysis: ImportAnalysis, met
           outcome,
         );
       } else if (duplicate) {
-        flagForReview(db, id, duplicate, meta.importedBy);
+        await flagForReview(db, id, duplicate, meta.importedBy);
       }
 
       rows.push({ ...row, status, duplicate });
     }
 
     const summary = summaryFromRows(rows, analysis.parseErrors, true);
-    recordAudit(db, {
+    await recordAudit(db, {
       actorUserId: meta.importedBy.userId,
       actorLabel: meta.importedBy.label,
       action: 'lead.import',
@@ -473,28 +590,21 @@ export function commitImport(db: DB, _cfg: Config, analysis: ImportAnalysis, met
     return summary;
   };
 
-  db.exec('BEGIN IMMEDIATE');
-  try {
-    const summary = run();
-    db.exec('COMMIT');
+  // One transaction: BEGIN … COMMIT with automatic ROLLBACK on throw (the
+  // manual BEGIN IMMEDIATE / COMMIT / ROLLBACK block).
+  return await db.transaction(async () => {
+    const summary = await run();
     return summary;
-  } catch (err) {
-    try {
-      db.exec('ROLLBACK');
-    } catch {
-      /* ignore */
-    }
-    throw err;
-  }
+  });
 }
 
 /** Convenience: analyze + commit (used by CLI/seed paths and tests). */
-export function importCsvText(
+export async function importCsvText(
   db: DB,
   cfg: Config,
   csvText: string,
   meta: ImportMeta,
-): ImportSummary {
-  const analysis = analyzeCsv(db, parseCsv(csvText));
-  return commitImport(db, cfg, analysis, meta);
+): Promise<ImportSummary> {
+  const analysis = await analyzeCsv(db, parseCsv(csvText));
+  return await commitImport(db, cfg, analysis, meta);
 }

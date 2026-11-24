@@ -27,26 +27,26 @@ import { businessDayKey } from '../core/time.ts';
 export const dailyReportJob: JobDefinition = {
   name: 'daily_report',
   intervalMs: 60 * 60 * 1000, // hourly: soon after business-day midnight
-  run(ctx) {
+  async run(ctx) {
     const { db, config, now } = ctx;
     const yesterday = previousBusinessDayKey(now, config.businessTimezone);
     const candidates = pastBusinessDayKeys(now, config.businessTimezone, 7);
     let generated = 0;
     for (const reportDate of candidates) {
       if (reportDate !== yesterday) {
-        const existing = db.prepare('SELECT status FROM daily_reports WHERE report_date = ?').get(reportDate) as
+        const existing = (await db.prepare('SELECT status FROM daily_reports WHERE report_date = ?').get(reportDate)) as
           | { status: string }
           | undefined;
         if (existing?.status === 'final') continue; // already finalized
         if (!existing) {
           const { start, end } = businessDayUtcRange(config, reportDate);
-          const activity = db
+          const activity = (await db
             .prepare(`SELECT COUNT(*) c FROM outreach_attempts WHERE created_at >= ? AND created_at < ?`)
-            .get(start.toISOString(), end.toISOString()) as { c: number };
+            .get(start.toISOString(), end.toISOString())) as { c: number };
           if (activity.c === 0) continue; // nothing happened, nothing to report
         }
       }
-      generateDailyReport(db, config, { reportDate, generatedBy: null, now });
+      await generateDailyReport(db, config, { reportDate, generatedBy: null, now });
       generated += 1;
     }
     return generated > 0 ? { detail: `generated/refreshed ${generated} report(s)` } : undefined;
@@ -77,13 +77,13 @@ export const notificationDeliveryJob: JobDefinition = {
 export const safeguardWatchJob: JobDefinition = {
   name: 'safeguard_notifications',
   intervalMs: 5 * 60_000,
-  run(ctx) {
+  async run(ctx) {
     const { db, config, now } = ctx;
     let raised = 0;
 
-    const state = getOperatingState(db);
+    const state = await getOperatingState(db);
     if (state.emergencyStop && state.emergencyStopAt) {
-      const res = notify(db, config, {
+      const res = await notify(db, config, {
         kind: 'emergency_stop',
         severity: 'critical',
         title: 'Emergency stop is ACTIVE',
@@ -96,16 +96,16 @@ export const safeguardWatchJob: JobDefinition = {
     }
 
     const date = businessDayKey(now, config.businessTimezone);
-    const rows = db
+    const rows = (await db
       .prepare(
         `SELECT metric, used_value, limit_value, state FROM budget_usage
           WHERE usage_date = ? AND state IN ('warning','exhausted')`,
       )
-      .all(date) as { metric: string; used_value: number; limit_value: number; state: string }[];
+      .all(date)) as { metric: string; used_value: number; limit_value: number; state: string }[];
     for (const row of rows) {
       const pct = row.limit_value > 0 ? Math.round((row.used_value / row.limit_value) * 100) : 100;
       const exhausted = row.state === 'exhausted';
-      const res = notify(db, config, {
+      const res = await notify(db, config, {
         kind: 'budget',
         severity: exhausted ? 'critical' : 'warning',
         title: exhausted ? `Daily ${row.metric} limit reached` : `Daily ${row.metric} at ${pct}%`,

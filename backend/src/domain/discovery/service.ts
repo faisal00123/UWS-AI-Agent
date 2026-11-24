@@ -43,6 +43,7 @@ import { getSetting } from '../settings/service.ts';
 import { createLead } from '../leads/repository.ts';
 import { recordInteraction } from '../pipeline/interactions.ts';
 import { analyzeWebsite } from '../analysis/service.ts';
+import { OSM_ATTRIBUTION, type OsmAttribution } from './attribution.ts';
 import type { FetchOptions as AnalyzeFetchOptions } from '../analysis/fetcher.ts';
 import { recordScore } from '../scoring/service.ts';
 import type { AdapterRegistry } from '../../adapters/registry.ts';
@@ -56,7 +57,7 @@ export interface DiscoveryPolicy {
   autoScore: boolean;
 }
 
-export function loadDiscoveryPolicy(db: DB, cfg: Config): DiscoveryPolicy {
+export async function loadDiscoveryPolicy(db: DB, cfg: Config): Promise<DiscoveryPolicy> {
   return getSetting<DiscoveryPolicy>(db, 'discovery_policy', cfg);
 }
 
@@ -91,6 +92,13 @@ export interface DiscoveryRunResult {
   cityResults: DiscoveryCityResult[];
   startedAt: string;
   finishedAt: string;
+  /**
+   * ODbL credit for the OpenStreetMap data the run consumed (Phase 9).
+   * Attached to EVERY run — the transport (overpass/osm_local/mock) changes
+   * how the data arrives, never where it comes from — so the dashboard can
+   * render the required attribution next to the results.
+   */
+  attribution: OsmAttribution;
 }
 
 /** Bound on public-page fetches per run (autoAnalyze) — politeness + time. */
@@ -119,7 +127,7 @@ export async function runDiscovery(
 ): Promise<DiscoveryRunResult> {
   // The integration toggle is authoritative: a disabled integration cannot be
   // exercised by a direct API call either.
-  if (!isIntegrationEnabled(db, cfg, 'discovery')) {
+  if (!(await isIntegrationEnabled(db, cfg, 'discovery'))) {
     throw new AppError(
       'blocked_by_safeguard',
       'Lead discovery is disabled. Enable it on the System page (Integrations) first.',
@@ -127,7 +135,7 @@ export async function runDiscovery(
     );
   }
 
-  const status = registry.discovery.status();
+  const status = await registry.discovery.status();
   if (status.state === 'unconfigured' || status.implementation === null) {
     throw new AppError(
       'provider_unavailable',
@@ -136,7 +144,7 @@ export async function runDiscovery(
     );
   }
 
-  const policy = loadDiscoveryPolicy(db, cfg);
+  const policy = await loadDiscoveryPolicy(db, cfg);
   const categories = uniqueTrimmed(input.categories ?? policy.categories).slice(0, 40);
   const cities = uniqueTrimmed(input.cities ?? policy.cities).slice(0, 40);
   if (categories.length === 0) {
@@ -185,11 +193,18 @@ export async function runDiscovery(
         seenSourceUrls.add(hit.sourceUrl);
         seenIdentity.add(identity);
 
-        const lead = createLead(
+        const lead = await createLead(
           db,
           {
             displayName: hit.name,
             city: hit.city ?? city,
+            // Extended provenance (Phase 2): carried only when the provider
+            // actually has the value — never invented.
+            category: hit.category ?? null,
+            email: hit.email ?? null,
+            address: hit.address ?? null,
+            latitude: hit.lat ?? null,
+            longitude: hit.lon ?? null,
             phone: hit.phone ?? null,
             websiteUrl: hit.website ?? null,
             sourceUrl: hit.sourceUrl,
@@ -206,17 +221,26 @@ export async function runDiscovery(
         budgetLeft -= 1;
 
         if (!lead.mergedIntoId) {
-          recordInteraction(db, {
+          await recordInteraction(db, {
             businessId: lead.id,
             kind: 'import',
             direction: 'internal',
-            summary: `Discovered via OpenStreetMap (Overpass) in ${city}`,
+            // Provider-neutral provenance: the data is always OpenStreetMap;
+            // the parenthetical names the actual adapter serving this run
+            // (`overpass`, `osm_local`, ...) so the timeline never claims a
+            // source path that was not used.
+            summary: `Discovered via OpenStreetMap (${status.implementation}) in ${city}`,
             outcome: lead.duplicate ? 'discovered_needs_review' : 'discovered',
             evidence: {
               provider: status.implementation,
               source: 'openstreetmap',
               sourceUrl: hit.sourceUrl,
               categories,
+              // Element identity when the provider knows it (audit back to
+              // the exact OSM record; omitted otherwise).
+              ...(hit.osmType !== undefined && hit.osmId !== undefined
+                ? { osmType: hit.osmType, osmId: hit.osmId }
+                : {}),
             },
           });
 
@@ -238,7 +262,7 @@ export async function runDiscovery(
             }
             if (policy.autoScore) {
               try {
-                recordScore(db, cfg, { businessId: lead.id });
+                await recordScore(db, cfg, { businessId: lead.id });
                 scored += 1;
               } catch {
                 analyzeFailures += 1;
@@ -265,7 +289,7 @@ export async function runDiscovery(
   }
 
   const finishedAt = nowIso();
-  recordAudit(db, {
+  await recordAudit(db, {
     actorUserId: actor.userId,
     actorLabel: actor.label,
     action: 'discovery.run',
@@ -295,5 +319,6 @@ export async function runDiscovery(
     cityResults,
     startedAt,
     finishedAt,
+    attribution: OSM_ATTRIBUTION,
   };
 }

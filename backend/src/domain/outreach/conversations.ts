@@ -105,22 +105,22 @@ function toConversation(r: Row): Conversation {
 }
 
 /** Conversations for a lead, newest first. */
-export function listConversations(db: DB, businessId: string, limit = 50): Conversation[] {
-  const rows = db
-    .prepare(`${SELECT} WHERE c.business_id = ? ORDER BY c.started_at DESC, c.rowid DESC LIMIT ?`)
-    .all(businessId, limit) as unknown as Row[];
+export async function listConversations(db: DB, businessId: string, limit = 50): Promise<Conversation[]> {
+  const rows = (await db
+    .prepare(`${SELECT} WHERE c.business_id = ? ORDER BY c.started_at DESC, c.id DESC LIMIT ?`)
+    .all(businessId, limit)) as unknown as Row[];
   return rows.map(toConversation);
 }
 
-export function getConversation(db: DB, id: string): ConversationDetail | null {
-  const r = db.prepare(`${SELECT} WHERE c.id = ?`).get(id) as Row | undefined;
+export async function getConversation(db: DB, id: string): Promise<ConversationDetail | null> {
+  const r = (await db.prepare(`${SELECT} WHERE c.id = ?`).get(id)) as Row | undefined;
   if (!r) return null;
-  const segs = db
+  const segs = (await db
     .prepare(
       `SELECT seq, speaker, text, language, confidence, source, occurred_at
          FROM transcript_segments WHERE conversation_id = ? ORDER BY seq ASC`,
     )
-    .all(id) as unknown as SegmentRow[];
+    .all(id)) as unknown as SegmentRow[];
   return {
     ...toConversation(r),
     segments: segs.map((s) => ({
@@ -136,8 +136,8 @@ export function getConversation(db: DB, id: string): ConversationDetail | null {
 }
 
 /** Like getConversation but throws a 404. */
-export function requireConversation(db: DB, id: string): ConversationDetail {
-  const c = getConversation(db, id);
+export async function requireConversation(db: DB, id: string): Promise<ConversationDetail> {
+  const c = await getConversation(db, id);
   if (!c) throw notFound('Conversation');
   return c;
 }

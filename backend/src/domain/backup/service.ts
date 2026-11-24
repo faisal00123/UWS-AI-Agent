@@ -2,8 +2,9 @@
  * Backups, verification and restore tests (Phase 9).
  *
  * Design rules:
- *  - backups use SQLite's `VACUUM INTO`, which takes a consistent snapshot of
- *    a live WAL database without blocking writers
+ *  - backups use SQLite's `VACUUM INTO` (SQLite mode) or a logical JSONL
+ *    dump + manifest (PostgreSQL mode), both taken consistently from the
+ *    live database without blocking writers
  *  - every backup is VERIFIED before it counts: the snapshot is reopened and
  *    integrity_check + foreign_key_check + schema/owner checks must pass, and
  *    per-table row counts are recorded as a manifest in `verify_result`
@@ -12,7 +13,11 @@
  *    row honestly records `encrypted = 0`
  *  - a restore test re-opens the STORED backup (decrypting if needed), runs
  *    the same checks and compares the manifest counts — proving the backup is
- *    still restorable, not merely present
+ *    still restorable, not merely present (PostgreSQL mode additionally
+ *    restores into an isolated schema and re-hashes every row)
+ *  - when R2 credentials are configured the stored file is ALSO uploaded
+ *    off-site and verified with HeadObject (size + sha256 must match); a
+ *    failed upload is recorded, notified and NEVER claimed as verified
  *  - opt-outs (`suppression_list`) are inside every snapshot; restore tooling
  *    additionally re-applies opt-outs recorded AFTER the snapshot (restore.ts)
  *  - failures raise a notification (and, via the job, a scheduler incident);
@@ -32,49 +37,23 @@ import { nowIso } from '../../core/time.ts';
 import { recordAudit } from '../audit/service.ts';
 import { notify } from '../notifications/service.ts';
 import { decryptBuffer, encryptBuffer, isEncryptedBuffer } from './crypto.ts';
+import { COUNTED_TABLES, REQUIRED_TABLES, looksLikeDump, type VerifyCheck, type VerifyResult } from './format.ts';
+import { dumpDatabase, restoreDumpIntoIsolatedSchema, verifyDumpBuffer } from './pgdump.ts';
+import { deleteObject, headObject, r2KeyFor, r2Ref, uploadBuffer, type R2Config } from './r2.ts';
+
+// Re-exported so existing importers (restore.ts, cli) keep one import site.
+export type { VerifyCheck, VerifyResult } from './format.ts';
 
 // --------------------------------------------------------------- verify -----
 
-export interface VerifyCheck {
-  code: string;
-  label: string;
-  passed: boolean;
-  detail: string;
-}
+// VerifyCheck / VerifyResult / REQUIRED_TABLES / COUNTED_TABLES come from
+// ./format.ts (shared with pgdump.ts) and are re-exported above.
 
-export interface VerifyResult {
-  ok: boolean;
-  checks: VerifyCheck[];
-  counts: Record<string, number>;
-}
-
-/** Tables whose presence a restorable snapshot must prove. */
-const REQUIRED_TABLES = [
-  'users',
-  'businesses',
-  'suppression_list',
-  'interactions',
-  'outreach_attempts',
-  'calls',
-  'messages',
-  'audit_events',
-  'daily_reports',
-];
-
-/** Tables whose row counts are captured as the backup manifest. */
-const COUNTED_TABLES = [
-  ...REQUIRED_TABLES,
-  'followup_tasks',
-  'portfolio_items',
-  'budget_usage',
-  'provider_events',
-];
-
-function countTables(db: DB): Record<string, number> {
+function countTables(snap: DatabaseSync): Record<string, number> {
   const counts: Record<string, number> = {};
   for (const t of COUNTED_TABLES) {
     try {
-      const row = db.prepare(`SELECT COUNT(*) c FROM "${t}"`).get() as { c: number };
+      const row = snap.prepare(`SELECT COUNT(*) c FROM "${t}"`).get() as { c: number };
       counts[t] = row.c;
     } catch {
       // A missing table is captured as -1 so the manifest shows it honestly.
@@ -145,6 +124,19 @@ export function verifyBackupFile(path: string, opts: VerifyBackupOptions = {}): 
         detail: 'A passphrase is configured but this backup file is not encrypted.',
       });
       return { ok: false, checks, counts: {} };
+    }
+
+    // Format detection: PostgreSQL-mode backups are logical JSONL dumps and
+    // are verified from their bytes; SQLite-mode backups are opened below.
+    const plainBytes = snapshotPath === path ? raw : readFileSync(snapshotPath);
+    if (looksLikeDump(plainBytes)) {
+      const dumpResult = verifyDumpBuffer(plainBytes);
+      cleanup();
+      return {
+        ok: dumpResult.ok && checks.every((c) => c.passed),
+        checks: [...checks, ...dumpResult.checks],
+        counts: dumpResult.counts,
+      };
     }
 
     let snap: DatabaseSync;
@@ -238,7 +230,7 @@ export function verifyBackupFile(path: string, opts: VerifyBackupOptions = {}): 
         detail: ownerCount >= 1 ? `${ownerCount} owner account(s).` : 'No owner account in this snapshot.',
       });
 
-      const counts = countTables(snap as unknown as DB);
+      const counts = countTables(snap);
       return { ok: checks.every((c) => c.passed), checks, counts };
     } finally {
       snap.close();
@@ -335,26 +327,29 @@ export async function runBackup(db: DB, cfg: Config, opts: RunBackupOptions = {}
   const now = new Date();
   const id = newId('bkp');
   const dir = resolve(cfg.backup.dir);
+  const isPg = db.dialect === 'postgres';
 
-  const plainName = `uws-${stamp(now)}-${id.slice(-6)}.sqlite`;
+  const plainName = `uws-${stamp(now)}-${id.slice(-6)}${isPg ? '.jsonl' : '.sqlite'}`;
   const plainPath = join(dir, plainName);
   const finalPath = plainPath + (cfg.backup.passphrase ? '.enc' : '');
 
   // The row exists from the very first moment so even a failure as mundane as
   // an uncreatable directory is RECORDED, notified and auditable.
-  db.prepare(
-    `INSERT INTO backups (id, path, size_bytes, sha256, encrypted, status, error, created_at)
-     VALUES (?, ?, NULL, NULL, ?, 'running', NULL, ?)`,
-  ).run(id, finalPath, cfg.backup.passphrase ? 1 : 0, nowIso());
+  await db
+    .prepare(
+      `INSERT INTO backups (id, path, size_bytes, sha256, encrypted, status, error, created_at)
+       VALUES (?, ?, NULL, NULL, ?, 'running', NULL, ?)`,
+    )
+    .run(id, finalPath, cfg.backup.passphrase ? 1 : 0, nowIso());
 
-  const fail = (err: unknown): never => {
+  const fail = async (err: unknown): Promise<never> => {
     const message = err instanceof Error ? err.message : String(err);
-    db.prepare(`UPDATE backups SET status = 'failed', error = ? WHERE id = ?`).run(message.slice(0, 500), id);
+    await db.prepare(`UPDATE backups SET status = 'failed', error = ? WHERE id = ?`).run(message.slice(0, 500), id);
     // One alert per DAY: the job retries hourly on a broken backup, so keying
     // the alert by attempt id would email-spam the owner. The failed row and
     // audit event are still written for every attempt; if the message differs
     // later the same day, the row still shows it.
-    notify(db, cfg, {
+    await notify(db, cfg, {
       kind: 'backup',
       severity: 'critical',
       title: 'Backup FAILED',
@@ -363,7 +358,7 @@ export async function runBackup(db: DB, cfg: Config, opts: RunBackupOptions = {}
       entityType: 'backups',
       entityId: id,
     });
-    recordAudit(db, {
+    await recordAudit(db, {
       actorUserId: opts.actor?.userId ?? null,
       actorLabel: opts.actor?.label ?? 'scheduler',
       action: 'backup.failed',
@@ -379,8 +374,15 @@ export async function runBackup(db: DB, cfg: Config, opts: RunBackupOptions = {}
     // 0. Create the backup directory only now that the row can record failure.
     mkdirSync(dir, { recursive: true });
 
-    // 1. Consistent snapshot of the live WAL database (parameterised path).
-    db.prepare('VACUUM INTO ?').run(plainPath);
+    // 1. Consistent snapshot of the live database. SQLite uses VACUUM INTO
+    //    (WAL-consistent file copy); PostgreSQL has no such command, so it
+    //    writes the portable logical JSONL dump instead (see pgdump.ts).
+    if (isPg) {
+      const dump = await dumpDatabase(db);
+      writeFileSync(plainPath, dump.data);
+    } else {
+      await db.prepare('VACUUM INTO ?').run(plainPath);
+    }
 
     // 2. Optional encryption: read plaintext, write encrypted, remove plaintext.
     let storedPath = plainPath;
@@ -402,27 +404,88 @@ export async function runBackup(db: DB, cfg: Config, opts: RunBackupOptions = {}
       throw new Error(`backup verification failed: ${failed}`);
     }
 
-    // 5. Record the verified backup.
-    const retentionUntil = new Date(now.getTime() + cfg.backup.retentionDays * 86_400_000).toISOString();
-    db.prepare(
-      `UPDATE backups SET size_bytes = ?, sha256 = ?, status = 'verified', verify_result = ?,
-         retention_until = ?, verified_at = ? WHERE id = ?`,
-    ).run(sizeBytes, sha256, JSON.stringify(verification), retentionUntil, nowIso(), id);
+    // 5. Off-site upload to R2 (when configured), verified with HeadObject:
+    //    the stored object must report the same byte size and the same sha256.
+    //    An upload failure NEVER deletes the verified local file and NEVER
+    //    claims 'verified' — the row records the failure and the owner is
+    //    notified (a local-only backup on ephemeral disk is not off-site).
+    let r2Info: { ref: string; key: string } | null = null;
+    let r2Error: string | null = null;
+    if (cfg.backup.r2.configured) {
+      const fileName = storedPath.split(/[\\/]/).pop() ?? plainName;
+      const key = r2KeyFor(cfg.backup.r2, fileName);
+      try {
+        await uploadBuffer(cfg.backup.r2, key, readFileSync(storedPath), sha256);
+        const head = await headObject(cfg.backup.r2, key);
+        if (!head) throw new Error('object not found after upload (HeadObject returned nothing)');
+        if (head.size !== sizeBytes) throw new Error(`size mismatch: local=${sizeBytes} remote=${head.size}`);
+        if (head.sha256 && head.sha256 !== sha256) throw new Error('sha256 metadata mismatch between local file and stored object');
+        r2Info = { ref: r2Ref(cfg.backup.r2, key), key };
+      } catch (err) {
+        r2Error = (err instanceof Error ? err.message : String(err)).slice(0, 300);
+        await notify(db, cfg, {
+          kind: 'backup',
+          severity: 'critical',
+          title: 'Off-site backup upload FAILED',
+          body: `The local backup verified but could not be stored off-site in R2: ${r2Error}\nOff-site copies are missing until a later run succeeds — check the R2 credentials/bucket and the next scheduled backup.`,
+          dedupeKey: `backup_upload_failed:${new Date().toISOString().slice(0, 10)}`,
+          entityType: 'backups',
+          entityId: id,
+        });
+        await recordAudit(db, {
+          actorUserId: opts.actor?.userId ?? null,
+          actorLabel: opts.actor?.label ?? 'scheduler',
+          action: 'backup.upload_failed',
+          entityType: 'backups',
+          entityId: id,
+          summary: `R2 upload failed: ${r2Error}`,
+          details: { sizeBytes, sha256 },
+        });
+      }
+    }
 
-    recordAudit(db, {
+    // 6. Record the outcome: 'verified' only when EVERYTHING passed —
+    //    including the off-site copy when R2 is configured.
+    const retentionUntil = new Date(now.getTime() + cfg.backup.retentionDays * 86_400_000).toISOString();
+    const verifyResult = r2Info ? { ...verification, r2: r2Info } : verification;
+    const status = r2Error ? 'completed' : 'verified';
+    await db
+      .prepare(
+        `UPDATE backups SET size_bytes = ?, sha256 = ?, status = ?, verify_result = ?, error = ?,
+           retention_until = ?, verified_at = ? WHERE id = ?`,
+      )
+      .run(
+        sizeBytes,
+        sha256,
+        status,
+        JSON.stringify(verifyResult),
+        r2Error,
+        retentionUntil,
+        status === 'verified' ? nowIso() : null,
+        id,
+      );
+
+    await recordAudit(db, {
       actorUserId: opts.actor?.userId ?? null,
       actorLabel: opts.actor?.label ?? 'scheduler',
       action: 'backup.created',
       entityType: 'backups',
       entityId: id,
-      summary: `Backup verified (${sizeBytes} bytes${cfg.backup.passphrase ? ', encrypted' : ''})`,
-      details: { sizeBytes, encrypted: Boolean(cfg.backup.passphrase), retentionUntil },
+      summary:
+        `Backup ${status} (${sizeBytes} bytes${cfg.backup.passphrase ? ', encrypted' : ''})` +
+        (r2Info ? `, off-site ${r2Info.ref}` : r2Error ? ', off-site FAILED' : ''),
+      details: {
+        sizeBytes,
+        encrypted: Boolean(cfg.backup.passphrase),
+        retentionUntil,
+        offSite: r2Info ? 'verified' : r2Error ? 'failed' : cfg.backup.r2.configured ? 'failed' : 'not_configured',
+      },
     });
 
-    // 6. Age-based pruning (never deletes the newest backup).
-    pruneBackups(db, cfg);
+    // 7. Age-based pruning (never deletes the newest backup).
+    await pruneBackups(db, cfg);
 
-    const row = db.prepare('SELECT * FROM backups WHERE id = ?').get(id) as unknown as BackupRow;
+    const row = (await db.prepare('SELECT * FROM backups WHERE id = ?').get(id)) as BackupRow;
     return toBackupRecord(row);
   } catch (err) {
     // Clean up any half-written files so the directory only holds real backups.
@@ -438,51 +501,64 @@ export async function runBackup(db: DB, cfg: Config, opts: RunBackupOptions = {}
 }
 
 /** Deletes backups older than the retention window; the newest is always kept. */
-export function pruneBackups(db: DB, cfg: Config): { deleted: number } {
+export async function pruneBackups(db: DB, cfg: Config): Promise<{ deleted: number }> {
   const cutoff = new Date(Date.now() - cfg.backup.retentionDays * 86_400_000).toISOString();
-  const keepNewest = db.prepare('SELECT id FROM backups ORDER BY created_at DESC LIMIT 1').get() as
+  const keepNewest = (await db.prepare('SELECT id FROM backups ORDER BY created_at DESC LIMIT 1').get()) as
     | { id: string }
     | undefined;
-  const rows = db
-    .prepare('SELECT id, path FROM backups WHERE created_at < ? AND id <> ?')
-    .all(cutoff, keepNewest?.id ?? '') as unknown as { id: string; path: string }[];
+  const rows = (await db
+    .prepare('SELECT id, path, verify_result FROM backups WHERE created_at < ? AND id <> ?')
+    .all(cutoff, keepNewest?.id ?? '')) as { id: string; path: string; verify_result: string | null }[];
   let deleted = 0;
   for (const row of rows) {
+    // Off-site copy first (best effort: a failed remote delete must not stop
+    // local pruning — the record is deleted either way and R2's own
+    // retention/lifecycle rules remain the owner's to configure).
+    if (cfg.backup.r2.configured && row.verify_result) {
+      try {
+        const parsed = JSON.parse(row.verify_result) as { r2?: { key?: unknown } };
+        if (typeof parsed.r2?.key === 'string') {
+          await deleteObject(cfg.backup.r2, parsed.r2.key);
+        }
+      } catch {
+        /* best effort */
+      }
+    }
     try {
       if (existsSync(row.path)) unlinkSync(row.path);
     } catch {
       /* file may already be gone */
     }
-    db.prepare('DELETE FROM backups WHERE id = ?').run(row.id);
+    await db.prepare('DELETE FROM backups WHERE id = ?').run(row.id);
     deleted += 1;
   }
   return { deleted };
 }
 
-export function listBackups(db: DB, limit = 30): BackupRecord[] {
-  const rows = db
+export async function listBackups(db: DB, limit = 30): Promise<BackupRecord[]> {
+  const rows = (await db
     .prepare('SELECT * FROM backups ORDER BY created_at DESC LIMIT ?')
-    .all(Math.min(Math.max(limit, 1), 120)) as unknown as BackupRow[];
+    .all(Math.min(Math.max(limit, 1), 120))) as BackupRow[];
   return rows.map(toBackupRecord);
 }
 
-export function getBackup(db: DB, id: string): BackupRecord | null {
-  const row = db.prepare('SELECT * FROM backups WHERE id = ?').get(id) as unknown as BackupRow | undefined;
+export async function getBackup(db: DB, id: string): Promise<BackupRecord | null> {
+  const row = (await db.prepare('SELECT * FROM backups WHERE id = ?').get(id)) as BackupRow | undefined;
   return row ? toBackupRecord(row) : null;
 }
 
-export function latestBackup(db: DB): BackupRecord | null {
-  const row = db.prepare('SELECT * FROM backups ORDER BY created_at DESC LIMIT 1').get() as unknown as
+export async function latestBackup(db: DB): Promise<BackupRecord | null> {
+  const row = (await db.prepare('SELECT * FROM backups ORDER BY created_at DESC LIMIT 1').get()) as
     | BackupRow
     | undefined;
   return row ? toBackupRecord(row) : null;
 }
 
 /** The newest backup that passed verification — the only one worth testing. */
-export function latestVerifiedBackup(db: DB): BackupRecord | null {
-  const row = db
+export async function latestVerifiedBackup(db: DB): Promise<BackupRecord | null> {
+  const row = (await db
     .prepare(`SELECT * FROM backups WHERE status = 'verified' ORDER BY created_at DESC LIMIT 1`)
-    .get() as unknown as BackupRow | undefined;
+    .get()) as BackupRow | undefined;
   return row ? toBackupRecord(row) : null;
 }
 
@@ -529,15 +605,15 @@ function toRestoreTest(row: RestoreTestRow): RestoreTestRecord {
   };
 }
 
-export function listRestoreTests(db: DB, limit = 20): RestoreTestRecord[] {
-  const rows = db
+export async function listRestoreTests(db: DB, limit = 20): Promise<RestoreTestRecord[]> {
+  const rows = (await db
     .prepare('SELECT * FROM restore_tests ORDER BY started_at DESC LIMIT ?')
-    .all(Math.min(Math.max(limit, 1), 100)) as unknown as RestoreTestRow[];
+    .all(Math.min(Math.max(limit, 1), 100))) as RestoreTestRow[];
   return rows.map(toRestoreTest);
 }
 
-export function latestRestoreTest(db: DB): RestoreTestRecord | null {
-  const row = db.prepare('SELECT * FROM restore_tests ORDER BY started_at DESC LIMIT 1').get() as unknown as
+export async function latestRestoreTest(db: DB): Promise<RestoreTestRecord | null> {
+  const row = (await db.prepare('SELECT * FROM restore_tests ORDER BY started_at DESC LIMIT 1').get()) as
     | RestoreTestRow
     | undefined;
   return row ? toRestoreTest(row) : null;
@@ -555,8 +631,12 @@ export interface RestoreTestOptions {
  * A failed restore test raises a critical notification — a backup that cannot
  * be restored is worse than no backup, because it breeds false confidence.
  */
-export function runRestoreTest(db: DB, cfg: Config, opts: RestoreTestOptions = {}): RestoreTestRecord {
-  const backup = opts.backupId ? getBackup(db, opts.backupId) : latestVerifiedBackup(db);
+export async function runRestoreTest(
+  db: DB,
+  cfg: Config,
+  opts: RestoreTestOptions = {},
+): Promise<RestoreTestRecord> {
+  const backup = opts.backupId ? await getBackup(db, opts.backupId) : await latestVerifiedBackup(db);
   if (!backup) {
     throw new AppError('not_found', opts.backupId ? `Backup ${opts.backupId} not found` : 'No verified backup to test');
   }
@@ -565,13 +645,19 @@ export function runRestoreTest(db: DB, cfg: Config, opts: RestoreTestOptions = {
   }
 
   const id = newId('rtst');
-  db.prepare(
-    `INSERT INTO restore_tests (id, backup_id, started_at, status, checks_json, performed_by)
-     VALUES (?, ?, ?, 'running', '[]', ?)`,
-  ).run(id, backup.id, nowIso(), opts.performedBy ?? null);
+  await db
+    .prepare(
+      `INSERT INTO restore_tests (id, backup_id, started_at, status, checks_json, performed_by)
+       VALUES (?, ?, ?, 'running', '[]', ?)`,
+    )
+    .run(id, backup.id, nowIso(), opts.performedBy ?? null);
 
-  const finish = (status: 'passed' | 'failed', checks: VerifyCheck[], error: string | null): RestoreTestRecord => {
-    db.prepare(`UPDATE restore_tests SET finished_at = ?, status = ?, checks_json = ?, error = ? WHERE id = ?`).run(
+  const finish = async (
+    status: 'passed' | 'failed',
+    checks: VerifyCheck[],
+    error: string | null,
+  ): Promise<RestoreTestRecord> => {
+    await db.prepare(`UPDATE restore_tests SET finished_at = ?, status = ?, checks_json = ?, error = ? WHERE id = ?`).run(
       nowIso(),
       status,
       JSON.stringify(checks),
@@ -579,7 +665,7 @@ export function runRestoreTest(db: DB, cfg: Config, opts: RestoreTestOptions = {
       id,
     );
     if (status === 'failed') {
-      notify(db, cfg, {
+      await notify(db, cfg, {
         kind: 'restore_test',
         severity: 'critical',
         title: 'Restore test FAILED',
@@ -589,7 +675,7 @@ export function runRestoreTest(db: DB, cfg: Config, opts: RestoreTestOptions = {
         entityId: id,
       });
     }
-    recordAudit(db, {
+    await recordAudit(db, {
       actorUserId: opts.performedBy ?? null,
       actorLabel: opts.performedBy ? 'owner' : 'scheduler',
       action: 'backup.restore_test',
@@ -598,7 +684,7 @@ export function runRestoreTest(db: DB, cfg: Config, opts: RestoreTestOptions = {
       summary: `Restore test ${status} for backup ${backup.id}`,
       details: { backupId: backup.id, status },
     });
-    const row = db.prepare('SELECT * FROM restore_tests WHERE id = ?').get(id) as unknown as RestoreTestRow;
+    const row = (await db.prepare('SELECT * FROM restore_tests WHERE id = ?').get(id)) as RestoreTestRow;
     return toRestoreTest(row);
   };
 
@@ -627,6 +713,37 @@ export function runRestoreTest(db: DB, cfg: Config, opts: RestoreTestOptions = {
             mismatches.length === 0
               ? `All ${Object.keys(manifest).length} table counts match.`
               : mismatches.map(([t, n]) => `${t}: manifest=${n}, actual=${verification.counts[t]}`).join('; '),
+        });
+      }
+    }
+
+    // Deep test (PostgreSQL mode): actually RESTORE the dump into an
+    // ISOLATED schema, re-verify every row count and content digest from the
+    // restored rows, then drop the schema again. The live schema is never
+    // written to — this is a rehearsal of real recovery, on the real engine.
+    if (db.dialect === 'postgres' && checks.every((c) => c.passed)) {
+      try {
+        const rawBytes = readFileSync(backup.path);
+        const bytes = isEncryptedBuffer(rawBytes)
+          ? decryptBuffer(rawBytes, cfg.backup.passphrase)
+          : rawBytes;
+        if (looksLikeDump(bytes)) {
+          const restored = await restoreDumpIntoIsolatedSchema(db, bytes);
+          checks.push(...restored.checks);
+        } else {
+          checks.push({
+            code: 'dump_format',
+            label: 'Backup is a logical dump (postgres mode)',
+            passed: false,
+            detail: 'PostgreSQL mode backups must be JSONL dumps; this file is not one.',
+          });
+        }
+      } catch (err) {
+        checks.push({
+          code: 'isolated_restore',
+          label: 'Isolated restore rehearsal completed',
+          passed: false,
+          detail: err instanceof Error ? err.message : String(err),
         });
       }
     }

@@ -24,7 +24,7 @@ async function main(): Promise<void> {
     const mode = process.argv[2] ?? 'run';
 
     if (mode === 'list') {
-      const backups = listBackups(db);
+      const backups = await listBackups(db);
       if (backups.length === 0) {
         process.stdout.write('No backups recorded yet.\n');
       } else {
@@ -37,7 +37,7 @@ async function main(): Promise<void> {
           if (b.error) process.stdout.write(`      error: ${b.error}\n`);
         }
       }
-      const tests = listRestoreTests(db);
+      const tests = await listRestoreTests(db);
       process.stdout.write('\nRestore tests:\n');
       if (tests.length === 0) {
         process.stdout.write('  none yet (run: npm run backup -- test)\n');
@@ -50,7 +50,7 @@ async function main(): Promise<void> {
     }
 
     if (mode === 'test') {
-      const test = runRestoreTest(db, config);
+      const test = await runRestoreTest(db, config);
       process.stdout.write(`Restore test ${test.status} for backup ${test.backupId}\n`);
       for (const c of test.checks) {
         process.stdout.write(`  [${c.passed ? 'PASS' : 'FAIL'}] ${c.label} - ${c.detail}\n`);
@@ -79,7 +79,7 @@ async function main(): Promise<void> {
       process.stdout.write(`  [${c.passed ? 'PASS' : 'FAIL'}] ${c.label}\n`);
     }
   } finally {
-    db.close();
+    void db.close();
   }
 }
 

@@ -122,6 +122,22 @@ function hostOf(raw: string): string | null {
 }
 
 /**
+ * Rejects as soon as `signal` aborts (or immediately if it already has).
+ *
+ * Body reads are raced against this so the hop's timeout covers the read phase
+ * too (MED#5) *without* depending on the transport honouring `signal`: a real
+ * `fetch` tears the socket down, while a stub or a stalled stream still loses
+ * the race and falls into the structured timeout instead of hanging analysis.
+ */
+function rejectOnAbort(signal: AbortSignal): Promise<never> {
+  return new Promise<never>((_, reject) => {
+    const fail = (): void => reject(new Error('aborted'));
+    if (signal.aborted) fail();
+    else signal.addEventListener('abort', fail, { once: true });
+  });
+}
+
+/**
  * Fetch a page for analysis. Never throws: all outcomes are structured.
  */
 export async function fetchForAnalysis(rawUrl: string, options: FetchOptions = {}): Promise<FetchOutcome> {
@@ -178,7 +194,7 @@ export async function fetchForAnalysis(rawUrl: string, options: FetchOptions = {
       const host = hostOf(current) ?? current;
       return {
         ok: false,
-        status: aborted ? 'unreachable' : 'unreachable',
+        status: 'unreachable',
         httpStatus: null,
         finalUrl: current,
         redirectCount,
@@ -186,82 +202,109 @@ export async function fetchForAnalysis(rawUrl: string, options: FetchOptions = {
         message: aborted ? `Timed out after ${opts.timeoutMs}ms` : `Request to ${host} failed`,
       };
     }
-    clearTimeout(timer);
-
-    // Redirect handling: re-validate every hop rather than trusting fetch.
-    if (res.status >= 300 && res.status < 400) {
-      const loc = res.headers.get('location');
-      if (!loc) {
-        return { ok: false, status: 'error', httpStatus: res.status, finalUrl: current, redirectCount, durationMs: Date.now() - started, message: 'Redirect without a Location header' };
-      }
-      if (redirectCount >= opts.maxRedirects) {
-        return { ok: false, status: 'blocked', httpStatus: res.status, finalUrl: current, redirectCount, durationMs: Date.now() - started, message: `Exceeded ${opts.maxRedirects} redirects` };
-      }
-      try {
-        current = new URL(loc, parsed).toString();
-      } catch {
-        return { ok: false, status: 'error', httpStatus: res.status, finalUrl: current, redirectCount, durationMs: Date.now() - started, message: 'Unparseable redirect target' };
-      }
-      redirectCount++;
-      void res.body?.cancel().catch(() => undefined);
-      continue;
-    }
-
-    if (!res.ok) {
-      void res.body?.cancel().catch(() => undefined);
-      return {
-        ok: false,
-        status: res.status >= 500 ? 'unreachable' : 'unreachable',
-        httpStatus: res.status,
-        finalUrl: parsed.toString(),
-        redirectCount,
-        durationMs: Date.now() - started,
-        message: `HTTP ${res.status} ${res.statusText}`.trim(),
-      };
-    }
-
-    const contentType = (res.headers.get('content-type') ?? '').toLowerCase();
-    if (contentType && !contentType.includes('html') && !contentType.includes('xml') && !contentType.includes('text/plain')) {
-      void res.body?.cancel().catch(() => undefined);
-      return {
-        ok: false,
-        status: 'blocked',
-        httpStatus: res.status,
-        finalUrl: parsed.toString(),
-        redirectCount,
-        durationMs: Date.now() - started,
-        message: `Content-Type "${contentType}" is not an HTML document`,
-      };
-    }
-
-    // Bounded read: accumulate up to maxBytes, then stop.
-    const reader = res.body?.getReader();
-    let text = '';
-    let bytes = 0;
-    let truncated = false;
-    if (reader) {
-      const decoder = new TextDecoder('utf-8', { fatal: false });
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        bytes += value.byteLength;
-        if (bytes > opts.maxBytes) {
-          const keep = value.byteLength - (bytes - opts.maxBytes);
-          text += decoder.decode(value.subarray(0, Math.max(keep, 0)), { stream: true });
-          truncated = true;
-          void reader.cancel().catch(() => undefined);
-          break;
+    // The timer stays armed for the WHOLE hop — including the body read
+    // (MED#5): a server that answers headers quickly and then trickles the
+    // body must not hang analysis past timeoutMs. Every path out of this hop
+    // clears the timer via `finally`.
+    let bodyReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    try {
+      // Redirect handling: re-validate every hop rather than trusting fetch.
+      if (res.status >= 300 && res.status < 400) {
+        const loc = res.headers.get('location');
+        if (!loc) {
+          return { ok: false, status: 'error', httpStatus: res.status, finalUrl: current, redirectCount, durationMs: Date.now() - started, message: 'Redirect without a Location header' };
         }
-        text += decoder.decode(value, { stream: true });
+        if (redirectCount >= opts.maxRedirects) {
+          return { ok: false, status: 'blocked', httpStatus: res.status, finalUrl: current, redirectCount, durationMs: Date.now() - started, message: `Exceeded ${opts.maxRedirects} redirects` };
+        }
+        try {
+          current = new URL(loc, parsed).toString();
+        } catch {
+          return { ok: false, status: 'error', httpStatus: res.status, finalUrl: current, redirectCount, durationMs: Date.now() - started, message: 'Unparseable redirect target' };
+        }
+        redirectCount++;
+        void res.body?.cancel().catch(() => undefined);
+        continue;
       }
-      text += decoder.decode();
-    } else {
-      const buf = Buffer.from(await res.arrayBuffer());
-      bytes = buf.byteLength;
-      text = buf.subarray(0, opts.maxBytes).toString('utf-8');
-      truncated = bytes > opts.maxBytes;
-    }
 
-    return { ok: true, status: res.status, finalUrl: parsed.toString(), redirectCount, html: text, bytes, durationMs: Date.now() - started, truncated };
+      if (!res.ok) {
+        void res.body?.cancel().catch(() => undefined);
+        return {
+          ok: false,
+          status: 'unreachable',
+          httpStatus: res.status,
+          finalUrl: parsed.toString(),
+          redirectCount,
+          durationMs: Date.now() - started,
+          message: `HTTP ${res.status} ${res.statusText}`.trim(),
+        };
+      }
+
+      const contentType = (res.headers.get('content-type') ?? '').toLowerCase();
+      if (contentType && !contentType.includes('html') && !contentType.includes('xml') && !contentType.includes('text/plain')) {
+        void res.body?.cancel().catch(() => undefined);
+        return {
+          ok: false,
+          status: 'blocked',
+          httpStatus: res.status,
+          finalUrl: parsed.toString(),
+          redirectCount,
+          durationMs: Date.now() - started,
+          message: `Content-Type "${contentType}" is not an HTML document`,
+        };
+      }
+
+      // Bounded read: accumulate up to maxBytes, then stop. Every await races
+      // the hop's abort signal, so the timeout applies to the read phase even
+      // when the transport does not honour `signal` itself. The abort promise
+      // is created ONCE per hop (not per chunk) so a hostile many-tiny-chunk
+      // stream cannot accumulate listeners.
+      const bodyAbort = rejectOnAbort(controller.signal);
+      const reader = res.body?.getReader();
+      bodyReader = reader;
+      let text = '';
+      let bytes = 0;
+      let truncated = false;
+      if (reader) {
+        const decoder = new TextDecoder('utf-8', { fatal: false });
+        for (;;) {
+          const { done, value } = await Promise.race([reader.read(), bodyAbort]);
+          if (done) break;
+          bytes += value.byteLength;
+          if (bytes > opts.maxBytes) {
+            const keep = value.byteLength - (bytes - opts.maxBytes);
+            text += decoder.decode(value.subarray(0, Math.max(keep, 0)), { stream: true });
+            truncated = true;
+            void reader.cancel().catch(() => undefined);
+            break;
+          }
+          text += decoder.decode(value, { stream: true });
+        }
+        text += decoder.decode();
+      } else {
+        const buf = Buffer.from(await Promise.race([res.arrayBuffer(), bodyAbort]));
+        bytes = buf.byteLength;
+        text = buf.subarray(0, opts.maxBytes).toString('utf-8');
+        truncated = bytes > opts.maxBytes;
+      }
+
+      return { ok: true, status: res.status, finalUrl: parsed.toString(), redirectCount, html: text, bytes, durationMs: Date.now() - started, truncated };
+    } catch (err) {
+      // The awaited operations inside the try are body reads: an abort
+      // mid-read (timer fired) or a transport failure must stay a structured
+      // outcome — fetchForAnalysis never throws. Release the stream too so a
+      // stalled body is not left open.
+      void bodyReader?.cancel().catch(() => undefined);
+      const original = (err instanceof Error ? err.message : String(err)).slice(0, 160);
+      if (controller.signal.aborted) {
+        // The failure happened while reading the body (the only await in this
+        // try), so name the phase — callers surface this message verbatim.
+        return { ok: false, status: 'unreachable', httpStatus: null, finalUrl: parsed.toString(), redirectCount, durationMs: Date.now() - started, message: `Timed out after ${opts.timeoutMs}ms reading the response body` };
+      }
+      const host = hostOf(current) ?? current;
+      return { ok: false, status: 'unreachable', httpStatus: null, finalUrl: parsed.toString(), redirectCount, durationMs: Date.now() - started, message: `Reading response from ${host} failed: ${original}` };
+    } finally {
+      clearTimeout(timer);
+    }
   }
 }

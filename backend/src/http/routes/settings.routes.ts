@@ -23,9 +23,9 @@ export function settingsRoutes(deps: AppDeps): Router {
   router.get(
     '/',
     requireAuth,
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       res.json({
-        settings: getAllSettings(req.ctx.deps.db, req.ctx.deps.config),
+        settings: await getAllSettings(req.ctx.deps.db, req.ctx.deps.config),
         hardCeilings: {
           dailyCallLimit: req.ctx.deps.config.hardDailyCallLimit,
           dailyBudgetMinor: req.ctx.deps.config.hardDailyBudgetMinor,
@@ -54,7 +54,7 @@ export function settingsRoutes(deps: AppDeps): Router {
     requireAuth,
     requireRole('owner'),
     requireCsrf,
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const body = z.object({ updates: z.record(z.string(), z.unknown()) }).parse(req.body);
       const keys = Object.keys(body.updates);
       if (keys.length === 0) throw new AppError('validation_failed', 'No settings provided');
@@ -64,8 +64,8 @@ export function settingsRoutes(deps: AppDeps): Router {
         return def?.sensitive === true;
       });
 
-      const proceed = (): void => {
-        const result = updateSettings(req.ctx.deps.db, req.ctx.deps.config, body.updates, {
+      const proceed = async (): Promise<void> => {
+        const result = await updateSettings(req.ctx.deps.db, req.ctx.deps.config, body.updates, {
           userId: req.ctx.user!.id,
           label: 'owner',
           ipHash: req.ctx.ipHash,
@@ -84,7 +84,7 @@ export function settingsRoutes(deps: AppDeps): Router {
           applied: result.applied,
           rejected: result.rejected,
           configVersion: result.configVersion,
-          settings: getAllSettings(req.ctx.deps.db, req.ctx.deps.config),
+          settings: await getAllSettings(req.ctx.deps.db, req.ctx.deps.config),
         });
       };
 
@@ -95,7 +95,7 @@ export function settingsRoutes(deps: AppDeps): Router {
           { windowMinutes: 5, keys },
         );
       }
-      proceed();
+      await proceed();
     }),
   );
 
@@ -105,7 +105,7 @@ export function settingsRoutes(deps: AppDeps): Router {
     requireAuth,
     requireRole('owner'),
     requireCsrf,
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const key = z.string().min(1).max(60).parse(req.params.key);
       // Resetting a sensitive setting loosens/tightens policy too, so it takes
       // the same fresh-reauth path as an update.
@@ -116,12 +116,12 @@ export function settingsRoutes(deps: AppDeps): Router {
           windowMinutes: 5,
         });
       }
-      const result = resetSetting(req.ctx.deps.db, key, {
+      const result = await resetSetting(req.ctx.deps.db, key, {
         userId: req.ctx.user!.id,
         label: 'owner',
         ipHash: req.ctx.ipHash,
       });
-      res.json({ ...result, settings: getAllSettings(req.ctx.deps.db, req.ctx.deps.config) });
+      res.json({ ...result, settings: await getAllSettings(req.ctx.deps.db, req.ctx.deps.config) });
     }),
   );
 

@@ -83,24 +83,24 @@ function bump(map: Record<string, number>, key: string, by = 1): void {
   map[key] = (map[key] ?? 0) + by;
 }
 
-function buildTotals(db: DB, cfg: Config, reportDate: string): ReportTotals {
+async function buildTotals(db: DB, cfg: Config, reportDate: string): Promise<ReportTotals> {
   const { start, end } = businessDayUtcRange(cfg, reportDate);
   const s = start.toISOString();
   const e = end.toISOString();
 
-  const leadRows = db
+  const leadRows = (await db
     .prepare('SELECT stage, COUNT(*) c FROM businesses WHERE created_at >= ? AND created_at < ? GROUP BY stage')
-    .all(s, e) as { stage: string; c: number }[];
+    .all(s, e)) as { stage: string; c: number }[];
   const leadsCreated = leadRows.reduce((sum, r) => sum + r.c, 0);
   const byStage: Record<string, number> = {};
   for (const r of leadRows) byStage[r.stage] = r.c;
 
-  const attemptRows = db
+  const attemptRows = (await db
     .prepare(
       `SELECT decision, channel, blocked_code, COUNT(*) c FROM outreach_attempts
         WHERE created_at >= ? AND created_at < ? GROUP BY decision, channel, blocked_code`,
     )
-    .all(s, e) as { decision: string; channel: string; blocked_code: string | null; c: number }[];
+    .all(s, e)) as { decision: string; channel: string; blocked_code: string | null; c: number }[];
   const attempts = {
     total: 0,
     allowed: 0,
@@ -118,9 +118,9 @@ function buildTotals(db: DB, cfg: Config, reportDate: string): ReportTotals {
     }
   }
 
-  const callRows = db
+  const callRows = (await db
     .prepare('SELECT status, outcome, duration_seconds, simulation FROM calls WHERE created_at >= ? AND created_at < ?')
-    .all(s, e) as { status: string; outcome: string; duration_seconds: number | null; simulation: number }[];
+    .all(s, e)) as { status: string; outcome: string; duration_seconds: number | null; simulation: number }[];
   const calls = {
     total: callRows.length,
     simulated: 0,
@@ -137,9 +137,9 @@ function buildTotals(db: DB, cfg: Config, reportDate: string): ReportTotals {
     calls.totalDurationSeconds += r.duration_seconds ?? 0;
   }
 
-  const msgRows = db
+  const msgRows = (await db
     .prepare('SELECT status, simulation FROM messages WHERE created_at >= ? AND created_at < ?')
-    .all(s, e) as { status: string; simulation: number }[];
+    .all(s, e)) as { status: string; simulation: number }[];
   const messages = { total: msgRows.length, simulated: 0, live: 0, byStatus: {} as Record<string, number> };
   for (const r of msgRows) {
     if (r.simulation === 1) messages.simulated += 1;
@@ -148,33 +148,40 @@ function buildTotals(db: DB, cfg: Config, reportDate: string): ReportTotals {
   }
 
   const optOuts = (
-    db.prepare('SELECT COUNT(*) c FROM suppression_list WHERE created_at >= ? AND created_at < ?').get(s, e) as { c: number }
+    (await db.prepare('SELECT COUNT(*) c FROM suppression_list WHERE created_at >= ? AND created_at < ?').get(s, e)) as {
+      c: number;
+    }
   ).c;
 
-  const interRow = db
+  const interRow = (await db
     .prepare(
       `SELECT COUNT(*) total,
               SUM(CASE WHEN direction = 'inbound' THEN 1 ELSE 0 END) inbound,
               SUM(CASE WHEN simulation = 0 AND kind IN ('call','whatsapp_message','whatsapp_call','email','meeting') THEN 1 ELSE 0 END) contact
          FROM interactions WHERE occurred_at >= ? AND occurred_at < ?`,
     )
-    .get(s, e) as { total: number; inbound: number | null; contact: number | null };
+    .get(s, e)) as { total: number; inbound: number | null; contact: number | null };
 
   const followCreated = (
-    db.prepare('SELECT COUNT(*) c FROM followup_tasks WHERE created_at >= ? AND created_at < ?').get(s, e) as { c: number }
+    (await db.prepare('SELECT COUNT(*) c FROM followup_tasks WHERE created_at >= ? AND created_at < ?').get(s, e)) as {
+      c: number;
+    }
   ).c;
   const followCompleted = (
-    db.prepare('SELECT COUNT(*) c FROM followup_tasks WHERE completed_at >= ? AND completed_at < ?').get(s, e) as { c: number }
+    (await db
+      .prepare('SELECT COUNT(*) c FROM followup_tasks WHERE completed_at >= ? AND completed_at < ?')
+      .get(s, e)) as { c: number }
   ).c;
-  const followDue = (db.prepare(`SELECT COUNT(*) c FROM followup_tasks WHERE status = 'due'`).get() as { c: number }).c;
+  const followDue = ((await db.prepare(`SELECT COUNT(*) c FROM followup_tasks WHERE status = 'due'`).get()) as { c: number })
+    .c;
 
-  const budgetRows = db
+  const budgetRows = (await db
     .prepare('SELECT metric, used_value, limit_value, state FROM budget_usage WHERE usage_date = ? ORDER BY metric')
-    .all(reportDate) as { metric: string; used_value: number; limit_value: number; state: string }[];
+    .all(reportDate)) as { metric: string; used_value: number; limit_value: number; state: string }[];
 
-  const costRows = db
+  const costRows = (await db
     .prepare('SELECT state, currency, SUM(amount_minor) total FROM cost_records WHERE usage_date = ? GROUP BY state, currency')
-    .all(reportDate) as { state: string; currency: string; total: number }[];
+    .all(reportDate)) as { state: string; currency: string; total: number }[];
   const byState: Record<string, number> = {};
   let totalMinor = 0;
   let currency = 'USD';
@@ -207,7 +214,7 @@ function buildTotals(db: DB, cfg: Config, reportDate: string): ReportTotals {
       })),
     },
     costs: { byState, totalMinor, currency },
-    mode: getOperatingState(db).mode,
+    mode: (await getOperatingState(db)).mode,
   };
 }
 
@@ -245,53 +252,59 @@ export interface GenerateReportOptions {
  * Generate (or regenerate) the report for one business day. The date may not
  * be in the future: today's report exists only as a preview draft.
  */
-export function generateDailyReport(db: DB, cfg: Config, opts: GenerateReportOptions): DailyReport {
+export async function generateDailyReport(
+  db: DB,
+  cfg: Config,
+  opts: GenerateReportOptions,
+): Promise<DailyReport> {
   const now = opts.now ?? new Date();
   const todayKey = businessDayKey(now, cfg.businessTimezone);
   if (opts.reportDate > todayKey) {
     throw new AppError('validation_failed', `Cannot generate a report for the future date ${opts.reportDate}`);
   }
 
-  const totals = buildTotals(db, cfg, opts.reportDate);
-  const reconciliation = reconcileDay(db, cfg, opts.reportDate, now);
+  const totals = await buildTotals(db, cfg, opts.reportDate);
+  const reconciliation = await reconcileDay(db, cfg, opts.reportDate, now);
   const status: 'draft' | 'final' = opts.reportDate < todayKey ? 'final' : 'draft';
   const discrepanciesCount = reconciliation.discrepancies.filter((d) => d.severity !== 'info').length;
   const generatedAt = nowIso();
   // The stored row keeps its original id across regenerations (the upsert
   // only refreshes content), so reuse it and the return value matches the DB.
-  const existing = db
+  const existing = (await db
     .prepare('SELECT id FROM daily_reports WHERE report_date = ?')
-    .get(opts.reportDate) as { id: string } | undefined;
+    .get(opts.reportDate)) as { id: string } | undefined;
   const id = existing?.id ?? newId('rpt');
 
-  db.prepare(
-    `INSERT INTO daily_reports (id, report_date, generated_at, generated_by, status, totals_json,
-       reconciliation_json, discrepancies_count, missing_data_json, payload_json)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT(report_date) DO UPDATE SET
-       generated_at = excluded.generated_at,
-       generated_by = excluded.generated_by,
-       status = excluded.status,
-       totals_json = excluded.totals_json,
-       reconciliation_json = excluded.reconciliation_json,
-       discrepancies_count = excluded.discrepancies_count,
-       missing_data_json = excluded.missing_data_json,
-       payload_json = excluded.payload_json`,
-  ).run(
-    id,
-    opts.reportDate,
-    generatedAt,
-    opts.generatedBy ?? null,
-    status,
-    JSON.stringify(totals),
-    JSON.stringify(reconciliation),
-    discrepanciesCount,
-    JSON.stringify(reconciliation.missingData),
-    JSON.stringify({ version: 1, totals, reconciliation, missingData: reconciliation.missingData }),
-  );
+  await db
+    .prepare(
+      `INSERT INTO daily_reports (id, report_date, generated_at, generated_by, status, totals_json,
+         reconciliation_json, discrepancies_count, missing_data_json, payload_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(report_date) DO UPDATE SET
+         generated_at = excluded.generated_at,
+         generated_by = excluded.generated_by,
+         status = excluded.status,
+         totals_json = excluded.totals_json,
+         reconciliation_json = excluded.reconciliation_json,
+         discrepancies_count = excluded.discrepancies_count,
+         missing_data_json = excluded.missing_data_json,
+         payload_json = excluded.payload_json`,
+    )
+    .run(
+      id,
+      opts.reportDate,
+      generatedAt,
+      opts.generatedBy ?? null,
+      status,
+      JSON.stringify(totals),
+      JSON.stringify(reconciliation),
+      discrepanciesCount,
+      JSON.stringify(reconciliation.missingData),
+      JSON.stringify({ version: 1, totals, reconciliation, missingData: reconciliation.missingData }),
+    );
 
   if (status === 'final' && opts.notifyOwner !== false) {
-    notify(db, cfg, {
+    await notify(db, cfg, {
       kind: 'daily_report',
       severity: discrepanciesCount > 0 ? 'warning' : 'info',
       title: `Daily report ${opts.reportDate} ready`,
@@ -329,15 +342,15 @@ function parseReport(row: Record<string, unknown>): DailyReport {
   };
 }
 
-export function getReport(db: DB, reportDate: string): DailyReport | null {
-  const row = db.prepare('SELECT * FROM daily_reports WHERE report_date = ?').get(reportDate) as
+export async function getReport(db: DB, reportDate: string): Promise<DailyReport | null> {
+  const row = (await db.prepare('SELECT * FROM daily_reports WHERE report_date = ?').get(reportDate)) as
     | Record<string, unknown>
     | undefined;
   return row ? parseReport(row) : null;
 }
 
-export function requireReport(db: DB, reportDate: string): DailyReport {
-  const report = getReport(db, reportDate);
+export async function requireReport(db: DB, reportDate: string): Promise<DailyReport> {
+  const report = await getReport(db, reportDate);
   if (!report) throw notFound('Daily report');
   return report;
 }
@@ -350,13 +363,13 @@ export interface ReportSummary {
   discrepanciesCount: number;
 }
 
-export function listReports(db: DB, limit = 30): ReportSummary[] {
-  const rows = db
+export async function listReports(db: DB, limit = 30): Promise<ReportSummary[]> {
+  const rows = (await db
     .prepare(
       `SELECT report_date, generated_at, generated_by, status, discrepancies_count
          FROM daily_reports ORDER BY report_date DESC LIMIT ?`,
     )
-    .all(Math.min(Math.max(limit, 1), 120)) as {
+    .all(Math.min(Math.max(limit, 1), 120))) as {
     report_date: string;
     generated_at: string;
     generated_by: string | null;

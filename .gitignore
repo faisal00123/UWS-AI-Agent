@@ -30,3 +30,10 @@ Desktop.ini
 # Test artifacts
 coverage/
 .tmp/
+
+# Offline OSM datasets — raw Geofabrik PBF and derived lead datasets are
+# never committed to the public repo (ODbL data stays on the owner's machine)
+*.pbf
+*.ndjson
+*.ndjson.tmp
+*.ndjson.meta.json

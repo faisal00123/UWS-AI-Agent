@@ -89,7 +89,7 @@ const OUTCOME_BY_SCENARIO: Record<SimScenario['key'], { status: string; outcome:
  * orchestration service (the caller has already consumed the daily counter).
  * Returns the created call row and conversation reference.
  */
-export function placeSimulatedCall(db: DB, input: SimCallInput): SimCallRow {
+export async function placeSimulatedCall(db: DB, input: SimCallInput): Promise<SimCallRow> {
   const scenario = simScenarioFor(input.businessId, input.dayKey);
   const map = OUTCOME_BY_SCENARIO[scenario.key];
   const callId = newId('cal');
@@ -98,7 +98,7 @@ export function placeSimulatedCall(db: DB, input: SimCallInput): SimCallRow {
   const answeredAt = scenario.answered ? new Date(started + 3000).toISOString() : null;
   const endedAt = new Date(started + Math.max(scenario.durationSeconds, 1) * 1000).toISOString();
 
-  db.prepare(
+  await db.prepare(
     `INSERT INTO calls (id, attempt_id, business_id, direction, channel, provider, provider_call_id, status, outcome,
        to_number_e164, recording_enabled, recording_consent, recording_ref, started_at, answered_at, ended_at,
        duration_seconds, failure_code, failure_detail, simulation, counts_against_daily_limit, daily_bucket,
@@ -124,7 +124,7 @@ export function placeSimulatedCall(db: DB, input: SimCallInput): SimCallRow {
 
   let conversationId: string | null = null;
   if (scenario.answered) {
-    conversationId = writeSimulatedConversation(db, {
+    conversationId = await writeSimulatedConversation(db, {
       callId,
       businessId: input.businessId,
       businessName: input.businessName,
@@ -149,12 +149,12 @@ interface SimConversationInput {
  *  - the agent always discloses it is an AI (ai_identity_disclosed = 1)
  *  - prospect turns are explicit scripted placeholders, never invented quotes
  */
-function writeSimulatedConversation(db: DB, input: SimConversationInput): string {
+async function writeSimulatedConversation(db: DB, input: SimConversationInput): Promise<string> {
   const id = newId('cnv');
   const at = nowIso();
   const interested = input.scenario.key === 'interested';
 
-  db.prepare(
+  await db.prepare(
     `INSERT INTO conversations (id, call_id, business_id, language, ai_identity_disclosed, human_requested,
        transcript_state, summary, extracted_json, started_at, ended_at, created_at)
      VALUES (?, ?, ?, 'en', 1, ?, 'complete', ?, ?, ?, ?, ?)`,
@@ -216,10 +216,10 @@ function writeSimulatedConversation(db: DB, input: SimConversationInput): string
      VALUES (?, ?, ?, ?, ?, NULL, 'simulated', ?)`,
   );
   let t = Date.parse(input.startedAt);
-  segments.forEach((s, i) => {
-    stmt.run(id, i + 1, s.speaker, s.text, s.language, new Date(t).toISOString());
+  for (const [i, s] of segments.entries()) {
+    await stmt.run(id, i + 1, s.speaker, s.text, s.language, new Date(t).toISOString());
     t += 4000;
-  });
+  }
   return id;
 }
 

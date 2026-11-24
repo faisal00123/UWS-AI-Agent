@@ -14,7 +14,7 @@ import type { Config } from '../core/config.ts';
 import type { Logger } from '../core/logger.ts';
 import type { AdapterRegistry } from '../adapters/registry.ts';
 import { nowIso } from '../core/time.ts';
-import { summarise } from '../domain/state/service.ts';
+import { summarise, type GuardStateSummary } from '../domain/state/service.ts';
 import { recordAudit } from '../domain/audit/service.ts';
 
 export interface JobContext {
@@ -22,7 +22,7 @@ export interface JobContext {
   config: Config;
   logger: Logger;
   /** Snapshot of operating state at tick start (re-read every tick). */
-  guard: ReturnType<typeof summarise>;
+  guard: GuardStateSummary;
   now: Date;
   /** Provider registry for jobs that deliver (e.g. notification email). */
   adapters?: AdapterRegistry;
@@ -56,7 +56,7 @@ export function listJobs(): { name: string; intervalMs: number }[] {
   return JOB_REGISTRY.map((j) => ({ name: j.name, intervalMs: j.intervalMs }));
 }
 
-export function listJobRuns(db: DB, limit = 20): unknown[] {
+export async function listJobRuns(db: DB, limit = 20): Promise<unknown[]> {
   return db
     .prepare('SELECT id, job_name, started_at, finished_at, status, detail, error FROM job_runs ORDER BY id DESC LIMIT ?')
     .all(limit);
@@ -77,29 +77,33 @@ export function startScheduler(opts: {
   let stopped = false;
   let ticking = false;
 
-  const recordRun = (
+  const recordRun = async (
     name: string,
     startedAt: string,
     status: 'success' | 'failed' | 'skipped',
     detail: string | null,
     error: string | null,
-  ): void => {
-    db.prepare(
-      `INSERT INTO job_runs (job_name, started_at, finished_at, status, detail, error)
+  ): Promise<void> => {
+    await db
+      .prepare(
+        `INSERT INTO job_runs (job_name, started_at, finished_at, status, detail, error)
        VALUES (?, ?, ?, ?, ?, ?)`,
-    ).run(name, startedAt, nowIso(), status, detail, error);
+      )
+      .run(name, startedAt, nowIso(), status, detail, error);
     // Keep the run history bounded.
-    db.prepare(
-      `DELETE FROM job_runs WHERE id NOT IN (SELECT id FROM job_runs ORDER BY id DESC LIMIT 500)`,
-    ).run();
+    await db
+      .prepare(
+        `DELETE FROM job_runs WHERE id NOT IN (SELECT id FROM job_runs ORDER BY id DESC LIMIT 500)`,
+      )
+      .run();
   };
 
   const runJob = async (job: JobDefinition, now: Date): Promise<void> => {
     const startedAt = nowIso();
     try {
-      const guard = summarise(db);
+      const guard = await summarise(db);
       if (job.requiresOutreachEnabled && !guard.outreachEnabled) {
-        recordRun(job.name, startedAt, 'skipped', `Outreach blocked: ${guard.reason}`, null);
+        await recordRun(job.name, startedAt, 'skipped', `Outreach blocked: ${guard.reason}`, null);
         logger.debug('job.skipped', { job: job.name, reason: guard.reason });
         return;
       }
@@ -108,24 +112,26 @@ export function startScheduler(opts: {
       // watcher would churn the bounded run history (500 rows) and bury real
       // failures. Anything WITH a detail message, plus every failure/skip, is
       // always recorded (failures additionally raise an incident).
-      if (result?.detail) recordRun(job.name, startedAt, 'success', result.detail, null);
+      if (result?.detail) await recordRun(job.name, startedAt, 'success', result.detail, null);
       logger.debug('job.ok', { job: job.name, detail: result?.detail ?? null });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      recordRun(job.name, startedAt, 'failed', null, message);
+      await recordRun(job.name, startedAt, 'failed', null, message);
       logger.error('job.failed', { job: job.name, error: message });
       try {
-        db.prepare(
-          `INSERT INTO incidents (id, component, severity, title, detail, status, detected_at, last_error)
+        await db
+          .prepare(
+            `INSERT INTO incidents (id, component, severity, title, detail, status, detected_at, last_error)
            VALUES (?, ?, 'warning', ?, ?, 'open', ?, ?)`,
-        ).run(
-          `inc_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
-          'scheduler',
-          `Background job "${job.name}" failed`,
-          message,
-          nowIso(),
-          message,
-        );
+          )
+          .run(
+            `inc_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+            'scheduler',
+            `Background job "${job.name}" failed`,
+            message,
+            nowIso(),
+            message,
+          );
       } catch {
         /* incident recording must never throw out of the scheduler */
       }
@@ -173,13 +179,13 @@ export function startScheduler(opts: {
 }
 
 /** Convenience for jobs that need an audit entry. */
-export function auditSystem(
+export async function auditSystem(
   db: DB,
   action: string,
   summary: string,
   details?: Record<string, unknown>,
-): void {
-  recordAudit(db, {
+): Promise<void> {
+  await recordAudit(db, {
     actorLabel: 'scheduler',
     action,
     entityType: 'system',

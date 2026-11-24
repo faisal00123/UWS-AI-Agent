@@ -19,6 +19,9 @@ export const COLUMN_ALIASES: Record<string, string[]> = {
   contactPerson: ['contactperson', 'contactpersonname', 'contactname', 'person', 'owner', 'proprietor', 'manager', 'decisionmaker'],
   sourceUrl: ['sourceurl', 'source', 'reference', 'ref', 'sourcelink', 'importedfrom', 'listingurl'],
   requirements: ['notes', 'note', 'requirements', 'requirement', 'comments', 'comment', 'description', 'details', 'lookingfor', 'servicesneeded', 'remarks'],
+  address: ['address', 'addressline', 'streetaddress', 'street', 'addr', 'fulladdress', 'building', 'premises'],
+  latitude: ['latitude', 'lat'],
+  longitude: ['longitude', 'lon', 'lng', 'long'],
 };
 
 /**

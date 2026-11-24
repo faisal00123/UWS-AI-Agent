@@ -59,6 +59,12 @@ export function multipart(
   fields: Record<string, string>,
   file: { field: string; filename: string; contentType: string; data: Uint8Array },
 ): { body: Buffer; contentType: string } {
+  // Defence in depth: filename/contentType are interpolated into the part
+  // header below, so anything that could close the header or the part
+  // (quotes, CR/LF, backslashes) is stripped here regardless of caller —
+  // no present or future input path can inject extra multipart fields.
+  const filename = file.filename.replace(/["\r\n\\]/g, '').slice(0, 120) || 'upload.bin';
+  const contentType = file.contentType.replace(/[\r\n"]/g, '').slice(0, 100) || 'application/octet-stream';
   const boundary = `----uws${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
   const chunks: Buffer[] = [];
   for (const [name, value] of Object.entries(fields)) {
@@ -66,8 +72,8 @@ export function multipart(
   }
   chunks.push(
     Buffer.from(
-      `--${boundary}\r\nContent-Disposition: form-data; name="${file.field}"; filename="${file.filename}"\r\n` +
-        `Content-Type: ${file.contentType}\r\n\r\n`,
+      `--${boundary}\r\nContent-Disposition: form-data; name="${file.field}"; filename="${filename}"\r\n` +
+        `Content-Type: ${contentType}\r\n\r\n`,
     ),
   );
   chunks.push(Buffer.from(file.data));
@@ -187,7 +193,7 @@ export function createOpenAISpeechAdapter(opts: OpenAISpeechOptions): SpeechPort
     key: 'openai_speech',
     label: 'Speech STT/TTS (OpenAI-compatible)',
 
-    status(): AdapterStatus {
+    async status(): Promise<AdapterStatus> {
       return {
         key: 'speech',
         label: 'Speech (STT/TTS)',

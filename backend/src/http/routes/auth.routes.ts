@@ -77,10 +77,10 @@ export function authRoutes(deps: AppDeps): Router {
   router.post(
     '/logout',
     requireCsrf,
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const cookies = req.headers.cookie ?? '';
       const match = /(?:^|;\s*)uws_session=([^;]+)/.exec(cookies);
-      if (match) destroySession(deps.db, decodeURIComponent(match[1]!));
+      if (match) await destroySession(deps.db, decodeURIComponent(match[1]!));
       clearSessionCookies(res, deps);
       res.json({ ok: true });
     }),
@@ -136,13 +136,13 @@ export function authRoutes(deps: AppDeps): Router {
     asyncRoute(async (req, res) => {
       const body = z.object({ password: passwordSchema }).parse(req.body);
       const { verifyPassword } = await import('../../core/password.ts');
-      const row = deps.db.prepare('SELECT password_hash FROM users WHERE id = ?').get(req.ctx.user!.id) as
+      const row = (await deps.db.prepare('SELECT password_hash FROM users WHERE id = ?').get(req.ctx.user!.id)) as
         | { password_hash: string }
         | undefined;
       if (!row) throw new AppError('unauthenticated', 'User not found');
       const check = await verifyPassword(body.password, row.password_hash);
       if (!check.valid) throw new AppError('unauthenticated', 'Password verification failed');
-      const until = grantReauth(deps.db, req.ctx.session!.id);
+      const until = await grantReauth(deps.db, req.ctx.session!.id);
       res.json({ ok: true, validUntil: until });
     }),
   );
@@ -152,8 +152,8 @@ export function authRoutes(deps: AppDeps): Router {
     '/users',
     requireAuth,
     requireRole('owner'),
-    asyncRoute((_req, res) => {
-      res.json({ users: listUsers(deps.db) });
+    asyncRoute(async (_req, res) => {
+      res.json({ users: await listUsers(deps.db) });
     }),
   );
 
@@ -177,9 +177,9 @@ export function authRoutes(deps: AppDeps): Router {
     requireAuth,
     requireRole('owner'),
     requireCsrf,
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const id = z.string().min(1).parse(req.params.id);
-      const revoked = destroyOtherSessions(deps.db, id);
+      const revoked = await destroyOtherSessions(deps.db, id);
       res.json({ ok: true, revokedSessions: revoked });
     }),
   );

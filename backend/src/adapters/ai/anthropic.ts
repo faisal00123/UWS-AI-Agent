@@ -58,7 +58,7 @@ export function createAnthropicAdapter(opts: AnthropicOptions): ConversationPort
   return {
     key: 'anthropic',
     label: 'AI conversation (Anthropic)',
-    status(): AdapterStatus {
+    async status(): Promise<AdapterStatus> {
       const configured = Boolean(opts.apiKey && opts.model);
       return {
         key: 'ai',

@@ -13,11 +13,12 @@
  */
 import { loadConfig } from '../core/config.ts';
 import { createLogger } from '../core/logger.ts';
-import { openDatabase } from '../db/index.ts';
+import { openFromConfig, assertBootableDatabase, assertDatabaseIdentity } from '../db/index.ts';
 import { runMigrations } from '../db/migrate.ts';
 import { markApplicationStart } from '../domain/state/service.ts';
 import { buildRegistry, type AdapterUsageEvent } from '../adapters/registry.ts';
 import { isIntegrationEnabled, recordAdapterUsage } from '../domain/integrations/service.ts';
+import { newId } from '../core/ids.ts';
 import { createApp } from './app.ts';
 import { attachDuplexBridge, type DuplexBridge } from './duplex.ts';
 import { attachGatewayMediaBridge, type GatewayMediaBridge } from './gatewaymedia.ts';
@@ -25,23 +26,37 @@ import { attachUpgradeFallback } from './upgrade.ts';
 import { registerReportingJobs } from '../jobs/reporting.ts';
 import { registerBackupJobs } from '../jobs/backup.ts';
 import { registerHealthJobs } from '../jobs/health.ts';
+import { registerSessionJobs } from '../jobs/sessions.ts';
 import { startScheduler, type Scheduler } from '../jobs/scheduler.ts';
 
 const config = loadConfig();
 const logger = createLogger(config.logLevel, config.logRedact);
 
 async function main(): Promise<void> {
-  const db = openDatabase(config.databasePath);
-  const migration = runMigrations(db);
+  const production = config.nodeEnv === 'production';
+  const db = openFromConfig(config);
+
+  // Never silently create a fresh database: on an empty production DB this
+  // throws unless DB_INIT_CONFIRM=1 (the explicit `npm run db:init` path).
+  await assertBootableDatabase(db, { production, allowInit: config.dbInitConfirm });
+
+  const migration = await runMigrations(db);
   if (migration.applied.length > 0) {
     logger.info('database.migrations.applied', {
       applied: migration.applied.join(', '),
     });
   }
 
+  // Prove this is the expected database before serving any traffic.
+  await assertDatabaseIdentity(db, {
+    production,
+    allowInit: config.dbInitConfirm,
+    makeInstanceId: () => newId('inst'),
+  });
+
   // Restart safety: outreach is paused on every start and must be resumed
   // manually by the owner (Section 3.5).
-  const bootState = markApplicationStart(db);
+  const bootState = await markApplicationStart(db);
   if (bootState.paused) {
     logger.warn('outreach.paused_after_start', {
       reason: bootState.pauseReason,
@@ -117,6 +132,9 @@ async function main(): Promise<void> {
   // Phase 11B: 30-minute free health probes for every integration. Runs even
   // in simulation/outreach-disabled state — health is always observable.
   registerHealthJobs();
+  // Session hygiene: expired session rows are purged once a day (they already
+  // fail at load; this stops them accumulating forever).
+  registerSessionJobs();
   const scheduler: Scheduler = startScheduler({ config, db, logger, adapters });
 
   const shutdown = (signal: string): void => {
@@ -124,8 +142,7 @@ async function main(): Promise<void> {
     scheduler.stop();
     void Promise.all([duplex.close(), gatewayMedia.close()]).finally(() => {
       server.close(() => {
-        db.close();
-        process.exit(0);
+        void db.close().finally(() => process.exit(0));
       });
     });
     // Hard exit if providers/jobs hang.

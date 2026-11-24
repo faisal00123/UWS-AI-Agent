@@ -79,7 +79,7 @@ export function createElevenLabsSpeechAdapter(opts: ElevenLabsOptions): SpeechPo
     key: 'elevenlabs_speech',
     label: 'Speech TTS (ElevenLabs)',
 
-    status(): AdapterStatus {
+    async status(): Promise<AdapterStatus> {
       return {
         key: 'speech',
         label: 'Speech (STT/TTS)',

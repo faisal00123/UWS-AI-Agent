@@ -14,6 +14,8 @@
     "test:coverage": "node --disable-warning=ExperimentalWarning --test --experimental-test-coverage \"tests/**/*.test.ts\"",
     "typecheck": "tsc --noEmit",
     "migrate": "node --disable-warning=ExperimentalWarning --env-file-if-exists=.env src/cli/migrate.ts",
+    "migrate:pg": "node --disable-warning=ExperimentalWarning --env-file-if-exists=.env src/cli/migrate-pg.ts",
+    "extract:osm": "node --disable-warning=ExperimentalWarning scripts/extract-osm.ts",
     "setup": "node --disable-warning=ExperimentalWarning --env-file-if-exists=.env src/cli/setup.ts",
     "seed:demo": "node --disable-warning=ExperimentalWarning --env-file-if-exists=.env src/cli/seed-demo.ts",
     "backup": "node --disable-warning=ExperimentalWarning --env-file-if-exists=.env src/cli/backup.ts",
@@ -21,17 +23,22 @@
     "doctor": "node --disable-warning=ExperimentalWarning --env-file-if-exists=.env src/cli/doctor.ts"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1170.0",
     "exceljs": "^4.4.0",
     "express": "^5.1.0",
     "express-rate-limit": "^8.0.0",
     "helmet": "^8.1.0",
+    "pg": "^8.23.1",
     "ws": "^8.22.1",
     "zod": "^4.1.12"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "^0.5.16",
     "@types/express": "^5.0.5",
     "@types/node": "^24.10.1",
+    "@types/pg": "^8.23.1",
     "@types/ws": "^8.18.2",
+    "osm-pbf-parser": "^2.3.0",
     "typescript": "^5.9.3"
   }
 }

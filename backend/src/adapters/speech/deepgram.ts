@@ -89,7 +89,7 @@ export function createDeepgramSpeechAdapter(opts: DeepgramOptions): SpeechPort {
     key: 'deepgram_speech',
     label: 'Speech STT (Deepgram)',
 
-    status(): AdapterStatus {
+    async status(): Promise<AdapterStatus> {
       return {
         key: 'speech',
         label: 'Speech (STT/TTS)',

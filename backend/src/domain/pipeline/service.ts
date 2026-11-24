@@ -67,8 +67,8 @@ export interface AdvanceInput {
  * record in the same step; both paths end with a persisted interaction that the
  * stage history references.
  */
-export function advanceStage(db: DB, cfg: Config, input: AdvanceInput): AdvanceResult {
-  const current = db.prepare('SELECT stage FROM businesses WHERE id = ?').get(input.businessId) as
+export async function advanceStage(db: DB, cfg: Config, input: AdvanceInput): Promise<AdvanceResult> {
+  const current = (await db.prepare('SELECT stage FROM businesses WHERE id = ?').get(input.businessId)) as
     | { stage: LeadStage }
     | undefined;
   if (!current) throw new AppError('not_found', 'Lead not found');
@@ -77,7 +77,7 @@ export function advanceStage(db: DB, cfg: Config, input: AdvanceInput): AdvanceR
   // Record the interaction first so we have an id to cite as evidence.
   let interactionId: string;
   if (input.interaction) {
-    const created = recordInteraction(db, {
+    const created = await recordInteraction(db, {
       ...input.interaction,
       businessId: input.businessId,
       createdBy: input.interaction.createdBy ?? input.actor.userId,
@@ -94,7 +94,7 @@ export function advanceStage(db: DB, cfg: Config, input: AdvanceInput): AdvanceR
   }
 
   // Guard: contact-gated stages need prior real contact evidence.
-  if (STAGES_NEEDING_CONTACT.includes(input.toStage) && !hasContactEvidence(db, input.businessId)) {
+  if (STAGES_NEEDING_CONTACT.includes(input.toStage) && !(await hasContactEvidence(db, input.businessId))) {
     throw new AppError(
       'validation_failed',
       `Moving to "${input.toStage}" requires at least one real customer contact on record`,
@@ -107,7 +107,7 @@ export function advanceStage(db: DB, cfg: Config, input: AdvanceInput): AdvanceR
     throw new AppError('forbidden', 'Only the owner can confirm a conversion (won)', { toStage: 'won' });
   }
 
-  const result = changeStage(db, input.businessId, input.toStage, {
+  const result = await changeStage(db, input.businessId, input.toStage, {
     reason: input.reason,
     evidenceInteractionId: interactionId,
     actor: input.actor,
@@ -118,9 +118,9 @@ export function advanceStage(db: DB, cfg: Config, input: AdvanceInput): AdvanceR
     const cadence = DEFAULT_CADENCE_DAYS[input.toStage];
     if (cadence) {
       const now = Date.now();
-      cadence.forEach((days, i) => {
+      for (const [i, days] of cadence.entries()) {
         scheduled.push(
-          scheduleFollowup(db, cfg, {
+          await scheduleFollowup(db, cfg, {
             businessId: input.businessId,
             type: (i === 0 ? 'followup_call' : 'followup_message') as FollowupType,
             title: `Follow-up ${i + 1} after ${input.toStage}`,
@@ -129,7 +129,7 @@ export function advanceStage(db: DB, cfg: Config, input: AdvanceInput): AdvanceR
             createdBy: input.actor.userId,
           }),
         );
-      });
+      }
     }
   }
 
@@ -137,15 +137,15 @@ export function advanceStage(db: DB, cfg: Config, input: AdvanceInput): AdvanceR
 }
 
 /** Full timeline for a lead, newest first. */
-export function timeline(db: DB, businessId: string, limit = 200) {
+export async function timeline(db: DB, businessId: string, limit = 200) {
   return listInteractions(db, { businessId, limit });
 }
 
 /** Count of interactions by kind, used by the pipeline summary. */
-export function interactionCounts(db: DB, businessId: string): Record<string, number> {
-  const rows = db
+export async function interactionCounts(db: DB, businessId: string): Promise<Record<string, number>> {
+  const rows = (await db
     .prepare('SELECT kind, COUNT(*) c FROM interactions WHERE business_id = ? GROUP BY kind')
-    .all(businessId) as unknown as { kind: string; c: number }[];
+    .all(businessId)) as { kind: string; c: number }[];
   const out: Record<string, number> = {};
   for (const r of rows) out[r.kind] = r.c;
   return out;

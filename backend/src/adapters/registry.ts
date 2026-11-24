@@ -88,9 +88,9 @@ export interface AdapterUsageEvent {
 
 export interface AdapterRegistryHooks {
   /** False when the owner disabled this integration in settings. Default: true. */
-  isEnabled?: (key: IntegrationKey) => boolean;
+  isEnabled?: (key: IntegrationKey) => boolean | Promise<boolean>;
   /** Called once per adapter operation; the domain persists it. Must never throw. */
-  onUsage?: (event: AdapterUsageEvent) => void;
+  onUsage?: (event: AdapterUsageEvent) => void | Promise<void>;
 }
 
 export interface AdapterRegistry {
@@ -103,7 +103,7 @@ export interface AdapterRegistry {
   /** Speech voice/language defaults resolved from env (never secrets). */
   speechDefaults: SpeechDefaults;
   /** Status list for the Integrations page (secret-free). */
-  statuses(): AdapterStatus[];
+  statuses(): Promise<AdapterStatus[]>;
   /** Verify a Twilio callback signature; false when unconfigured. */
   verifyTwilioSignature(fullUrl: string, params: Record<string, string>, signature: string | null): boolean;
   /** Verify Meta's X-Hub-Signature-256 over the raw body; false when unconfigured. */
@@ -193,21 +193,25 @@ export function buildRegistry(cfg: Config, env: Env = process.env, opts: BuildRe
         retries: number,
       ): void => {
         try {
-          onUsage({
-            integration: key,
-            operation: op,
-            outcome,
-            errorCode,
-            durationMs: Date.now() - started,
-            retries,
-            occurredAt: new Date(),
+          void Promise.resolve(
+            onUsage({
+              integration: key,
+              operation: op,
+              outcome,
+              errorCode,
+              durationMs: Date.now() - started,
+              retries,
+              occurredAt: new Date(),
+            }),
+          ).catch(() => {
+            /* usage accounting must never break the operation */
           });
         } catch {
           /* usage accounting must never break the operation */
         }
       };
 
-      if (!isEnabled(key)) {
+      if (!(await isEnabled(key))) {
         record('disabled', 'disabled', 0);
         throw new AdapterError('unconfigured', `The ${key} integration is disabled in settings`);
       }
@@ -347,28 +351,28 @@ export function buildRegistry(cfg: Config, env: Env = process.env, opts: BuildRe
     discovery,
     speechDefaults,
 
-    statuses(): AdapterStatus[] {
+    async statuses(): Promise<AdapterStatus[]> {
       const list: AdapterStatus[] = [];
       list.push(
         telephony
-          ? telephony.status()
+          ? await telephony.status()
           : {
               key: 'telephony',
               label: 'Telephony (calls)',
               implementation: null,
-              state: isEnabled('telephony') ? 'unconfigured' : 'disabled',
+              state: (await isEnabled('telephony')) ? 'unconfigured' : 'disabled',
               features: ['outbound calls', 'status callbacks', 'duration tracking'],
               lastError: null,
             },
       );
       list.push(
         whatsapp
-          ? whatsapp.status()
+          ? await whatsapp.status()
           : {
               key: 'whatsapp',
               label: 'WhatsApp Business',
               implementation: null,
-              state: isEnabled('whatsapp') ? 'unconfigured' : 'disabled',
+              state: (await isEnabled('whatsapp')) ? 'unconfigured' : 'disabled',
               features: [
                 'portfolio messages',
                 'delivery events',
@@ -380,41 +384,41 @@ export function buildRegistry(cfg: Config, env: Env = process.env, opts: BuildRe
       );
       list.push(
         ai
-          ? ai.status()
+          ? await ai.status()
           : {
               key: 'ai',
               label: 'AI conversation',
               implementation: null,
-              state: isEnabled('ai') ? 'unconfigured' : 'disabled',
+              state: (await isEnabled('ai')) ? 'unconfigured' : 'disabled',
               features: ['call turns', 'qualification extraction', 'objection handling'],
               lastError: null,
             },
       );
       list.push(
         speech
-          ? speech.status()
+          ? await speech.status()
           : {
               key: 'speech',
               label: 'Speech (STT/TTS)',
               implementation: null,
-              state: isEnabled('speech') ? 'unconfigured' : 'disabled',
+              state: (await isEnabled('speech')) ? 'unconfigured' : 'disabled',
               features: ['transcription', 'voice synthesis', 'ur + en'],
               lastError: null,
             },
       );
       list.push(
         email
-          ? email.status()
+          ? await email.status()
           : {
               key: 'email',
               label: 'Email (SMTP)',
               implementation: null,
-              state: isEnabled('email') ? 'unconfigured' : 'disabled',
+              state: (await isEnabled('email')) ? 'unconfigured' : 'disabled',
               features: ['owner notifications', 'daily report email', 'delivery status'],
               lastError: null,
             },
       );
-      list.push(discovery.status());
+      list.push(await discovery.status());
       return list;
     },
 
@@ -481,17 +485,18 @@ function timingSafeStringEqual(a: string, b: string): boolean {
 }
 
 /** Report 'disabled' in the status when the toggle is off (regardless of config). */
-function decorateStatus(
+async function decorateStatus(
   _key: IntegrationKey,
-  status: AdapterStatus,
-  isEnabled: (key: IntegrationKey) => boolean,
-): AdapterStatus {
+  status: AdapterStatus | Promise<AdapterStatus>,
+  isEnabled: (key: IntegrationKey) => boolean | Promise<boolean>,
+): Promise<AdapterStatus> {
+  const resolved = await status;
   // `status.key` is the integration key string used by each adapter.
-  const integration = status.key as IntegrationKey;
-  if (!isEnabled(integration)) {
-    return { ...status, state: 'disabled' };
+  const integration = resolved.key as IntegrationKey;
+  if (!(await isEnabled(integration))) {
+    return { ...resolved, state: 'disabled' };
   }
-  return status;
+  return resolved;
 }
 
 /** A registry with nothing configured — the default for tests/simulation. */

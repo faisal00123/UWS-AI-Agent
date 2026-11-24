@@ -36,15 +36,15 @@ export function discoveryRoutes(_deps: AppDeps): Router {
   router.get(
     '/status',
     requireAuth,
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const { db, config, adapters } = req.ctx.deps;
-      const status = adapters?.discovery.status() ?? null;
-      const policy = loadDiscoveryPolicy(db, config);
+      const status = adapters?.discovery.status ? (await adapters.discovery.status()) : null;
+      const policy = await loadDiscoveryPolicy(db, config);
       res.json({
         provider: status?.implementation ?? null,
         state: status?.state ?? 'unconfigured',
         simulated: status?.simulated === true,
-        enabled: isIntegrationEnabled(db, config, 'discovery'),
+        enabled: await isIntegrationEnabled(db, config, 'discovery'),
         policy: {
           categories: policy.categories,
           cities: policy.cities,

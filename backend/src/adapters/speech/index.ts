@@ -144,9 +144,9 @@ function composite(stt: SpeechPort, tts: SpeechPort): SpeechPort {
     key: 'speech',
     label: `Speech (${stt.label} + ${tts.label})`,
 
-    status(): AdapterStatus {
-      const a = stt.status();
-      const b = tts.status();
+    async status(): Promise<AdapterStatus> {
+      const a = await stt.status();
+      const b = await tts.status();
       const implementation =
         a.implementation && b.implementation && a.implementation !== b.implementation
           ? `${a.implementation}+${b.implementation}`

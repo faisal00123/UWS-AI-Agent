@@ -34,6 +34,7 @@ interface RunBody {
     merged: number;
     skipped: number;
     cityResults: { city: string; hits: number; error: string | null }[];
+    attribution?: { text: string; license: string; url: string };
   };
 }
 interface ErrorBody {
@@ -105,6 +106,15 @@ describe('Phase 12 API: discovery', () => {
     assert.equal(res.body.run.simulated, true, 'mock runs are never presented as real');
     assert.ok(res.body.run.created >= 1, 'Sample Salon Studio matches "salon" in Karachi');
     assert.equal(res.body.run.cityResults[0]!.error, null);
+
+    // Phase 9: every run carries the ODbL credit for the OSM data it used,
+    // so the dashboard can display it without hardcoding wording.
+    const attr = res.body.run.attribution;
+    assert.ok(attr, 'attribution rides along with the run result');
+    assert.equal(attr.license, 'ODbL');
+    assert.equal(attr.url, 'https://www.openstreetmap.org/copyright');
+    assert.match(attr.text, /© OpenStreetMap contributors/);
+    assert.match(attr.text, /Open Database License \(ODbL\)/);
 
     // The lead landed in the database with mock provenance.
     const lead = server.db

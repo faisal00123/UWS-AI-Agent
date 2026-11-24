@@ -50,8 +50,8 @@ interface Row {
 
 const SELECT = 'SELECT * FROM operating_state WHERE id = 1';
 
-export function getOperatingState(db: DB): OperatingState {
-  const r = db.prepare(SELECT).get() as Row | undefined;
+export async function getOperatingState(db: DB): Promise<OperatingState> {
+  const r = (await db.prepare(SELECT).get()) as Row | undefined;
   if (!r) throw new AppError('internal_error', 'operating_state row missing');
   return {
     mode: r.mode,
@@ -74,18 +74,20 @@ export function getOperatingState(db: DB): OperatingState {
  * Increments the restart counter and forces `paused = 1` so no outbound work
  * can resume automatically after a crash/restart/redeploy.
  */
-export function markApplicationStart(db: DB, reason = 'application_restart'): OperatingState {
-  db.prepare(
-    `UPDATE operating_state
+export async function markApplicationStart(db: DB, reason = 'application_restart'): Promise<OperatingState> {
+  await db
+    .prepare(
+      `UPDATE operating_state
         SET paused = 1,
             pause_reason = ?,
             paused_at = ?,
             restart_count = restart_count + 1,
             updated_at = ?
       WHERE id = 1`,
-  ).run(reason, nowIso(), nowIso());
-  const state = getOperatingState(db);
-  recordAudit(db, {
+    )
+    .run(reason, nowIso(), nowIso());
+  const state = await getOperatingState(db);
+  await recordAudit(db, {
     actorLabel: 'system',
     action: 'system.start',
     entityType: 'operating_state',
@@ -103,11 +105,12 @@ export interface Actor {
   ipHash?: string | null;
 }
 
-export function emergencyStop(db: DB, reason: string, actor: Actor): OperatingState {
+export async function emergencyStop(db: DB, reason: string, actor: Actor): Promise<OperatingState> {
   if (!reason.trim()) throw new AppError('validation_failed', 'A reason is required to stop outreach');
   const at = nowIso();
-  db.prepare(
-    `UPDATE operating_state
+  await db
+    .prepare(
+      `UPDATE operating_state
         SET emergency_stop = 1,
             emergency_stop_reason = ?,
             emergency_stop_at = ?,
@@ -117,10 +120,11 @@ export function emergencyStop(db: DB, reason: string, actor: Actor): OperatingSt
             paused_at = ?,
             updated_at = ?
       WHERE id = 1`,
-  ).run(reason, at, actor.userId, at, at);
+    )
+    .run(reason, at, actor.userId, at, at);
 
   // Any task still queued/running is blocked rather than silently dropped.
-  const blocked = db
+  const blocked = await db
     .prepare(
       `UPDATE followup_tasks
           SET status = 'blocked',
@@ -130,7 +134,7 @@ export function emergencyStop(db: DB, reason: string, actor: Actor): OperatingSt
     )
     .run(at);
 
-  recordAudit(db, {
+  await recordAudit(db, {
     actorUserId: actor.userId,
     actorLabel: actor.label,
     action: 'emergency.stop',
@@ -140,7 +144,7 @@ export function emergencyStop(db: DB, reason: string, actor: Actor): OperatingSt
     details: { reason, blockedTasks: Number(blocked.changes) },
     ipHash: actor.ipHash ?? null,
   });
-  return getOperatingState(db);
+  return await getOperatingState(db);
 }
 
 export interface ResumeCheck {
@@ -163,21 +167,21 @@ export interface ResumeEvaluation {
  * @param opts.ignoreEmergencyStop  set when the owner explicitly asked to clear
  *        the stop in the same action - otherwise an active stop blocks resume.
  */
-export function evaluateResume(
+export async function evaluateResume(
   db: DB,
   cfg: Config,
   opts: { ignoreEmergencyStop?: boolean } = {},
   now = new Date(),
-): ResumeEvaluation {
+): Promise<ResumeEvaluation> {
   const checks: ResumeCheck[] = [];
-  const state = getOperatingState(db);
+  const state = await getOperatingState(db);
   const businessDayKey = dayKeyFor(cfg, now);
-  const dailyLimit = getSetting<number>(db, 'daily_call_limit', cfg);
-  const budget = getSetting<{ limitMinor: number }>(db, 'daily_budget', cfg);
+  const dailyLimit = await getSetting<number>(db, 'daily_call_limit', cfg);
+  const budget = await getSetting<{ limitMinor: number }>(db, 'daily_budget', cfg);
 
-  const callRow = db
+  const callRow = (await db
     .prepare(`SELECT used_value FROM budget_usage WHERE usage_date = ? AND metric = 'calls'`)
-    .get(businessDayKey) as { used_value: number } | undefined;
+    .get(businessDayKey)) as { used_value: number } | undefined;
   const usedCalls = callRow?.used_value ?? 0;
   // Reaching the daily limit does not forbid *resuming*; it only means new
   // calls stay blocked until the next business day. Informational only.
@@ -192,9 +196,9 @@ export function evaluateResume(
         : `Daily limit reached (${usedCalls}/${dailyLimit}) - new calls stay blocked until the next business day`,
   });
 
-  const costRow = db
+  const costRow = (await db
     .prepare(`SELECT used_value FROM budget_usage WHERE usage_date = ? AND metric = 'cost_minor'`)
-    .get(businessDayKey) as { used_value: number } | undefined;
+    .get(businessDayKey)) as { used_value: number } | undefined;
   const usedCost = costRow?.used_value ?? 0;
   checks.push({
     key: 'daily_budget',
@@ -208,9 +212,11 @@ export function evaluateResume(
   });
 
   const criticalOpen = (
-    db
-      .prepare(`SELECT COUNT(*) c FROM incidents WHERE severity = 'critical' AND status IN ('open','investigating')`)
-      .get() as { c: number }
+    (
+      await db
+        .prepare(`SELECT COUNT(*) c FROM incidents WHERE severity = 'critical' AND status IN ('open','investigating')`)
+        .get()
+    ) as { c: number }
   ).c;
   checks.push({
     key: 'open_incidents',
@@ -253,8 +259,13 @@ export interface ResumeResult {
 }
 
 /** Owner-initiated resume. Clears pause AND emergency stop in one audited action. */
-export function resume(db: DB, cfg: Config, actor: Actor, options: { clearEmergencyStop: boolean }): ResumeResult {
-  const evaluation = evaluateResume(db, cfg, { ignoreEmergencyStop: options.clearEmergencyStop });
+export async function resume(
+  db: DB,
+  cfg: Config,
+  actor: Actor,
+  options: { clearEmergencyStop: boolean },
+): Promise<ResumeResult> {
+  const evaluation = await evaluateResume(db, cfg, { ignoreEmergencyStop: options.clearEmergencyStop });
   if (!evaluation.canResume) {
     throw new AppError(
       'blocked_by_safeguard',
@@ -263,15 +274,16 @@ export function resume(db: DB, cfg: Config, actor: Actor, options: { clearEmerge
     );
   }
   if (options.clearEmergencyStop) {
-    const state = getOperatingState(db);
+    const state = await getOperatingState(db);
     if (state.emergencyStop && actor.label !== 'owner') {
       throw new AppError('forbidden', 'Only the owner may clear an emergency stop');
     }
   }
   const at = nowIso();
-  const state = getOperatingState(db);
-  db.prepare(
-    `UPDATE operating_state
+  const state = await getOperatingState(db);
+  await db
+    .prepare(
+      `UPDATE operating_state
         SET paused = 0,
             pause_reason = NULL,
             paused_at = NULL,
@@ -283,18 +295,21 @@ export function resume(db: DB, cfg: Config, actor: Actor, options: { clearEmerge
             emergency_stop_by = CASE WHEN ? = 1 AND emergency_stop = 1 THEN NULL ELSE emergency_stop_by END,
             updated_at = ?
       WHERE id = 1`,
-  ).run(at, actor.userId, options.clearEmergencyStop ? 1 : 0, options.clearEmergencyStop ? 1 : 0, options.clearEmergencyStop ? 1 : 0, options.clearEmergencyStop ? 1 : 0, at);
+    )
+    .run(at, actor.userId, options.clearEmergencyStop ? 1 : 0, options.clearEmergencyStop ? 1 : 0, options.clearEmergencyStop ? 1 : 0, options.clearEmergencyStop ? 1 : 0, at);
 
   // Tasks blocked by the emergency stop return to 'scheduled' so queues survive.
   if (options.clearEmergencyStop) {
-    db.prepare(
-      `UPDATE followup_tasks
+    await db
+      .prepare(
+        `UPDATE followup_tasks
           SET status = 'scheduled', blocked_reason = NULL, updated_at = ?
         WHERE status = 'blocked' AND blocked_reason = 'emergency_stop'`,
-    ).run(at);
+      )
+      .run(at);
   }
 
-  recordAudit(db, {
+  await recordAudit(db, {
     actorUserId: actor.userId,
     actorLabel: actor.label,
     action: 'system.resume',
@@ -304,7 +319,7 @@ export function resume(db: DB, cfg: Config, actor: Actor, options: { clearEmerge
     details: { checks: evaluation.checks, clearedEmergencyStop: options.clearEmergencyStop, previousMode: state.mode },
     ipHash: actor.ipHash ?? null,
   });
-  return { state: getOperatingState(db), evaluation };
+  return { state: await getOperatingState(db), evaluation };
 }
 
 /**
@@ -327,7 +342,7 @@ export function resume(db: DB, cfg: Config, actor: Actor, options: { clearEmerge
  * Switching back to SIMULATION closes any active activation record
  * (`reverted_at`) — simulation is always available and always safe.
  */
-export function setMode(db: DB, cfg: Config, mode: OperatingMode, actor: Actor): OperatingState {
+export async function setMode(db: DB, cfg: Config, mode: OperatingMode, actor: Actor): Promise<OperatingState> {
   if (mode === 'live') {
     const telephony = cfg.providers.find((p) => p.key === 'telephony');
     if (!telephony || telephony.state !== 'configured') {
@@ -344,7 +359,7 @@ export function setMode(db: DB, cfg: Config, mode: OperatingMode, actor: Actor):
     // Phase 11B: the telephony credentials must be VERIFIED via onboarding,
     // not merely present. This is the guardrail that stops a half-configured
     // or rejected credential set from ever reaching a real call.
-    const onboarding = getOnboarding(db, 'telephony');
+    const onboarding = await getOnboarding(db, 'telephony');
     if (onboarding.state !== 'verified') {
       throw new AppError(
         'blocked_by_safeguard',
@@ -355,16 +370,18 @@ export function setMode(db: DB, cfg: Config, mode: OperatingMode, actor: Actor):
   }
 
   const at = nowIso();
-  const current = getOperatingState(db);
+  const current = await getOperatingState(db);
 
   if (mode === 'live' && current.mode !== 'live') {
     // Explicit activation record: which guardrail checks actually passed.
     const activationId = `lact_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
-    const onboarding = getOnboarding(db, 'telephony');
-    db.prepare(
-      `INSERT INTO live_activations (id, activated_at, activated_by, checks_json, detail)
+    const onboarding = await getOnboarding(db, 'telephony');
+    await db
+      .prepare(
+        `INSERT INTO live_activations (id, activated_at, activated_by, checks_json, detail)
        VALUES (?, ?, ?, ?, ?)`,
-    ).run(
+      )
+      .run(
       activationId,
       at,
       actor.userId,
@@ -385,13 +402,15 @@ export function setMode(db: DB, cfg: Config, mode: OperatingMode, actor: Actor):
   if (mode === 'simulation') {
     // Revert: close any active activation record (append-only — rows are
     // never deleted, only stamped).
-    db.prepare(
-      `UPDATE live_activations SET reverted_at = ?, reverted_by = ? WHERE reverted_at IS NULL`,
-    ).run(at, actor.userId);
+    await db
+      .prepare(
+        `UPDATE live_activations SET reverted_at = ?, reverted_by = ? WHERE reverted_at IS NULL`,
+      )
+      .run(at, actor.userId);
   }
 
-  db.prepare('UPDATE operating_state SET mode = ?, updated_at = ? WHERE id = 1').run(mode, at);
-  recordAudit(db, {
+  await db.prepare('UPDATE operating_state SET mode = ?, updated_at = ? WHERE id = 1').run(mode, at);
+  await recordAudit(db, {
     actorUserId: actor.userId,
     actorLabel: actor.label,
     action: mode === 'live' ? 'mode.live_enabled' : 'mode.simulation_enabled',
@@ -404,7 +423,7 @@ export function setMode(db: DB, cfg: Config, mode: OperatingMode, actor: Actor):
     details: { mode },
     ipHash: actor.ipHash ?? null,
   });
-  return getOperatingState(db);
+  return await getOperatingState(db);
 }
 
 export interface LiveActivation {
@@ -418,8 +437,8 @@ export interface LiveActivation {
 }
 
 /** Latest live activation record (active or reverted), for dashboards. */
-export function latestActivation(db: DB): LiveActivation | null {
-  const row = db.prepare('SELECT * FROM live_activations ORDER BY activated_at DESC, id DESC LIMIT 1').get() as
+export async function latestActivation(db: DB): Promise<LiveActivation | null> {
+  const row = (await db.prepare('SELECT * FROM live_activations ORDER BY activated_at DESC, id DESC LIMIT 1').get()) as
     | {
         id: string;
         activated_at: string;
@@ -458,8 +477,8 @@ export interface GuardStateSummary {
   reason: string;
 }
 
-export function summarise(db: DB): GuardStateSummary {
-  const s = getOperatingState(db);
+export async function summarise(db: DB): Promise<GuardStateSummary> {
+  const s = await getOperatingState(db);
   if (s.emergencyStop) {
     return {
       mode: s.mode,

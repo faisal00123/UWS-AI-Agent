@@ -160,8 +160,11 @@ production path).
   is returned in `notMeasured` so the dashboard never implies a full audit.
 - `fetcher.ts` is hardened for attacker-influenced URLs: http/https only, a
   loopback/private/link-local/reserved block applied **after** DNS resolution
-  on every redirect hop, and bounded time/size. Transport and DNS are
-  injectable so tests run with no network while the SSRF guard still fires.
+  on every redirect hop, and bounded time/size — the per-hop timer stays armed
+  through the **body read**, so a server that answers headers and then stalls
+  the stream still fails as `unreachable` instead of hanging the job. Transport
+  and DNS are injectable so tests run with no network while the SSRF guard
+  still fires.
 - A `no_website` result states the whole site is the gap (there is no page to
   audit); an `unreachable`/`blocked` result is recorded as such and is **never**
   converted into "the business has no website".

@@ -24,8 +24,8 @@ export function reviewRoutes(_deps: AppDeps): Router {
     '/candidates',
     requireAuth,
     requireRole('owner'),
-    asyncRoute((_req, res) => {
-      res.json({ candidates: listLiftCandidates(_req.ctx.deps.db) });
+    asyncRoute(async (_req, res) => {
+      res.json({ candidates: await listLiftCandidates(_req.ctx.deps.db) });
     }),
   );
 
@@ -33,8 +33,8 @@ export function reviewRoutes(_deps: AppDeps): Router {
     '/reviews',
     requireAuth,
     requireRole('owner'),
-    asyncRoute((_req, res) => {
-      res.json({ reviews: listSuppressionReviews(_req.ctx.deps.db) });
+    asyncRoute(async (_req, res) => {
+      res.json({ reviews: await listSuppressionReviews(_req.ctx.deps.db) });
     }),
   );
 
@@ -48,7 +48,7 @@ export function reviewRoutes(_deps: AppDeps): Router {
     requireAuth,
     requireRole('owner'),
     requireCsrf,
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const parsed = reviewBody.safeParse(req.body);
       if (!parsed.success) {
         res.status(400).json({
@@ -56,7 +56,7 @@ export function reviewRoutes(_deps: AppDeps): Router {
         });
         return;
       }
-      const review = reviewSuppression(
+      const review = await reviewSuppression(
         req.ctx.deps.db,
         z.string().min(1).parse(req.params['id']),
         parsed.data.decision,

@@ -291,9 +291,9 @@ interface SettingRow {
   updated_at: string;
 }
 
-export function getSetting<T = unknown>(db: DB, key: string, cfg: Config): T {
+export async function getSetting<T = unknown>(db: DB, key: string, cfg: Config): Promise<T> {
   const def = settingDefinition(key);
-  const row = db.prepare('SELECT * FROM settings WHERE key = ?').get(key) as SettingRow | undefined;
+  const row = (await db.prepare('SELECT * FROM settings WHERE key = ?').get(key)) as SettingRow | undefined;
   if (!row) return def.default(cfg) as T;
   try {
     return JSON.parse(row.value_json) as T;
@@ -315,11 +315,10 @@ export interface SettingView {
   sensitive: boolean;
 }
 
-export function getAllSettings(db: DB, cfg: Config): SettingView[] {
-  return SETTING_DEFINITIONS.map((def) => {
-    const row = db.prepare('SELECT * FROM settings WHERE key = ?').get(def.key) as
-      | SettingRow
-      | undefined;
+export async function getAllSettings(db: DB, cfg: Config): Promise<SettingView[]> {
+  const views: SettingView[] = [];
+  for (const def of SETTING_DEFINITIONS) {
+    const row = (await db.prepare('SELECT * FROM settings WHERE key = ?').get(def.key)) as SettingRow | undefined;
     let value: unknown;
     if (row) {
       try {
@@ -330,7 +329,7 @@ export function getAllSettings(db: DB, cfg: Config): SettingView[] {
     } else {
       value = def.default(cfg);
     }
-    return {
+    views.push({
       key: def.key,
       label: def.label,
       description: def.description,
@@ -340,8 +339,9 @@ export function getAllSettings(db: DB, cfg: Config): SettingView[] {
       updatedAt: row?.updated_at ?? null,
       updatedBy: row?.updated_by ?? null,
       sensitive: def.sensitive ?? false,
-    };
-  });
+    });
+  }
+  return views;
 }
 
 export interface SettingsUpdateResult {
@@ -370,12 +370,12 @@ function clampAgainstCeiling(key: string, value: unknown, cfg: Config): unknown 
   return value;
 }
 
-export function updateSettings(
+export async function updateSettings(
   db: DB,
   cfg: Config,
   updates: Record<string, unknown>,
   actor: SettingsActor,
-): SettingsUpdateResult {
+): Promise<SettingsUpdateResult> {
   const result: SettingsUpdateResult = { applied: [], rejected: [], configVersion: '' };
 
   for (const [key, raw] of Object.entries(updates)) {
@@ -403,7 +403,7 @@ export function updateSettings(
       }
     }
 
-    const existing = db.prepare('SELECT value_json, version FROM settings WHERE key = ?').get(key) as
+    const existing = (await db.prepare('SELECT value_json, version FROM settings WHERE key = ?').get(key)) as
       | { value_json: string; version: number }
       | undefined;
 
@@ -412,17 +412,19 @@ export function updateSettings(
       continue; // no-op update: do not bump version or write audit noise
     }
 
-    db.prepare(
-      `INSERT INTO settings (key, value_json, version, updated_by, updated_at)
+    await db
+      .prepare(
+        `INSERT INTO settings (key, value_json, version, updated_by, updated_at)
        VALUES (?, ?, 1, ?, ?)
        ON CONFLICT(key) DO UPDATE SET
          value_json = excluded.value_json,
          version = settings.version + 1,
          updated_by = excluded.updated_by,
          updated_at = excluded.updated_at`,
-    ).run(key, serialized, actor.userId, nowIso());
+      )
+      .run(key, serialized, actor.userId, nowIso());
 
-    recordAudit(db, {
+    await recordAudit(db, {
       actorUserId: actor.userId,
       actorLabel: actor.label,
       action: 'settings.update',
@@ -435,7 +437,7 @@ export function updateSettings(
     result.applied.push(key);
   }
 
-  result.configVersion = configVersion(db);
+  result.configVersion = await configVersion(db);
   return result;
 }
 
@@ -443,20 +445,20 @@ export function updateSettings(
  * Remove a stored override so the compiled-in default applies again. This is
  * the "reset" path used by the dashboard; it is audited like any other change.
  */
-export function resetSetting(
+export async function resetSetting(
   db: DB,
   key: string,
   actor: SettingsActor,
-): { reset: boolean; configVersion: string } {
+): Promise<{ reset: boolean; configVersion: string }> {
   const def = settingDefinition(key); // throws AppError('not_found') for unknown keys
-  const existing = db.prepare('SELECT value_json FROM settings WHERE key = ?').get(key) as
+  const existing = (await db.prepare('SELECT value_json FROM settings WHERE key = ?').get(key)) as
     | { value_json: string }
     | undefined;
   if (!existing) {
-    return { reset: false, configVersion: configVersion(db) };
+    return { reset: false, configVersion: await configVersion(db) };
   }
-  db.prepare('DELETE FROM settings WHERE key = ?').run(key);
-  recordAudit(db, {
+  await db.prepare('DELETE FROM settings WHERE key = ?').run(key);
+  await recordAudit(db, {
     actorUserId: actor.userId,
     actorLabel: actor.label,
     action: 'settings.reset',
@@ -466,12 +468,12 @@ export function resetSetting(
     details: { key, previous: JSON.parse(existing.value_json) },
     ipHash: actor.ipHash ?? null,
   });
-  return { reset: true, configVersion: configVersion(db) };
+  return { reset: true, configVersion: await configVersion(db) };
 }
 
 /** Deterministic fingerprint of the current configuration (used in approvals). */
-export function configVersion(db: DB): string {
-  const rows = db.prepare('SELECT key, version FROM settings ORDER BY key').all() as {
+export async function configVersion(db: DB): Promise<string> {
+  const rows = (await db.prepare('SELECT key, version FROM settings ORDER BY key').all()) as {
     key: string;
     version: number;
   }[];

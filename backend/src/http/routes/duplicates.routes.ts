@@ -18,7 +18,7 @@ export function duplicateRoutes(deps: AppDeps): Router {
 
   router.get(
     '/',
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const q = z
         .object({
           status: z.enum(['pending', 'merged', 'rejected', 'reviewed_not_duplicate']).optional(),
@@ -28,11 +28,11 @@ export function duplicateRoutes(deps: AppDeps): Router {
         .parse(req.query);
       const status = q.status ?? 'pending';
       const total = (
-        req.ctx.deps.db.prepare('SELECT COUNT(*) c FROM duplicate_candidates WHERE status = ?').get(status) as {
+        (await req.ctx.deps.db.prepare('SELECT COUNT(*) c FROM duplicate_candidates WHERE status = ?').get(status)) as {
           c: number;
         }
       ).c;
-      const rows = req.ctx.deps.db
+      const rows = (await req.ctx.deps.db
         .prepare(
           `SELECT d.*,
                   a.display_name AS name_a, a.merged_into_id AS merged_a, a.discovered_at AS discovered_a,
@@ -44,7 +44,7 @@ export function duplicateRoutes(deps: AppDeps): Router {
             ORDER BY d.match_score DESC, d.created_at ASC
             LIMIT ? OFFSET ?`,
         )
-        .all(status, q.pageSize, (q.page - 1) * q.pageSize) as unknown as Record<string, unknown>[];
+        .all(status, q.pageSize, (q.page - 1) * q.pageSize)) as Record<string, unknown>[];
       res.json({ items: rows, total, page: q.page, pageSize: q.pageSize });
     }),
   );
@@ -53,7 +53,7 @@ export function duplicateRoutes(deps: AppDeps): Router {
     '/:id/decision',
     requireCsrf,
     requireRole('owner', 'staff'),
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const id = z.string().min(1).parse(req.params.id);
       const body = z
         .object({
@@ -62,12 +62,12 @@ export function duplicateRoutes(deps: AppDeps): Router {
         })
         .parse(req.body);
 
-      const row = req.ctx.deps.db.prepare('SELECT id FROM duplicate_candidates WHERE id = ?').get(id);
+      const row = await req.ctx.deps.db.prepare('SELECT id FROM duplicate_candidates WHERE id = ?').get(id);
       if (!row) throw notFound('Duplicate candidate');
 
       let result: { survivorId: string; mergedId: string | null };
       try {
-        result = resolveDuplicate(
+        result = await resolveDuplicate(
           req.ctx.deps.db,
           id,
           body.decision,

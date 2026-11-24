@@ -1,0 +1,110 @@
+/**
+ * Phase 10: `npm run doctor` as the owner actually runs it â?" as a real
+ * subprocess, with a strict environment.
+ *
+ * Proves:
+ *  - a healthy install exits 0 and reports migrations up to date;
+ *  - SESSION_SECRET (and every other secret) is NEVER printed â?" only
+ *    "provided"/"not set" style statements;
+ *  - DISCOVERY_PROVIDER=osm_local with a missing dataset is a WARN line
+ *    (a pending owner extraction step), NOT a failure: exit code stays 0;
+ *  - the dataset line only appears when the provider is osm_local;
+ *  - the child gets a WHITELISTED environment and is spawned WITHOUT the
+ *    `--env-file` flag, so this test never reads the developer's `.env`.
+ */
+import { test, describe, before, after } from 'node:test';
+import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { openDatabase } from '../../src/db/index.ts';
+import { runMigrations } from '../../src/db/migrate.ts';
+
+const backendDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+
+/** Recognisable sentinel: if doctor ever printed config values, this appears. */
+const SECRET = 'doctor-secret-probe'.padEnd(48, '0');
+
+let workDir: string;
+let dbPath: string;
+
+function runDoctor(extraEnv: Record<string, string>): { status: number | null; stdout: string; stderr: string } {
+  // WHITELIST only â?" the parent's provider keys, API tokens and secrets are
+  // deliberately not forwarded, and there is no --env-file flag, so `.env`
+  // is never opened by the child.
+  const env: Record<string, string | undefined> = {
+    PATH: process.env['PATH'],
+    SYSTEMROOT: process.env['SYSTEMROOT'],
+    WINDIR: process.env['WINDIR'],
+    COMSPEC: process.env['COMSPEC'],
+    TEMP: process.env['TEMP'],
+    TMP: process.env['TMP'],
+    NODE_ENV: 'test',
+    DATABASE_PATH: dbPath,
+    SESSION_SECRET: SECRET,
+    LOG_LEVEL: 'silent',
+    ...extraEnv,
+  };
+  const res = spawnSync(process.execPath, ['--disable-warning=ExperimentalWarning', 'src/cli/doctor.ts'], {
+    cwd: backendDir,
+    env,
+    encoding: 'utf8',
+    timeout: 60_000,
+  });
+  return { status: res.status, stdout: res.stdout ?? '', stderr: res.stderr ?? '' };
+}
+
+describe('Phase 10: doctor CLI', () => {
+  before(() => {
+    workDir = mkdtempSync(path.join(tmpdir(), 'uws-doctor-'));
+    dbPath = path.join(workDir, 'doctor.db');
+    // Migrate the temp database first so "pending migrations" cannot skew
+    // the exit code of an otherwise healthy install.
+    const db = openDatabase(dbPath);
+    await runMigrations(db);
+    db.close();
+  });
+  after(() => {
+    rmSync(workDir, { recursive: true, force: true });
+  });
+
+  test('healthy install exits 0 and never prints the session secret', () => {
+    const res = runDoctor({});
+    assert.equal(res.status, 0, `doctor must exit 0 (stderr: ${res.stderr})`);
+    assert.match(res.stdout, /UWS AI Sales Agent - doctor/);
+    assert.match(res.stdout, /\[ OK \] migrations up to date/);
+    assert.match(res.stdout, /\[ OK \] SESSION_SECRET provided/, 'presence is reported, not the value');
+    assert.ok(!res.stdout.includes(SECRET), 'the secret value must never be printed');
+    assert.ok(!res.stderr.includes(SECRET), 'nor on stderr');
+    // Without DISCOVERY_PROVIDER=osm_local the dataset line is not shown at all.
+    assert.ok(!res.stdout.includes('local OSM dataset'), 'dataset line is gated on the provider');
+  });
+
+  test('osm_local with a missing dataset WARNs but still exits 0', () => {
+    const res = runDoctor({
+      DISCOVERY_PROVIDER: 'osm_local',
+      OSM_LOCAL_DATASET: path.join(workDir, 'no-such-dataset.ndjson'),
+    });
+    assert.equal(res.status, 0, `warn-only must not fail the exit code (stderr: ${res.stderr})`);
+    assert.match(
+      res.stdout,
+      /\[WARN\] local OSM dataset: /,
+      'the owner is told the extraction step is pending',
+    );
+    assert.ok(!res.stdout.includes('[FAIL] local OSM dataset'), 'a pending extraction is not a broken install');
+    assert.ok(!res.stdout.includes(SECRET), 'still no secret material');
+  });
+
+  test('osm_local with an existing dataset reports OK', () => {
+    const dataset = path.join(workDir, 'dataset.ndjson');
+    // Any non-empty file at the path passes doctor's availability check
+    // (existence + size; content is the adapter's business, not doctor's).
+    writeFileSync(dataset, '{}\n');
+    const res = runDoctor({ DISCOVERY_PROVIDER: 'osm_local', OSM_LOCAL_DATASET: dataset });
+    assert.equal(res.status, 0, `stderr: ${res.stderr}`);
+    assert.match(res.stdout, /\[ OK \] local OSM dataset: /);
+  });
+});
+

@@ -112,24 +112,24 @@ export function bandFor(score: number): ScoreResult['band'] {
  * Compute a fresh score. Pure with respect to the DB: reads the lead, its
  * latest website analysis and any recorded interactions, then scores.
  */
-export function computeScore(db: DB, cfg: Config, input: EvidenceInput): ScoreResult {
-  const weights = getSetting<ScoringWeights>(db, 'scoring_weights', cfg);
-  const lead = db
+export async function computeScore(db: DB, cfg: Config, input: EvidenceInput): Promise<ScoreResult> {
+  const weights = await getSetting<ScoringWeights>(db, 'scoring_weights', cfg);
+  const lead = (await db
     .prepare(
       `SELECT eligibility_state, budget_minor, budget_state, timeline, interest_level,
               phone_e164, email, whatsapp_e164, website_url, website_host
          FROM businesses WHERE id = ?`,
     )
-    .get(input.businessId) as LeadRow | undefined;
+    .get(input.businessId)) as LeadRow | undefined;
   if (!lead) throw new Error(`computeScore: lead ${input.businessId} not found`);
 
-  const analysis = db
-    .prepare(`SELECT status, opportunities_json FROM website_analyses WHERE business_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1`)
-    .get(input.businessId) as AnalysisRow | undefined;
+  const analysis = (await db
+    .prepare(`SELECT status, opportunities_json FROM website_analyses WHERE business_id = ? ORDER BY created_at DESC, id DESC LIMIT 1`)
+    .get(input.businessId)) as AnalysisRow | undefined;
 
-  const interactions = db
+  const interactions = (await db
     .prepare(`SELECT COUNT(*) c FROM interactions WHERE business_id = ?`)
-    .get(input.businessId) as { c: number };
+    .get(input.businessId)) as { c: number };
 
   const opportunities: { code: string }[] = analysis ? safeParse(analysis.opportunities_json, []) : [];
 
@@ -420,32 +420,37 @@ export interface PersistedScore extends ScoreResult {
 }
 
 /** Compute and persist a score, writing one row per factor. */
-export function recordScore(db: DB, cfg: Config, input: EvidenceInput): PersistedScore {
-  const result = computeScore(db, cfg, input);
+export async function recordScore(db: DB, cfg: Config, input: EvidenceInput): Promise<PersistedScore> {
+  const result = await computeScore(db, cfg, input);
   const id = newId('scr');
   const inputsSnapshot = {
     businessId: input.businessId,
     modelVersion: result.modelVersion,
-    weights: getSetting<ScoringWeights>(db, 'scoring_weights', cfg),
+    weights: await getSetting<ScoringWeights>(db, 'scoring_weights', cfg),
   };
 
-  db.prepare(
-    `INSERT INTO lead_scores (id, business_id, score, band, model_version, inputs_json, summary, computed_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(id, input.businessId, result.score, result.band, result.modelVersion, JSON.stringify(inputsSnapshot), result.summary, result.computedAt);
+  await db
+    .prepare(
+      `INSERT INTO lead_scores (id, business_id, score, band, model_version, inputs_json, summary, computed_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(id, input.businessId, result.score, result.band, result.modelVersion, JSON.stringify(inputsSnapshot), result.summary, result.computedAt);
 
-  const insertFactor = db.prepare(
-    `INSERT INTO score_factors (score_id, code, label, weight, points, raw_value, state, evidence)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  );
   for (const f of result.factors) {
-    insertFactor.run(id, f.code, f.label, f.weight, f.points, f.rawValue, f.state, f.evidence);
+    await db
+      .prepare(
+        `INSERT INTO score_factors (score_id, code, label, weight, points, raw_value, state, evidence)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(id, f.code, f.label, f.weight, f.points, f.rawValue, f.state, f.evidence);
   }
 
   // Project the current score onto the lead row for cheap listing/sorting.
-  db.prepare(
-    `UPDATE businesses SET score = ?, score_band = ?, score_updated_at = ?, updated_at = ? WHERE id = ?`,
-  ).run(result.score, result.band, result.computedAt, result.computedAt, input.businessId);
+  await db
+    .prepare(
+      `UPDATE businesses SET score = ?, score_band = ?, score_updated_at = ?, updated_at = ? WHERE id = ?`,
+    )
+    .run(result.score, result.band, result.computedAt, result.computedAt, input.businessId);
 
   return { ...result, id, businessId: input.businessId };
 }
@@ -457,17 +462,17 @@ export interface StoredScore extends ScoreResult {
 }
 
 /** Latest persisted score with its factors, or null. */
-export function latestScore(db: DB, businessId: string): StoredScore | null {
-  const row = db
-    .prepare(`SELECT id, business_id, score, band, model_version, summary, computed_at FROM lead_scores WHERE business_id = ? ORDER BY computed_at DESC, rowid DESC LIMIT 1`)
-    .get(businessId) as
+export async function latestScore(db: DB, businessId: string): Promise<StoredScore | null> {
+  const row = (await db
+    .prepare(`SELECT id, business_id, score, band, model_version, summary, computed_at FROM lead_scores WHERE business_id = ? ORDER BY computed_at DESC, id DESC LIMIT 1`)
+    .get(businessId)) as
     | { id: string; business_id: string; score: number; band: ScoreResult['band']; model_version: string; summary: string; computed_at: string }
     | undefined;
   if (!row) return null;
 
-  const factorRows = db
+  const factorRows = (await db
     .prepare(`SELECT code, label, weight, points, raw_value, state, evidence FROM score_factors WHERE score_id = ? ORDER BY id`)
-    .all(row.id) as unknown as {
+    .all(row.id)) as {
     code: string;
     label: string;
     weight: number;

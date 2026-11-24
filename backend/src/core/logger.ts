@@ -16,8 +16,75 @@ const ORDER: Record<LogLevel, number> = {
 
 const SECRET_KEY_RE =
   /(password|passwd|secret|token|api[_-]?key|authorization|cookie|csrf|passphrase|sid|session)/i;
-const EMAIL_RE = /[\w.+-]+@[\w-]+\.[\w.-]+/g;
 const PHONE_RE = /(?:\+?\d[\d\s()-]{7,}\d)/g;
+
+// Character classes for the LINEAR email masker below (same `\w` semantics
+// as the quadratic regex these replace — `\w` is ASCII word chars).
+const EMAIL_LOCAL_CH = /[\w.+-]/;
+const EMAIL_LABEL_CH = /[\w-]/;
+const EMAIL_TAIL_CH = /[\w.-]/;
+
+// --- value-side rules for free-text fields (error/message/detail) that do
+// --- NOT match SECRET_KEY_RE. All patterns are single-pass class repeats
+// --- (linear): they must never become a ReDoS vector themselves.
+
+/** `Bearer <token>` anywhere in free text. */
+const BEARER_RE = /\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi;
+/** Well-known provider key shapes (OpenAI/Google/GitHub/Slack). */
+const PROVIDER_KEY_RE =
+  /(?:\bsk|pk|rk)-(?:proj-)?[A-Za-z0-9_-]{16,}|\bAIza[0-9A-Za-z_-]{20,}|\bgh[pousr]_[A-Za-z0-9]{20,}|\bxox[baprs]-[A-Za-z0-9-]{10,}/g;
+/**
+ * `key=value` / `key: value` pairs inside free text whose key looks
+ * sensitive. The leading `\b` is deliberately absent so `access_token=…`
+ * matches (the separator requirement keeps `tokenizer=…` from matching).
+ */
+const KV_SECRET_RE =
+  /(api[_-]?key|apikey|secret|token|password|passwd|passphrase|authorization|private[_-]?key|access[_-]?key|session[_-]?id|sid)(["']?\s*[:=]\s*["']?)([^\s"',;&)}\]]{6,})/gi;
+
+/**
+ * Linear replacement for the old `/[\w.+-]+@[\w-]+\.[\w.-]+/g`.
+ *
+ * That pattern was QUADRATIC on adversarial input: a long unbroken word run
+ * followed by `@` made every start position re-backtrack the whole run
+ * (measured: 100 K chars ≈ 16.6 s), and the logger redacts the request PATH
+ * on every 404/error — an unauthenticated caller could burn CPU per request.
+ *
+ * The pattern can only ever match AT an `@`, so anchoring there and walking
+ * outwards visits each character a constant number of times — O(n).
+ * Match boundaries reproduce the old engine: maximal local run left of the
+ * `@`, a non-empty `[\w-]` label right of it, a `.`, then a non-empty
+ * `[\w.-]` tail.
+ */
+function maskEmails(s: string): string {
+  let out = '';
+  let copied = 0;
+  let at = s.indexOf('@');
+  while (at !== -1) {
+    let start = at;
+    while (start > 0 && EMAIL_LOCAL_CH.test(s[start - 1]!)) start--;
+    let label = at + 1;
+    while (label < s.length && EMAIL_LABEL_CH.test(s[label]!)) label++;
+    if (label > at + 1 && label < s.length && s[label] === '.') {
+      let tail = label + 1;
+      while (tail < s.length && EMAIL_TAIL_CH.test(s[tail]!)) tail++;
+      if (tail > label + 1) {
+        // The old engine scanned from the END of the previous match, so a
+        // local run reaching back past it is clamped to that boundary —
+        // reproduces the old match exactly while never re-emitting
+        // already-consumed text.
+        const from = Math.max(start, copied);
+        if (from < at) {
+          out += s.slice(copied, from) + '[email]';
+          copied = tail;
+          at = s.indexOf('@', tail);
+          continue;
+        }
+      }
+    }
+    at = s.indexOf('@', at + 1);
+  }
+  return out + s.slice(copied);
+}
 
 export function redactValue(key: string, value: unknown, enabled: boolean): unknown {
   if (!enabled) return value;
@@ -29,7 +96,13 @@ export function redactValue(key: string, value: unknown, enabled: boolean): unkn
 }
 
 export function redactString(s: string): string {
-  return s.replace(EMAIL_RE, '[email]').replace(PHONE_RE, (m) => {
+  // Secrets first (most specific), then PII. Every step is linear-time.
+  return maskEmails(
+    s
+      .replace(BEARER_RE, 'Bearer [redacted]')
+      .replace(PROVIDER_KEY_RE, '[redacted]')
+      .replace(KV_SECRET_RE, (_m, k: string, sep: string) => `${k}${sep}[redacted]`),
+  ).replace(PHONE_RE, (m) => {
     const digits = m.replace(/\D/g, '');
     if (digits.length < 8) return m;
     return `${'*'.repeat(Math.max(0, digits.length - 4))}${digits.slice(-4)}`;

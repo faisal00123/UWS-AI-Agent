@@ -61,8 +61,8 @@ interface CandidateRow {
  * This is a REVIEW QUEUE, not an automatic lift — the caller must still run
  * `reviewSuppression` with an owner decision.
  */
-export function listLiftCandidates(db: DB): LiftCandidate[] {
-  const rows = db
+export async function listLiftCandidates(db: DB): Promise<LiftCandidate[]> {
+  const rows = (await db
     .prepare(
       `SELECT s.id                AS suppression_id,
               s.business_id       AS business_id,
@@ -86,7 +86,7 @@ export function listLiftCandidates(db: DB): LiftCandidate[] {
         ORDER BY i.occurred_at DESC
         LIMIT 200`,
     )
-    .all() as unknown as CandidateRow[];
+    .all()) as CandidateRow[];
 
   return rows.map((r) => ({
     suppressionId: r.suppression_id,
@@ -123,13 +123,13 @@ export interface SuppressionReview {
  *
  * Owner-only; the reason is mandatory. Audited either way.
  */
-export function reviewSuppression(
+export async function reviewSuppression(
   db: DB,
   suppressionId: string,
   decision: ReviewDecision,
   reason: string,
   actor: Actor,
-): SuppressionReview {
+): Promise<SuppressionReview> {
   if (actor.label !== 'owner') {
     throw new AppError('forbidden', 'Only the owner may review suppression lift requests');
   }
@@ -141,9 +141,9 @@ export function reviewSuppression(
     throw new AppError('validation_failed', `Unknown review decision: ${String(decision)}`);
   }
 
-  const row = db
+  const row = (await db
     .prepare('SELECT id, business_id, lifted_at FROM suppression_list WHERE id = ?')
-    .get(suppressionId) as { id: string; business_id: string | null; lifted_at: string | null } | undefined;
+    .get(suppressionId)) as { id: string; business_id: string | null; lifted_at: string | null } | undefined;
   if (!row) throw new AppError('not_found', 'Suppression not found');
   if (row.lifted_at) {
     throw new AppError('conflict', 'This suppression has already been reviewed and lifted');
@@ -152,21 +152,25 @@ export function reviewSuppression(
   const at = nowIso();
   const reviewId = `srev_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
 
-  tx(db, () => {
+  await tx(db, async () => {
     if (decision === 'lifted') {
-      db.prepare(
-        `UPDATE suppression_list
-            SET lifted_at = ?, lifted_by = ?, lifted_reason = ?
-          WHERE id = ? AND lifted_at IS NULL`,
-      ).run(at, actor.userId, trimmed, suppressionId);
+      await db
+        .prepare(
+          `UPDATE suppression_list
+              SET lifted_at = ?, lifted_by = ?, lifted_reason = ?
+            WHERE id = ? AND lifted_at IS NULL`,
+        )
+        .run(at, actor.userId, trimmed, suppressionId);
     }
-    db.prepare(
-      `INSERT INTO suppression_reviews (id, suppression_id, business_id, decision, reason, reviewed_by, reviewed_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    ).run(reviewId, suppressionId, row.business_id, decision, trimmed, actor.userId, at);
+    await db
+      .prepare(
+        `INSERT INTO suppression_reviews (id, suppression_id, business_id, decision, reason, reviewed_by, reviewed_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(reviewId, suppressionId, row.business_id, decision, trimmed, actor.userId, at);
   });
 
-  recordAudit(db, {
+  await recordAudit(db, {
     actorUserId: actor.userId,
     actorLabel: actor.label,
     action: decision === 'lifted' ? 'suppression.lifted' : 'suppression.kept',
@@ -191,15 +195,15 @@ export function reviewSuppression(
 }
 
 /** Review history (newest first) for the dashboard / audit views. */
-export function listSuppressionReviews(db: DB, limit = 50): SuppressionReview[] {
-  const rows = db
+export async function listSuppressionReviews(db: DB, limit = 50): Promise<SuppressionReview[]> {
+  const rows = (await db
     .prepare(
       `SELECT id, suppression_id, business_id, decision, reason, reviewed_by, reviewed_at
          FROM suppression_reviews
         ORDER BY reviewed_at DESC
         LIMIT ?`,
     )
-    .all(Math.max(1, Math.min(500, limit))) as unknown as {
+    .all(Math.max(1, Math.min(500, limit)))) as {
     id: string;
     suppression_id: string;
     business_id: string | null;

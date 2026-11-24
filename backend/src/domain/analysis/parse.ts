@@ -100,32 +100,195 @@ function attr(tag: string, name: string): string | null {
   return decodeEntities(v).trim();
 }
 
-/** All `<tag ...>` occurrences, returned as raw tag strings. */
+// ------------------------------------------------------------- linear scans ---
+// The regexes these helpers replace were O(n²) on adversarial markup: a run of
+// lone `<` made `<[^>]+>` take ~5 s at 64 K chars (~45 min at the 1.5 MB fetch
+// cap), and unclosed `<script` / `<nav` / `<a` runs made the lazy `[\s\S]*?`
+// patterns rescan the tail from every opening position. Each helper below is a
+// single forward pass that never re-scans a suffix.
+
+/** ASCII case fold of one UTF-16 code unit (what the old `/i` flags did). */
+function fold(c: number): number {
+  return c >= 0x41 && c <= 0x5a ? c + 0x20 : c;
+}
+
+/** Word character per `\w` — the class behind the old `\b` boundaries. */
+function isWordCh(ch: string | undefined): boolean {
+  return ch !== undefined && /[A-Za-z0-9_]/.test(ch);
+}
+
+/** Whitespace per `\s` — the old `\s*` inside close tags. */
+function isWsCh(ch: string | undefined): boolean {
+  return ch !== undefined && /\s/.test(ch);
+}
+
+/** Case-insensitive `indexOf` over ASCII (the `/i` of the old patterns). */
+function indexOfCI(hay: string, needle: string, from: number): number {
+  const m = needle.length;
+  outer: for (let i = from; i + m <= hay.length; i++) {
+    for (let k = 0; k < m; k++) {
+      if (fold(hay.charCodeAt(i + k)) !== fold(needle.charCodeAt(k))) continue outer;
+    }
+    return i;
+  }
+  return -1;
+}
+
+/**
+ * Index of the next `<tag` opening that satisfies the old `\b` after the tag
+ * name (so `<area>` is not an `<a>`), ASCII case-insensitive; -1 if none.
+ */
+function findTagOpen(html: string, tag: string, from: number): number {
+  let i = from;
+  for (;;) {
+    const lt = indexOfCI(html, `<${tag}`, i);
+    if (lt === -1) return -1;
+    if (!isWordCh(html[lt + 1 + tag.length])) return lt;
+    i = lt + 1;
+  }
+}
+
+/**
+ * First close pattern at or after `from`, as start/end index, or null.
+ *  - `wsThenGt`: `</tag` + optional whitespace + `>` (the old `<\/tag\s*>`);
+ *  - otherwise: the literal `close` itself (the comment's `-->`).
+ */
+function findClose(
+  s: string,
+  close: string,
+  from: number,
+  wsThenGt: boolean,
+): { start: number; end: number } | null {
+  let i = from;
+  for (;;) {
+    const at = indexOfCI(s, close, i);
+    if (at === -1) return null;
+    if (!wsThenGt) return { start: at, end: at + close.length };
+    let p = at + close.length;
+    while (isWsCh(s[p])) p++;
+    if (s[p] === '>') return { start: at, end: p + 1 };
+    i = at + 1;
+  }
+}
+
+/** All `<tag ...>` occurrences, as raw tag strings (old `<tag\b([^>]*)>`). */
 function tags(html: string, tag: string): string[] {
-  const re = new RegExp(`<${tag}\\b([^>]*)>`, 'gi');
   const out: string[] = [];
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(html)) !== null) out.push(m[0]);
+  let from = 0;
+  for (;;) {
+    const lt = findTagOpen(html, tag, from);
+    if (lt === -1) break;
+    const gt = html.indexOf('>', lt + 1 + tag.length);
+    // No `>` anywhere ahead — no later `<tag` can end either, so stop.
+    if (gt === -1) break;
+    out.push(html.slice(lt, gt + 1));
+    from = gt + 1;
+  }
   return out;
 }
 
 /** Full `<tag ...>inner</tag>` blocks (opening tag + inner markup). */
 function blocks(html: string, tag: string): string[] {
-  const re = new RegExp(`<${tag}\\b[^>]*>[\\s\\S]*?<\\/${tag}\\s*>`, 'gi');
-  return html.match(re) ?? [];
+  const out: string[] = [];
+  let from = 0;
+  for (;;) {
+    const lt = findTagOpen(html, tag, from);
+    if (lt === -1) break;
+    const openEnd = html.indexOf('>', lt + 1 + tag.length);
+    if (openEnd === -1) break;
+    const close = findClose(html, `</${tag}`, openEnd + 1, true);
+    // Opening tags only move forward, so a missing close here means no later
+    // block could find one either — stop instead of rescanning the tail.
+    if (close === null) break;
+    out.push(html.slice(lt, close.end));
+    from = close.end;
+  }
+  return out;
 }
 
 /** Inner text of `<tag ...>text</tag>`, tolerating nesting-free content. */
 function innerText(html: string, tag: string): string | null {
-  const re = new RegExp(`<${tag}\\b[^>]*>([\\s\\S]*?)<\\/${tag}\\s*>`, 'i');
-  const m = re.exec(html);
-  if (!m) return null;
-  const raw = (m[1] ?? '')
-    .replace(/<script\b[\s\S]*?<\/script\s*>/gi, ' ')
-    .replace(/<style\b[\s\S]*?<\/style\s*>/gi, ' ')
-    .replace(/<!--[\s\S]*?-->/g, ' ')
-    .replace(/<[^>]+>/g, ' ');
+  const lt = findTagOpen(html, tag, 0);
+  if (lt === -1) return null;
+  const openEnd = html.indexOf('>', lt + 1 + tag.length);
+  if (openEnd === -1) return null;
+  const close = findClose(html, `</${tag}`, openEnd + 1, true);
+  if (close === null) return null;
+  const raw = stripInnerNoise(html.slice(openEnd + 1, close.start));
   return collapseWs(decodeEntities(raw)) || null;
+}
+
+/**
+ * Clean inner markup the way the old `innerText` did: script blocks, style
+ * blocks, comments, then any remaining tags — each replaced by one space.
+ */
+function stripInnerNoise(raw: string): string {
+  const noScript = stripBlocks(raw, '<script', '</script', true);
+  const noStyle = stripBlocks(noScript, '<style', '</style', true);
+  const noComment = stripBlocks(noStyle, '<!--', '-->', false);
+  return stripTagRuns(noComment);
+}
+
+/**
+ * Linear equivalent of `.replace(new RegExp(open + '[\\s\\S]*?' + close, 'gi'),
+ * ' ')` — used for `<script>`, `<style>` and `<!-- … -->`.
+ *
+ * Semantics preserved exactly:
+ *  - the close pattern is the FIRST one at or after the open, which is what
+ *    the lazy `[\s\S]*?` selected;
+ *  - `\b` applies when the open ends in a word character (`<script\b`,
+ *    `<style\b`); `<!--` ends in `-`, so — as in the old pattern — it does not;
+ *  - when no close exists ahead, nothing further is replaced and no later open
+ *    can match either (a later position only searches a suffix of the same
+ *    range), so we stop instead of retrying from every open — that retry is
+ *    exactly where the O(n²) came from.
+ */
+function stripBlocks(s: string, open: string, close: string, wsThenGt: boolean): string {
+  let out = '';
+  let from = 0; // end of the last emitted region
+  let search = 0; // next position to look for an open
+  for (;;) {
+    const st = indexOfCI(s, open, search);
+    if (st === -1) break;
+    if (isWordCh(open[open.length - 1]) && isWordCh(s[st + open.length])) {
+      search = st + 1; // e.g. `<scripty` is not `<script\b`
+      continue;
+    }
+    const c = findClose(s, close, st + open.length, wsThenGt);
+    if (c === null) break;
+    out += s.slice(from, st) + ' ';
+    from = c.end;
+    search = c.end;
+  }
+  return out + s.slice(from);
+}
+
+/**
+ * Linear equivalent of `.replace(/<[^>]+>/g, ' ')`.
+ *
+ * A `<` with no `>` anywhere ahead can never match — and neither can any later
+ * `<`, since it would search a suffix of the same range — so the scan stops;
+ * the old engine instead retried from every `<`, which is where the O(n²) on a
+ * run of lone `<` came from.
+ */
+function stripTagRuns(s: string): string {
+  let out = '';
+  let from = 0;
+  let search = 0;
+  for (;;) {
+    const lt = s.indexOf('<', search);
+    if (lt === -1) break;
+    const gt = s.indexOf('>', lt + 1);
+    if (gt === -1) break;
+    if (gt === lt + 1) {
+      search = lt + 1; // `<>`: `[^>]+` needs at least one character
+      continue;
+    }
+    out += s.slice(from, lt) + ' ';
+    from = gt + 1;
+    search = gt + 1;
+  }
+  return out + s.slice(from);
 }
 
 function absolutize(href: string, base: URL): { path: string; host: string } | null {
@@ -211,7 +374,7 @@ export function analyzeHtml(html: string, baseUrl: string): {
     const source = navBlocks.length > 0 ? navBlocks.join(' ') : null;
     if (source === null) {
       const asMenu = anchors.filter((a) => /menu|nav/i.test(attr(a, 'class') ?? '') || /menu|nav/i.test(attr(a, 'id') ?? ''));
-      const texts = asMenu.map((a) => collapseWs(a.replace(/<[^>]+>/g, ' '))).filter((t) => t !== '' && t.length <= 40);
+      const texts = asMenu.map((a) => collapseWs(stripTagRuns(a))).filter((t) => t !== '' && t.length <= 40);
       return [...new Set(texts)].slice(0, 20);
     }
     const texts = source
@@ -219,7 +382,7 @@ export function analyzeHtml(html: string, baseUrl: string): {
       .slice(1)
       .map((chunk) => {
         const inner = chunk.replace(/^[^>]*>/, '').replace(/<[\s\S]*$/, ' ');
-        return collapseWs(decodeEntities(inner.replace(/<[^>]+>/g, ' ')));
+        return collapseWs(decodeEntities(stripTagRuns(inner)));
       })
       .filter((t) => t !== '' && t.length <= 40);
     return [...new Set(texts)].slice(0, 20);

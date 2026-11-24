@@ -514,7 +514,7 @@ export async function renderSystem(root, ctx) {
         <div class="hint">up ${esc(Math.round(sys.uptimeSeconds ?? 0))}s</div></div>
       <div class="stat"><div class="label">Database</div>
         <div class="value sm">${sys.database?.ok ? 'OK' : 'Error'}</div>
-        <div class="hint">${esc(sys.database?.path ?? '')}</div></div>
+        <div class="hint">${esc(sys.database?.path ?? 'path hidden (owner only)')}</div></div>
       <div class="stat"><div class="label">Mode</div>
         <div class="value sm">${esc(titleCase(sys.operatingState?.mode ?? 'unknown'))}</div>
         <div class="hint">${sys.summary?.reason ? esc(sys.summary.reason) : ''}</div></div>

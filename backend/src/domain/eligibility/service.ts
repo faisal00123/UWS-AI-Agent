@@ -69,13 +69,13 @@ interface SuppressionRow {
  * (an interaction of kind 'consent', or an owner override). Absence of such a
  * record means consent is UNKNOWN, which blocks outreach.
  */
-function consentCheck(db: DB, businessId: string, channel: Channel): SubCheck {
-  const row = db
+async function consentCheck(db: DB, businessId: string, channel: Channel): Promise<SubCheck> {
+  const row = (await db
     .prepare(
       `SELECT COUNT(*) c FROM interactions
         WHERE business_id = ? AND kind = 'consent'`,
     )
-    .get(businessId) as { c: number };
+    .get(businessId)) as { c: number };
 
   if (row.c > 0) {
     return {
@@ -96,12 +96,12 @@ function consentCheck(db: DB, businessId: string, channel: Channel): SubCheck {
 }
 
 /** Opt-out / do-not-contact, which always wins over every other signal. */
-function suppressionCheck(db: DB, businessId: string, channel: Channel): SubCheck {
-  const lead = db
+async function suppressionCheck(db: DB, businessId: string, channel: Channel): Promise<SubCheck> {
+  const lead = (await db
     .prepare('SELECT phone_e164, whatsapp_e164, email FROM businesses WHERE id = ?')
-    .get(businessId) as { phone_e164: string | null; whatsapp_e164: string | null; email: string | null } | undefined;
+    .get(businessId)) as { phone_e164: string | null; whatsapp_e164: string | null; email: string | null } | undefined;
 
-  const rows = db
+  const rows = (await db
     .prepare(
       `SELECT id, scope, reason, permanent, evidence FROM suppression_list
         WHERE lifted_at IS NULL
@@ -110,7 +110,7 @@ function suppressionCheck(db: DB, businessId: string, channel: Channel): SubChec
            OR (whatsapp_e164 IS NOT NULL AND whatsapp_e164 = ?)
            OR (email IS NOT NULL AND email = ?))`,
     )
-    .all(businessId, lead?.phone_e164 ?? null, lead?.whatsapp_e164 ?? null, lead?.email ?? null) as unknown as SuppressionRow[];
+    .all(businessId, lead?.phone_e164 ?? null, lead?.whatsapp_e164 ?? null, lead?.email ?? null)) as SuppressionRow[];
 
   if (rows.length === 0) {
     return {
@@ -157,8 +157,8 @@ function channelAddressCheck(lead: LeadRow, channel: Channel): SubCheck {
 }
 
 /** The owner must have switched the channel on AND a provider must exist. */
-function channelEnabledCheck(db: DB, cfg: Config, channel: Channel): SubCheck {
-  const enabled = getSetting<{ call: boolean; whatsappMessage: boolean; whatsappCall: boolean; email: boolean }>(
+async function channelEnabledCheck(db: DB, cfg: Config, channel: Channel): Promise<SubCheck> {
+  const enabled = await getSetting<{ call: boolean; whatsappMessage: boolean; whatsappCall: boolean; email: boolean }>(
     db,
     'eligible_channels',
     cfg,
@@ -179,10 +179,15 @@ function channelEnabledCheck(db: DB, cfg: Config, channel: Channel): SubCheck {
  * Evaluate eligibility for one lead on one channel. Never throws for a normal
  * "not eligible" outcome - that is a first-class result.
  */
-export function evaluateEligibility(db: DB, cfg: Config, businessId: string, channel: Channel): EligibilityDecision {
-  const lead = db
+export async function evaluateEligibility(
+  db: DB,
+  cfg: Config,
+  businessId: string,
+  channel: Channel,
+): Promise<EligibilityDecision> {
+  const lead = (await db
     .prepare('SELECT id, eligibility_state, phone_e164, whatsapp_e164, email, merged_into_id FROM businesses WHERE id = ?')
-    .get(businessId) as LeadRow | undefined;
+    .get(businessId)) as LeadRow | undefined;
 
   const checks: SubCheck[] = [];
   const at = nowIso();
@@ -210,10 +215,10 @@ export function evaluateEligibility(db: DB, cfg: Config, businessId: string, cha
     checks.push({ code: 'is_live_record', label: 'Record is a live lead', result: 'pass', detail: 'Record is not a merged duplicate.' });
   }
 
-  checks.push(suppressionCheck(db, businessId, channel));
+  checks.push(await suppressionCheck(db, businessId, channel));
   checks.push(channelAddressCheck(lead, channel));
-  checks.push(channelEnabledCheck(db, cfg, channel));
-  checks.push(consentCheck(db, businessId, channel));
+  checks.push(await channelEnabledCheck(db, cfg, channel));
+  checks.push(await consentCheck(db, businessId, channel));
 
   const reasons: string[] = [];
   let decision: Decision;
@@ -242,20 +247,22 @@ export function evaluateEligibility(db: DB, cfg: Config, businessId: string, cha
     checkedAt: at,
   };
 
-  persistDecision(db, result);
+  await persistDecision(db, result);
   return result;
 }
 
-function persistDecision(db: DB, d: EligibilityDecision): void {
-  db.prepare(
-    `INSERT INTO eligibility_checks (id, business_id, channel, decision, policy_version, checks_json, reasons_json, checked_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(newId('elig'), d.businessId, d.channel, d.decision, d.policyVersion, JSON.stringify(d.checks), JSON.stringify(d.reasons), d.checkedAt);
+async function persistDecision(db: DB, d: EligibilityDecision): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO eligibility_checks (id, business_id, channel, decision, policy_version, checks_json, reasons_json, checked_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(newId('elig'), d.businessId, d.channel, d.decision, d.policyVersion, JSON.stringify(d.checks), JSON.stringify(d.reasons), d.checkedAt);
 
   // Project the most recent decision onto the lead for listing/filters. The
   // call/whatsapp channels are the ones that matter for the pipeline view.
   if (d.channel === 'call' || d.channel === 'whatsapp_message') {
-    db.prepare(`UPDATE businesses SET eligibility_state = ?, updated_at = ? WHERE id = ?`).run(
+    await db.prepare(`UPDATE businesses SET eligibility_state = ?, updated_at = ? WHERE id = ?`).run(
       d.decision,
       d.checkedAt,
       d.businessId,
@@ -264,13 +271,17 @@ function persistDecision(db: DB, d: EligibilityDecision): void {
 }
 
 /** Latest decision for a lead+channel, or null. */
-export function latestEligibility(db: DB, businessId: string, channel: Channel): EligibilityDecision | null {
-  const row = db
+export async function latestEligibility(
+  db: DB,
+  businessId: string,
+  channel: Channel,
+): Promise<EligibilityDecision | null> {
+  const row = (await db
     .prepare(
       `SELECT channel, decision, policy_version, checks_json, reasons_json, checked_at
-         FROM eligibility_checks WHERE business_id = ? AND channel = ? ORDER BY checked_at DESC, rowid DESC LIMIT 1`,
+         FROM eligibility_checks WHERE business_id = ? AND channel = ? ORDER BY checked_at DESC, id DESC LIMIT 1`,
     )
-    .get(businessId, channel) as
+    .get(businessId, channel)) as
     | { channel: Channel; decision: Decision; policy_version: string; checks_json: string; reasons_json: string; checked_at: string }
     | undefined;
   if (!row) return null;
@@ -315,24 +326,26 @@ export interface SuppressionInput {
  * Add a suppression record. Suppression is authoritative and MUST survive
  * merges, restores and retention cleanup, so it is append-only here.
  */
-export function suppress(db: DB, input: SuppressionInput): { id: string; deduped: boolean } {
-  const lead = db.prepare('SELECT phone_e164, whatsapp_e164, email FROM businesses WHERE id = ?').get(input.businessId) as
+export async function suppress(db: DB, input: SuppressionInput): Promise<{ id: string; deduped: boolean }> {
+  const lead = (await db.prepare('SELECT phone_e164, whatsapp_e164, email FROM businesses WHERE id = ?').get(input.businessId)) as
     | { phone_e164: string | null; whatsapp_e164: string | null; email: string | null }
     | undefined;
   if (!lead) throw new Error(`suppress: lead ${input.businessId} not found`);
 
-  const existing = db
+  const existing = (await db
     // Only an ACTIVE suppression dedupes: a lifted row must not swallow a
     // genuine later opt-out (Phase 11B append-only review flow).
     .prepare(`SELECT id FROM suppression_list WHERE business_id = ? AND reason = ? AND lifted_at IS NULL`)
-    .get(input.businessId, input.reason) as { id: string } | undefined;
+    .get(input.businessId, input.reason)) as { id: string } | undefined;
   if (existing) return { id: existing.id, deduped: true };
 
   const id = newId('sup');
-  db.prepare(
-    `INSERT INTO suppression_list (id, business_id, scope, phone_e164, whatsapp_e164, email, reason, source, evidence, permanent, created_by, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
+  await db
+    .prepare(
+      `INSERT INTO suppression_list (id, business_id, scope, phone_e164, whatsapp_e164, email, reason, source, evidence, permanent, created_by, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
     id,
     input.businessId,
     input.scope,
@@ -349,30 +362,30 @@ export function suppress(db: DB, input: SuppressionInput): { id: string; deduped
   return { id, deduped: false };
 }
 
-export function listSuppression(db: DB, businessId: string): SuppressionRow[] {
-  return db
+export async function listSuppression(db: DB, businessId: string): Promise<SuppressionRow[]> {
+  return (await db
     .prepare(
       `SELECT id, scope, reason, permanent, evidence, lifted_at, lifted_reason FROM suppression_list WHERE business_id = ? ORDER BY created_at DESC`,
     )
-    .all(businessId) as unknown as SuppressionRow[];
+    .all(businessId)) as SuppressionRow[];
 }
 
 /** Count of ACTIVE (not lifted) suppression records, for dashboard/health. */
-export function suppressionCount(db: DB): number {
-  return (db.prepare('SELECT COUNT(*) c FROM suppression_list WHERE lifted_at IS NULL').get() as { c: number }).c;
+export async function suppressionCount(db: DB): Promise<number> {
+  return ((await db.prepare('SELECT COUNT(*) c FROM suppression_list WHERE lifted_at IS NULL').get()) as { c: number }).c;
 }
 
 /** Normalise-and-check helper used by tests and by the import path. */
-export function isSuppressedPhone(db: DB, phoneRaw: string): boolean {
+export async function isSuppressedPhone(db: DB, phoneRaw: string): Promise<boolean> {
   const n = normalizePhone(phoneRaw);
   if (!n.valid || !n.e164) return false;
-  const row = db.prepare('SELECT COUNT(*) c FROM suppression_list WHERE phone_e164 = ? AND lifted_at IS NULL').get(n.e164) as { c: number };
+  const row = (await db.prepare('SELECT COUNT(*) c FROM suppression_list WHERE phone_e164 = ? AND lifted_at IS NULL').get(n.e164)) as { c: number };
   return row.c > 0;
 }
 
-export function isSuppressedEmail(db: DB, emailRaw: string): boolean {
+export async function isSuppressedEmail(db: DB, emailRaw: string): Promise<boolean> {
   const e = normalizeEmail(emailRaw);
   if (!e.valid || !e.email) return false;
-  const row = db.prepare('SELECT COUNT(*) c FROM suppression_list WHERE email = ? AND lifted_at IS NULL').get(e.email) as { c: number };
+  const row = (await db.prepare('SELECT COUNT(*) c FROM suppression_list WHERE email = ? AND lifted_at IS NULL').get(e.email)) as { c: number };
   return row.c > 0;
 }

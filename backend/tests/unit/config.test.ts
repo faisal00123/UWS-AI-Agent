@@ -115,6 +115,21 @@ describe('configuration', () => {
     );
   });
 
+  test('osm_local discovery is configured with NO api key (offline, keyless)', () => {
+    const cfg = loadConfig({ ...MIN, DISCOVERY_PROVIDER: 'osm_local' });
+    const discovery = cfg.providers.find((p) => p.key === 'discovery');
+    assert.equal(discovery?.state, 'configured', 'an offline local-file provider needs no key');
+    assert.deepEqual(discovery?.missing, []);
+    assert.ok(
+      discovery?.features.some((f) => /offline/i.test(f)),
+      'the offline/no-network nature is advertised honestly',
+    );
+    assert.ok(
+      discovery?.requiredSetup.some((s) => /extract/i.test(s)),
+      'the owner is pointed at the offline extractor as the setup step',
+    );
+  });
+
   test('a keyed discovery provider still requires its API key', () => {
     const cfg = loadConfig({ ...MIN, DISCOVERY_PROVIDER: 'somevendor' });
     const discovery = cfg.providers.find((p) => p.key === 'discovery');

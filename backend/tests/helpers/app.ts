@@ -86,7 +86,7 @@ export async function startTestServer(env: TestEnv = {}, opts: TestServerOptions
           occurredAt: event.occurredAt,
         }),
     });
-  const app = createApp({ config, db, logger, adapters });
+  const app = createApp({ config, db, logger, adapters, ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}) });
 
   const server = await new Promise<Server>((resolve, reject) => {
     const s = app.listen(0, () => resolve(s));

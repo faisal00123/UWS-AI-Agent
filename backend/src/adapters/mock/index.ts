@@ -48,7 +48,7 @@ export function createMockTelephonyAdapter(): MockTelephonyAdapter {
     key: 'mock_telephony',
     label: 'Telephony (simulated)',
     calls,
-    status(): AdapterStatus {
+    async status(): Promise<AdapterStatus> {
       return {
         key: 'telephony',
         label: 'Telephony (calls)',
@@ -86,7 +86,7 @@ export function createMockWhatsAppAdapter(): MockWhatsAppAdapter {
     key: 'mock_whatsapp',
     label: 'WhatsApp (simulated)',
     sent,
-    status(): AdapterStatus {
+    async status(): Promise<AdapterStatus> {
       return {
         key: 'whatsapp',
         label: 'WhatsApp Business',
@@ -147,7 +147,7 @@ export function createMockAIAdapter(opts: { reply?: string } = {}): MockAIAdapte
     label: 'AI conversation (simulated)',
     completions,
     responder: null,
-    status(): AdapterStatus {
+    async status(): Promise<AdapterStatus> {
       return {
         key: 'ai',
         label: 'AI conversation',
@@ -196,7 +196,7 @@ export function createMockSpeechAdapter(defaults: { language?: 'en' | 'ur'; voic
     label: 'Speech (simulated)',
     transcriptions,
     syntheses,
-    status(): AdapterStatus {
+    async status(): Promise<AdapterStatus> {
       return {
         key: 'speech',
         label: 'Speech (STT/TTS)',
@@ -258,7 +258,7 @@ export function createMockEmailAdapter(): MockEmailAdapter {
     label: 'Email (simulated)',
     sent,
     failNext: null,
-    status(): AdapterStatus {
+    async status(): Promise<AdapterStatus> {
       return {
         key: 'email',
         label: 'Email (SMTP)',
@@ -307,7 +307,7 @@ export function createMockDiscoveryAdapter(fixtures: DiscoveryHit[] = []): MockD
     label: 'Lead discovery (simulated)',
     queries,
     fixtures,
-    status(): AdapterStatus {
+    async status(): Promise<AdapterStatus> {
       return {
         key: 'discovery',
         label: 'Lead discovery',

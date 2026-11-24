@@ -15,7 +15,7 @@ export function createUnconfiguredDiscovery(): DiscoveryPort {
     key: 'discovery_none',
     label: 'Lead discovery',
 
-    status(): AdapterStatus {
+    async status(): Promise<AdapterStatus> {
       return {
         key: 'discovery',
         label: 'Lead discovery',

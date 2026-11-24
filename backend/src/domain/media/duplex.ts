@@ -153,27 +153,27 @@ function digitsOnly(value: string): string {
  * conversation, and any opt-out they express is applied by
  * `finishConversation` exactly as it would be on an outbound call.
  */
-export function resolveCallForAnswer(
+export async function resolveCallForAnswer(
   db: DB,
   input: { callSid: string; from?: string | null; to?: string | null; provider?: string },
-): ResolvedCall | null {
-  const existing = db
+): Promise<ResolvedCall | null> {
+  const existing = (await db
     .prepare('SELECT id, business_id FROM calls WHERE provider_call_id = ?')
-    .get(input.callSid) as { id: string; business_id: string } | undefined;
+    .get(input.callSid)) as { id: string; business_id: string } | undefined;
   if (existing) return { callId: existing.id, businessId: existing.business_id, created: false };
 
   const from = (input.from ?? '').trim();
   const digits = digitsOnly(from);
   if (digits.length < 7) return null;
 
-  const lead = db
+  const lead = (await db
     .prepare(
       `SELECT id FROM businesses
         WHERE (phone_e164 = ? OR phone_e164 = ?)
           AND merged_into_id IS NULL
         LIMIT 1`,
     )
-    .get(`+${digits}`, digits) as { id: string } | undefined;
+    .get(`+${digits}`, digits)) as { id: string } | undefined;
   if (!lead) return null;
 
   // The provider that carried this answer (default keeps Twilio's historical
@@ -182,18 +182,20 @@ export function resolveCallForAnswer(
   const at = nowIso();
   const id = newId('cal');
   try {
-    db.prepare(
-      `INSERT INTO calls (id, attempt_id, business_id, direction, channel, provider, provider_call_id, status,
+    await db
+      .prepare(
+        `INSERT INTO calls (id, attempt_id, business_id, direction, channel, provider, provider_call_id, status,
          outcome, to_number_e164, recording_enabled, recording_consent, started_at, answered_at, simulation,
          counts_against_daily_limit, daily_bucket, cost_state, created_at, updated_at)
        VALUES (?, NULL, ?, 'inbound', 'call', ?, ?, 'in_progress', 'answered', ?, 0, 0, ?, ?, 0, 0, NULL,
          'unavailable', ?, ?)`,
-    ).run(id, lead.id, provider, input.callSid, from, at, at, at, at);
+      )
+      .run(id, lead.id, provider, input.callSid, from, at, at, at, at);
   } catch {
     // A racing status callback already registered this call — read it back.
-    const raced = db
+    const raced = (await db
       .prepare('SELECT id, business_id FROM calls WHERE provider_call_id = ?')
-      .get(input.callSid) as { id: string; business_id: string } | undefined;
+      .get(input.callSid)) as { id: string; business_id: string } | undefined;
     if (!raced) throw new AppError('conflict', 'Call registration raced with a provider event');
     return { callId: raced.id, businessId: raced.business_id, created: false };
   }
@@ -206,10 +208,10 @@ export function resolveCallForAnswer(
  * the fixed greeting and refuses the WebSocket upgrade — a stream that could
  * only produce silence or invented speech is never opened.
  */
-export function duplexPorts(speech: SpeechPort | null, ai: ConversationPort | null): boolean {
+export async function duplexPorts(speech: SpeechPort | null, ai: ConversationPort | null): Promise<boolean> {
   if (!speech || !ai) return false;
-  if (speech.status().state === 'disabled') return false;
-  if (ai.status().state === 'disabled') return false;
+  if ((await speech.status()).state === 'disabled') return false;
+  if ((await ai.status()).state === 'disabled') return false;
   return true;
 }
 
@@ -373,37 +375,45 @@ export function createDuplexSession(opts: DuplexSessionOptions): DuplexSession {
     maxCallTimer.unref?.();
   }
 
-  function onStart(start: unknown): void {
+  async function onStart(start: unknown): Promise<void> {
     if (conversationId) return; // duplicate start on the same connection
-    const payload = (start ?? {}) as Record<string, unknown>;
-    const streamCallSid = typeof payload['callSid'] === 'string' ? payload['callSid'] : '';
-    if (streamCallSid !== callSid) {
-      log('warn', 'duplex.call_sid_mismatch');
-      ended = true;
-      transport.close('call_sid_mismatch');
-      return;
-    }
-    const format = (payload['mediaFormat'] ?? null) as { encoding?: unknown; sampleRate?: unknown } | null;
-    if (format && (format.encoding !== 'audio/x-mulaw' || Number(format.sampleRate) !== 8000)) {
-      log('warn', 'duplex.unsupported_format', { encoding: String(format.encoding ?? '') });
-      ended = true;
-      transport.close('unsupported_format');
-      return;
-    }
+    try {
+      const payload = (start ?? {}) as Record<string, unknown>;
+      const streamCallSid = typeof payload['callSid'] === 'string' ? payload['callSid'] : '';
+      if (streamCallSid !== callSid) {
+        log('warn', 'duplex.call_sid_mismatch');
+        ended = true;
+        transport.close('call_sid_mismatch');
+        return;
+      }
+      const format = (payload['mediaFormat'] ?? null) as { encoding?: unknown; sampleRate?: unknown } | null;
+      if (format && (format.encoding !== 'audio/x-mulaw' || Number(format.sampleRate) !== 8000)) {
+        log('warn', 'duplex.unsupported_format', { encoding: String(format.encoding ?? '') });
+        ended = true;
+        transport.close('unsupported_format');
+        return;
+      }
 
-    const call = db.prepare('SELECT id, business_id FROM calls WHERE provider_call_id = ?').get(callSid) as
-      | { id: string; business_id: string }
-      | undefined;
-    if (!call) {
-      log('warn', 'duplex.unknown_call');
-      ended = true;
-      transport.close('unknown_call');
-      return;
-    }
+      const call = (await db.prepare('SELECT id, business_id FROM calls WHERE provider_call_id = ?').get(callSid)) as
+        | { id: string; business_id: string }
+        | undefined;
+      if (!call) {
+        log('warn', 'duplex.unknown_call');
+        ended = true;
+        transport.close('unknown_call');
+        return;
+      }
 
-    conversationId = startConversation(db, config, { businessId: call.business_id, callId: call.id });
-    startMaxCallTimer();
-    log('info', 'duplex.started', { callId: call.id });
+      conversationId = await startConversation(db, config, { businessId: call.business_id, callId: call.id });
+      startMaxCallTimer();
+      log('info', 'duplex.started', { callId: call.id });
+    } catch (err) {
+      // A failed lookup/open must never become an unhandled rejection: the
+      // call is ended honestly, exactly like an unknown call.
+      log('error', 'duplex.start_failed', { error: err instanceof Error ? err.message : String(err) });
+      ended = true;
+      transport.close('start_failed');
+    }
   }
 
   async function runTurn(audio: Uint8Array): Promise<void> {
@@ -457,6 +467,8 @@ export function createDuplexSession(opts: DuplexSessionOptions): DuplexSession {
         const audio = pending.shift();
         if (audio) await runTurn(audio);
       }
+    } catch (err) {
+      log('error', 'duplex.drain_failed', { error: err instanceof Error ? err.message : String(err) });
     } finally {
       draining = false;
     }
@@ -483,17 +495,17 @@ export function createDuplexSession(opts: DuplexSessionOptions): DuplexSession {
     if (typeof digit['digit'] !== 'string' || digit['digit'].length === 0) return;
     const value = digit['digit'];
     try {
-      ingestSystemNote(db, conversationId, `DTMF ${value}`);
+      await ingestSystemNote(db, conversationId, `DTMF ${value}`);
     } catch {
       return; // conversation already closed elsewhere
     }
     if (value !== '0' && value !== '1') return;
-    if (!speech || speech.status().state === 'unconfigured') return;
+    if (!speech || (await speech.status()).state === 'unconfigured') return;
 
     log('info', 'duplex.human_handoff_requested', { digit: value });
     try {
-      if (!loadConversationPolicy(db, config).humanHandoffOnRequest) return;
-      db.prepare('UPDATE conversations SET human_requested = 1 WHERE id = ?').run(conversationId);
+      if (!(await loadConversationPolicy(db, config)).humanHandoffOnRequest) return;
+      await db.prepare('UPDATE conversations SET human_requested = 1 WHERE id = ?').run(conversationId);
       const farewell = 'Thank you. I will ask a member of our team to get back to you. Goodbye.';
       const synthesized = await speech.synthesize({
         text: farewell,
@@ -532,7 +544,7 @@ export function createDuplexSession(opts: DuplexSessionOptions): DuplexSession {
       const body = (msg as Record<string, unknown>)[event];
       switch (event) {
         case 'start':
-          onStart(body);
+          await onStart(body);
           return;
         case 'media':
           onMedia(body);

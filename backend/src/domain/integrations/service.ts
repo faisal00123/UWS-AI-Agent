@@ -50,10 +50,10 @@ export const DEFAULT_TOGGLES: IntegrationToggles = {
  * Read current toggles. Missing/corrupt setting => all enabled (safe default
  * matching the definition's default). Unknown keys are ignored.
  */
-export function getToggles(db: DB, cfg: Config): IntegrationToggles {
+export async function getToggles(db: DB, cfg: Config): Promise<IntegrationToggles> {
   let raw: unknown;
   try {
-    raw = getSetting<Partial<IntegrationToggles>>(db, 'integration_toggles', cfg);
+    raw = await getSetting<Partial<IntegrationToggles>>(db, 'integration_toggles', cfg);
   } catch {
     return { ...DEFAULT_TOGGLES };
   }
@@ -68,8 +68,8 @@ export function getToggles(db: DB, cfg: Config): IntegrationToggles {
 }
 
 /** True when the owner has not disabled this integration. */
-export function isIntegrationEnabled(db: DB, cfg: Config, key: IntegrationKey): boolean {
-  return getToggles(db, cfg)[key] !== false;
+export async function isIntegrationEnabled(db: DB, cfg: Config, key: IntegrationKey): Promise<boolean> {
+  return (await getToggles(db, cfg))[key] !== false;
 }
 
 // --------------------------------------------------------------- usage -----
@@ -88,20 +88,22 @@ export interface UsageRow {
  * Persist one adapter usage record. Never throws (usage accounting must not
  * break an operation) and never stores payloads/credentials.
  */
-export function recordAdapterUsage(db: DB, event: UsageRow): void {
+export async function recordAdapterUsage(db: DB, event: UsageRow): Promise<void> {
   try {
-    db.prepare(
-      `INSERT INTO adapter_usage (integration, operation, outcome, error_code, duration_ms, retries, occurred_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    ).run(
-      event.integration,
-      event.operation,
-      event.outcome,
-      event.errorCode ?? null,
-      Math.max(0, Math.round(event.durationMs)),
-      Math.max(0, Math.round(event.retries)),
-      (event.occurredAt ?? new Date()).toISOString(),
-    );
+    await db
+      .prepare(
+        `INSERT INTO adapter_usage (integration, operation, outcome, error_code, duration_ms, retries, occurred_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        event.integration,
+        event.operation,
+        event.outcome,
+        event.errorCode ?? null,
+        Math.max(0, Math.round(event.durationMs)),
+        Math.max(0, Math.round(event.retries)),
+        (event.occurredAt ?? new Date()).toISOString(),
+      );
   } catch {
     /* swallow: observability must never break the caller */
   }
@@ -112,14 +114,14 @@ export function recordAdapterUsage(db: DB, event: UsageRow): void {
  * unconfigured). Kept separate from recordAdapterUsage only in name — same
  * table, so the dashboard's usage panel shows WHY nothing was sent.
  */
-function recordRefusedProbe(
+async function recordRefusedProbe(
   db: DB,
   key: IntegrationKey,
   operation: string,
   outcome: 'disabled' | 'error',
   durationMs: number,
-): void {
-  recordAdapterUsage(db, {
+): Promise<void> {
+  await recordAdapterUsage(db, {
     integration: key,
     operation,
     outcome,
@@ -141,9 +143,9 @@ export interface UsageSummaryEntry {
 }
 
 /** Aggregate usage per integration for the dashboard (last N days). */
-export function usageSummary(db: DB, days = 7): UsageSummaryEntry[] {
+export async function usageSummary(db: DB, days = 7): Promise<UsageSummaryEntry[]> {
   const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
-  const rows = db
+  const rows = (await db
     .prepare(
       `SELECT integration,
               COUNT(*) AS total,
@@ -157,7 +159,7 @@ export function usageSummary(db: DB, days = 7): UsageSummaryEntry[] {
         GROUP BY integration
         ORDER BY integration`,
     )
-    .all(since) as {
+    .all(since)) as {
     integration: string;
     total: number;
     ok: number;
@@ -201,8 +203,9 @@ function redactDetail(detail: string | null | undefined): string | null {
 }
 
 /** Persist the latest health probe for one integration. */
-export function saveHealthCheck(db: DB, record: HealthRecord): void {
-  db.prepare(
+export async function saveHealthCheck(db: DB, record: HealthRecord): Promise<void> {
+  await db
+    .prepare(
     `INSERT INTO integration_health (integration, checked_at, ok, state, detail, duration_ms)
      VALUES (?, ?, ?, ?, ?, ?)
      ON CONFLICT(integration) DO UPDATE SET
@@ -226,10 +229,10 @@ export interface HealthView extends HealthRecord {
 }
 
 /** Latest health record per integration (missing => never checked). */
-export function lastHealthChecks(db: DB): Record<string, HealthView | null> {
-  const rows = db
+export async function lastHealthChecks(db: DB): Promise<Record<string, HealthView | null>> {
+  const rows = (await db
     .prepare('SELECT * FROM integration_health')
-    .all() as {
+    .all()) as {
     integration: string;
     checked_at: string;
     ok: number;
@@ -280,7 +283,7 @@ export async function runHealthCheck(
   const checkedAt = new Date().toISOString();
 
   // Disabled beats everything: no network, honest state.
-  const toggles = getToggles(db, cfg);
+  const toggles = await getToggles(db, cfg);
   if (toggles[key] === false) {
     const res: HealthCheckResult = {
       integration: key,
@@ -290,8 +293,8 @@ export async function runHealthCheck(
       durationMs: Date.now() - started,
       checkedAt,
     };
-    saveHealthCheck(db, res);
-    recordRefusedProbe(db, key, 'ping', 'disabled', res.durationMs);
+    await saveHealthCheck(db, res);
+    await recordRefusedProbe(db, key, 'ping', 'disabled', res.durationMs);
     return res;
   }
 
@@ -318,12 +321,12 @@ export async function runHealthCheck(
       durationMs: Date.now() - started,
       checkedAt,
     };
-    saveHealthCheck(db, res);
-    recordRefusedProbe(db, key, 'ping', 'disabled', res.durationMs);
+    await saveHealthCheck(db, res);
+    await recordRefusedProbe(db, key, 'ping', 'disabled', res.durationMs);
     return res;
   }
 
-  const status = port.status();
+  const status = await port.status();
   if (status.state === 'unconfigured') {
     const res: HealthCheckResult = {
       integration: key,
@@ -335,7 +338,7 @@ export async function runHealthCheck(
       durationMs: Date.now() - started,
       checkedAt,
     };
-    saveHealthCheck(db, res);
+    await saveHealthCheck(db, res);
     return res;
   }
 
@@ -349,7 +352,7 @@ export async function runHealthCheck(
       durationMs: Date.now() - started,
       checkedAt,
     };
-    saveHealthCheck(db, res);
+    await saveHealthCheck(db, res);
     return res;
   }
 
@@ -363,7 +366,7 @@ export async function runHealthCheck(
       durationMs: Date.now() - started,
       checkedAt,
     };
-    saveHealthCheck(db, res);
+    await saveHealthCheck(db, res);
     return res;
   } catch (err) {
     const detail =
@@ -378,7 +381,7 @@ export async function runHealthCheck(
       durationMs: Date.now() - started,
       checkedAt,
     };
-    saveHealthCheck(db, res);
+    await saveHealthCheck(db, res);
     return res;
   }
 }

@@ -235,6 +235,27 @@ describe('Phase 11B API: onboarding, review, media, activation', () => {
     const noText = await owner.post<ErrorBody>(`/api/conversations/${cid}/prospect`, { audioBase64: '' });
     assert.equal(noText.status, 400);
 
+    // Header/field-injection attempts in audio metadata are rejected: these
+    // strings are interpolated into outbound multipart/HTTP headers by the
+    // speech adapters, so they must never pass validation (400).
+    const evilMime = await owner.post<ErrorBody>(`/api/conversations/${cid}/prospect`, {
+      audioBase64: Buffer.from('x').toString('base64'),
+      mimeType: 'audio/wav\r\nX-Inject: 1',
+    });
+    assert.equal(evilMime.status, 400, 'CRLF in mimeType must be rejected');
+    const evilName = await owner.post<ErrorBody>(`/api/conversations/${cid}/prospect`, {
+      audioBase64: Buffer.from('x').toString('base64'),
+      filename: 'a.wav"\r\n\r\n--evil',
+    });
+    assert.equal(evilName.status, 400, 'quotes/CRLF in filename must be rejected');
+
+    // A legitimate mime type with a codec parameter still passes validation.
+    const okMime = await owner.post(`/api/conversations/${cid}/prospect`, {
+      audioBase64: Buffer.from('x').toString('base64'),
+      mimeType: 'audio/webm;codecs=opus',
+    });
+    assert.notEqual(okMime.status, 400, 'valid mime types pass validation');
+
     // Unknown conversation -> 404 on every media endpoint.
     assert.equal((await owner.post(`/api/conversations/cnv_missing/prospect`, { text: 'hi' })).status, 404);
 

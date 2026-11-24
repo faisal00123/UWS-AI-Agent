@@ -109,21 +109,9 @@ export function createApp(deps: AppDeps): Express {
     next();
   });
 
-  // Keep the RAW body bytes for webhook signature verification (Meta signs
-  // the exact bytes; re-serialized JSON would break the HMAC).
-  app.use(
-    express.json({
-      limit: '256kb',
-      verify: (req, _res, buf) => {
-        (req as unknown as { rawBody?: Buffer }).rawBody = Buffer.from(buf);
-      },
-    }),
-  );
-  app.use(express.urlencoded({ extended: false, limit: '64kb' }));
-
-  app.use(createContext(full));
-
-  // Structured access log (redaction happens in the logger).
+  // Structured access log (redaction happens in the logger). Registered
+  // BEFORE the body parsers so oversized-body rejections (413) are recorded
+  // too; userId resolves at `finish`, after createContext has run.
   app.use((req: Request, res: Response, next: NextFunction) => {
     res.on('finish', () => {
       const ms = Date.now() - (req.ctx?.startedAt ?? Date.now());
@@ -140,6 +128,11 @@ export function createApp(deps: AppDeps): Express {
     next();
   });
 
+  // Rate limit BEFORE the body parsers: otherwise every over-limit request
+  // still pays a full JSON / URL-encoded parse first, so CPU could be burned
+  // past the limit. The limiter keys on req.ip only (set by `trust proxy`
+  // above) and needs neither a parsed body nor req.ctx; the access logger
+  // runs first so 429s are still recorded.
   const apiLimiter = createRateLimiter({
     name: 'api',
     windowMs: 60_000,
@@ -147,6 +140,20 @@ export function createApp(deps: AppDeps): Express {
     message: 'Too many requests. Please slow down.',
   });
   app.use('/api', apiLimiter.handler);
+
+  // Keep the RAW body bytes for webhook signature verification (Meta signs
+  // the exact bytes; re-serialized JSON would break the HMAC).
+  app.use(
+    express.json({
+      limit: '256kb',
+      verify: (req, _res, buf) => {
+        (req as unknown as { rawBody?: Buffer }).rawBody = Buffer.from(buf);
+      },
+    }),
+  );
+  app.use(express.urlencoded({ extended: false, limit: '64kb' }));
+
+  app.use(createContext(full));
 
   // ------------------------------- API routers -----------------------------
   app.use('/api/auth', authRoutes(full));

@@ -110,7 +110,7 @@ export function outreachRoutes(): Router {
       });
 
       if (result.decision === 'allowed') {
-        recordAudit(req.ctx.deps.db, {
+        await recordAudit(req.ctx.deps.db, {
           actorUserId: req.ctx.user!.id,
           actorLabel: req.ctx.user!.role,
           action: result.attempt.mode === 'simulation' ? 'outreach.call_simulated' : 'outreach.call_placed',
@@ -152,7 +152,7 @@ export function outreachRoutes(): Router {
       });
 
       if (result.decision === 'allowed') {
-        recordAudit(req.ctx.deps.db, {
+        await recordAudit(req.ctx.deps.db, {
           actorUserId: req.ctx.user!.id,
           actorLabel: req.ctx.user!.role,
           action: result.simulated ? 'outreach.portfolio_rehearsed' : 'outreach.portfolio_shared',
@@ -179,13 +179,13 @@ export function outreachRoutes(): Router {
   // ----------------------------------------------------------- ledger ----
   router.get(
     '/:id/outreach',
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const id = idParam.parse(req.params.id);
       const decision = req.query.decision === 'allowed' || req.query.decision === 'blocked' ? req.query.decision : undefined;
       res.json({
-        attempts: listAttempts(req.ctx.deps.db, { businessId: id, decision }),
-        calls: listLeadCalls(req.ctx.deps.db, id),
-        messages: listLeadMessages(req.ctx.deps.db, id),
+        attempts: await listAttempts(req.ctx.deps.db, { businessId: id, decision }),
+        calls: await listLeadCalls(req.ctx.deps.db, id),
+        messages: await listLeadMessages(req.ctx.deps.db, id),
       });
     }),
   );
@@ -193,17 +193,17 @@ export function outreachRoutes(): Router {
   // ----------------------------------------------------- conversations ----
   router.get(
     '/:id/conversations',
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const id = idParam.parse(req.params.id);
-      res.json({ items: listConversations(req.ctx.deps.db, id) });
+      res.json({ items: await listConversations(req.ctx.deps.db, id) });
     }),
   );
 
   router.get(
     '/:id/conversations/:conversationId',
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const id = idParam.parse(req.params.id);
-      const conversation = getConversation(req.ctx.deps.db, idParam.parse(req.params.conversationId));
+      const conversation = await getConversation(req.ctx.deps.db, idParam.parse(req.params.conversationId));
       if (!conversation || conversation.businessId !== id) throw notFound('Conversation');
       res.json(conversation);
     }),
@@ -225,9 +225,9 @@ export function portfolioRoutes(): Router {
   router.get(
     '/',
     requireRole('owner', 'staff'),
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const shareableOnly = req.query.shareable === 'true';
-      res.json({ items: listPortfolio(req.ctx.deps.db, { shareableOnly }) });
+      res.json({ items: await listPortfolio(req.ctx.deps.db, { shareableOnly }) });
     }),
   );
 
@@ -235,9 +235,9 @@ export function portfolioRoutes(): Router {
     '/',
     requireCsrf,
     requireRole('owner', 'staff'),
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const body = createItemSchema.parse(req.body);
-      const item = createPortfolioItem(req.ctx.deps.db, {
+      const item = await createPortfolioItem(req.ctx.deps.db, {
         title: body.title,
         description: body.description ?? null,
         serviceKey: body.serviceKey ?? null,
@@ -246,7 +246,7 @@ export function portfolioRoutes(): Router {
         sortOrder: body.sortOrder,
         createdBy: req.ctx.user!.id,
       });
-      recordAudit(req.ctx.deps.db, {
+      await recordAudit(req.ctx.deps.db, {
         actorUserId: req.ctx.user!.id,
         actorLabel: req.ctx.user!.role,
         action: 'portfolio.create',
@@ -261,8 +261,8 @@ export function portfolioRoutes(): Router {
 
   router.get(
     '/:id',
-    asyncRoute((req, res) => {
-      const item = getPortfolioItem(req.ctx.deps.db, idParam.parse(req.params.id));
+    asyncRoute(async (req, res) => {
+      const item = await getPortfolioItem(req.ctx.deps.db, idParam.parse(req.params.id));
       if (!item) throw notFound('Portfolio item');
       res.json({ ...item, shareable: isShareable(item) });
     }),
@@ -272,11 +272,11 @@ export function portfolioRoutes(): Router {
     '/:id/verify',
     requireCsrf,
     requireRole('owner'),
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const id = idParam.parse(req.params.id);
       const body = verifySchema.parse(req.body);
-      const item = verifyPortfolioItem(req.ctx.deps.db, id, body.verified, body.note ?? null);
-      recordAudit(req.ctx.deps.db, {
+      const item = await verifyPortfolioItem(req.ctx.deps.db, id, body.verified, body.note ?? null);
+      await recordAudit(req.ctx.deps.db, {
         actorUserId: req.ctx.user!.id,
         actorLabel: req.ctx.user!.role,
         action: body.verified ? 'portfolio.verify' : 'portfolio.unverify',
@@ -295,11 +295,11 @@ export function portfolioRoutes(): Router {
     '/:id/approve',
     requireCsrf,
     requireRole('owner'),
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const id = idParam.parse(req.params.id);
       const body = approveSchema.parse(req.body);
-      const item = approvePortfolioItem(req.ctx.deps.db, id, body.approved);
-      recordAudit(req.ctx.deps.db, {
+      const item = await approvePortfolioItem(req.ctx.deps.db, id, body.approved);
+      await recordAudit(req.ctx.deps.db, {
         actorUserId: req.ctx.user!.id,
         actorLabel: req.ctx.user!.role,
         action: body.approved ? 'portfolio.approve' : 'portfolio.unapprove',

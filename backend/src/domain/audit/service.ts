@@ -4,6 +4,9 @@
  * Written for every sensitive action: authentication events, settings and
  * budget changes, approvals, live activation, emergency stop/resume, merges,
  * conversions, financial changes, exports/deletions.
+ *
+ * Async note: database access is async (SQLite + PostgreSQL share the
+ * interface), so every function here returns a Promise and callers await.
  */
 import type { DB } from '../../db/index.ts';
 import { nowIso } from '../../core/time.ts';
@@ -28,10 +31,12 @@ const INSERT = `
   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 `;
 
-export function recordAudit(db: DB, input: AuditInput): number {
+export async function recordAudit(db: DB, input: AuditInput): Promise<number> {
   const details = input.details ? JSON.stringify(input.details) : null;
-  const res = db
-    .prepare(INSERT)
+  // PostgreSQL has no lastInsertRowid: ask the server for the generated id.
+  const sql = db.dialect === 'postgres' ? `${INSERT.trim()} RETURNING id` : INSERT;
+  const res = await db
+    .prepare(sql)
     .run(
       nowIso(),
       input.actorUserId ?? null,
@@ -68,7 +73,10 @@ export interface AuditQuery {
   offset?: number;
 }
 
-export function listAudit(db: DB, q: AuditQuery = {}): { rows: AuditRow[]; total: number } {
+export async function listAudit(
+  db: DB,
+  q: AuditQuery = {},
+): Promise<{ rows: AuditRow[]; total: number }> {
   const where: string[] = [];
   const params: unknown[] = [];
   if (q.action) {
@@ -85,21 +93,27 @@ export function listAudit(db: DB, q: AuditQuery = {}): { rows: AuditRow[]; total
   }
   const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const total = (
-    db.prepare(`SELECT COUNT(*) AS c FROM audit_events ${clause}`).get(...(params as never[])) as {
+    (await db.prepare(`SELECT COUNT(*) AS c FROM audit_events ${clause}`).get(...(params as never[]))) as {
       c: number;
     }
   ).c;
-  const rows = db
+  const rows = (await db
     .prepare(
       `SELECT * FROM audit_events ${clause} ORDER BY id DESC LIMIT ? OFFSET ?`,
     )
-    .all(...([...params, q.limit ?? 50, q.offset ?? 0] as never[])) as unknown as AuditRow[];
+    .all(...([...params, q.limit ?? 50, q.offset ?? 0] as never[]))) as unknown as AuditRow[];
   return { rows, total };
 }
 
 /** Convenience for entity-scoped history views. */
-export function entityHistory(db: DB, entityType: string, entityId: string, limit = 50): AuditRow[] {
-  return listAudit(db, { entityType, entityId, limit }).rows;
+export async function entityHistory(
+  db: DB,
+  entityType: string,
+  entityId: string,
+  limit = 50,
+): Promise<AuditRow[]> {
+  const list = await listAudit(db, { entityType, entityId, limit });
+  return list.rows;
 }
 
 export function newAuditId(): string {

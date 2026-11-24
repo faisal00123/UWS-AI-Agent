@@ -80,4 +80,31 @@ describe('CSV parser (RFC 4180)', () => {
     assert.equal(mapped.records.length, 1);
     assert.equal(mapped.records[0]!.values['Business Name'], 'ABC Clinic');
   });
+
+  // ---- HIGH#3: maxRows bounds how much of an oversized file is ever read ----
+
+  test('maxRows stops reading and reports truncation', () => {
+    const r = parseCsv('name,city\nA,K\nB,L\nC,M\n', { maxRows: 3 });
+    assert.equal(r.rows.length, 3, 'never materialises more than the limit');
+    assert.equal(r.rows[2]!.cells[0], 'B', 'rows up to the limit are intact');
+    assert.ok(r.errors.some((e) => /Row limit of 3 reached/.test(e.message)), 'truncation is reported');
+  });
+
+  test('maxRows exactly at the file length is a complete read', () => {
+    const r = parseCsv('name,city\nA,K\nB,L\n', { maxRows: 3 });
+    assert.equal(r.rows.length, 3);
+    assert.ok(!r.errors.some((e) => /Row limit/.test(e.message)), 'a complete file must not be flagged');
+
+    // Trailing blank lines after the limit are not "unread rows".
+    const r2 = parseCsv('name,city\nA,K\nB,L\n\n\n', { maxRows: 3 });
+    assert.equal(r2.rows.length, 3);
+    assert.ok(!r2.errors.some((e) => /Row limit/.test(e.message)));
+  });
+
+  test('maxRows caps a multi-megabyte row flood without reading it all', () => {
+    const flood = `${'x\n'.repeat(200_000)}`;
+    const r = parseCsv(flood, { maxRows: 1000 });
+    assert.equal(r.rows.length, 1000);
+    assert.ok(r.errors.some((e) => /Row limit of 1000 reached/.test(e.message)));
+  });
 });

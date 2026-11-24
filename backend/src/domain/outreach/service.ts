@@ -78,10 +78,10 @@ interface LeadRow {
   merged_into_id: string | null;
 }
 
-function loadLead(db: DB, businessId: string): LeadRow {
-  const lead = db
+async function loadLead(db: DB, businessId: string): Promise<LeadRow> {
+  const lead = (await db
     .prepare('SELECT id, display_name, phone_e164, whatsapp_e164, merged_into_id FROM businesses WHERE id = ?')
-    .get(businessId) as LeadRow | undefined;
+    .get(businessId)) as LeadRow | undefined;
   if (!lead) throw notFound('Lead');
   return lead;
 }
@@ -133,11 +133,11 @@ function toCallInfo(row: SimCallRow): SimCallInfo {
 }
 
 /** Replay-safe lookup: rebuild the result from a previously recorded attempt. */
-function replayCallResult(db: DB, attempt: OutreachAttempt): PlaceCallResult {
+async function replayCallResult(db: DB, attempt: OutreachAttempt): Promise<PlaceCallResult> {
   if (attempt.decision === 'blocked') return { decision: 'blocked', attempt };
-  const callRow = db
+  const callRow = (await db
     .prepare('SELECT id, status, outcome, duration_seconds, simulation, provider FROM calls WHERE attempt_id = ?')
-    .get(attempt.id) as
+    .get(attempt.id)) as
     | { id: string; status: string; outcome: string; duration_seconds: number | null; simulation: number; provider: string }
     | undefined;
   if (!callRow) {
@@ -145,12 +145,12 @@ function replayCallResult(db: DB, attempt: OutreachAttempt): PlaceCallResult {
       attemptId: attempt.id,
     });
   }
-  const conv = db.prepare('SELECT id, human_requested FROM conversations WHERE call_id = ?').get(callRow.id) as
+  const conv = (await db.prepare('SELECT id, human_requested FROM conversations WHERE call_id = ?').get(callRow.id)) as
     | { id: string; human_requested: number }
     | undefined;
-  const inter = db
+  const inter = (await db
     .prepare(`SELECT id FROM interactions WHERE business_id = ? AND json_extract(evidence_json, '$.callId') = ?`)
-    .get(attempt.businessId, callRow.id) as { id: string } | undefined;
+    .get(attempt.businessId, callRow.id)) as { id: string } | undefined;
   // Recover the scenario key from the persisted outcome so a replay reports
   // what actually happened rather than a guess. Live rows carry no scenario.
   const simulated = callRow.simulation === 1;
@@ -199,11 +199,13 @@ function limitedVerdict(
 }
 
 /** Give back one consumed unit when execution provably could not proceed. */
-function refundUsage(db: DB, usageDate: string, metric: string, amount: number): void {
-  db.prepare(
-    `UPDATE budget_usage SET used_value = MAX(0, used_value - ?), updated_at = ?
-      WHERE usage_date = ? AND metric = ?`,
-  ).run(amount, nowIso(), usageDate, metric);
+async function refundUsage(db: DB, usageDate: string, metric: string, amount: number): Promise<void> {
+  await db
+    .prepare(
+      `UPDATE budget_usage SET used_value = MAX(0, used_value - ?), updated_at = ?
+        WHERE usage_date = ? AND metric = ?`,
+    )
+    .run(amount, nowIso(), usageDate, metric);
 }
 
 /** Provider status strings -> our calls.status vocabulary. */
@@ -232,15 +234,15 @@ function mapCallStatus(raw: string): string {
  * rows and rethrown as `provider_unavailable`.
  */
 export async function placeCall(db: DB, cfg: Config, input: PlaceCallInput): Promise<PlaceCallResult> {
-  const lead = loadLead(db, input.businessId);
+  const lead = await loadLead(db, input.businessId);
   const purpose: OutreachPurpose = input.purpose ?? 'callback';
   const channel: OutreachChannel = 'call';
   const now = input.now ?? new Date();
 
   if (input.taskId) {
-    const task = db
+    const task = (await db
       .prepare('SELECT id, business_id, status FROM followup_tasks WHERE id = ?')
-      .get(input.taskId) as { id: string; business_id: string; status: string } | undefined;
+      .get(input.taskId)) as { id: string; business_id: string; status: string } | undefined;
     if (!task || task.business_id !== lead.id) throw notFound('Follow-up task');
     if (task.status !== 'due' && task.status !== 'scheduled') {
       throw new AppError('validation_failed', `Task is ${task.status}; only scheduled or due tasks can be called`, {
@@ -252,14 +254,14 @@ export async function placeCall(db: DB, cfg: Config, input: PlaceCallInput): Pro
 
   // Replay: the same idempotency key never places a second call.
   if (input.idempotencyKey?.trim()) {
-    const existing = findAttemptByKey(db, input.idempotencyKey.trim());
+    const existing = await findAttemptByKey(db, input.idempotencyKey.trim());
     if (existing) return replayCallResult(db, existing);
   }
 
   // 1. Guard. Owner-initiated calls (callback purpose) skip the calling-window
   //    block — a human deciding to call now is not automated harassment.
   const respectWindow = purpose !== 'callback';
-  const verdict = runGuard(db, cfg, {
+  const verdict = await runGuard(db, cfg, {
     businessId: lead.id,
     channel,
     purpose,
@@ -268,7 +270,7 @@ export async function placeCall(db: DB, cfg: Config, input: PlaceCallInput): Pro
   });
 
   if (!verdict.allowed) {
-    const { attempt } = recordAttempt(db, {
+    const { attempt } = await recordAttempt(db, {
       businessId: lead.id,
       channel,
       purpose,
@@ -284,7 +286,7 @@ export async function placeCall(db: DB, cfg: Config, input: PlaceCallInput): Pro
 
   // Live mode needs a destination number before anything is dialled.
   if (verdict.mode === 'live' && !lead.phone_e164) {
-    const { attempt } = recordAttempt(db, {
+    const { attempt } = await recordAttempt(db, {
       businessId: lead.id,
       channel,
       purpose,
@@ -305,9 +307,9 @@ export async function placeCall(db: DB, cfg: Config, input: PlaceCallInput): Pro
   //    short transaction — a provider call must never happen inside BEGIN
   //    IMMEDIATE). A provider failure keeps the consumption: a retry is a new
   //    request, exactly as the daily-limit setting documents.
-  const consumed = tx(db, () => tryConsumeUsage(db, dayKey, 'calls', 1));
+  const consumed = await tx(db, () => tryConsumeUsage(db, dayKey, 'calls', 1));
   if (!consumed) {
-    const { attempt } = recordAttempt(db, {
+    const { attempt } = await recordAttempt(db, {
       businessId: lead.id,
       channel,
       purpose,
@@ -326,7 +328,7 @@ export async function placeCall(db: DB, cfg: Config, input: PlaceCallInput): Pro
 
   // 2. Ledger row. Simulation is executable here; live fills `provider` after
   //    the adapter returns.
-  const { attempt } = recordAttempt(db, {
+  const { attempt } = await recordAttempt(db, {
     businessId: lead.id,
     channel,
     purpose,
@@ -337,8 +339,8 @@ export async function placeCall(db: DB, cfg: Config, input: PlaceCallInput): Pro
   });
 
   if (verdict.mode === 'simulation') {
-    return tx(db, (): PlaceCallResult => {
-      const call = placeSimulatedCall(db, {
+    return tx(db, async (): Promise<PlaceCallResult> => {
+      const call = await placeSimulatedCall(db, {
         businessId: lead.id,
         businessName: lead.display_name,
         toNumber: lead.phone_e164 ?? '(unknown)',
@@ -349,7 +351,7 @@ export async function placeCall(db: DB, cfg: Config, input: PlaceCallInput): Pro
       });
 
       // 5. Timeline. simulation = 1 keeps this out of every honesty rule.
-      const interaction = recordInteraction(db, {
+      const interaction = await recordInteraction(db, {
         businessId: lead.id,
         kind: 'call',
         direction: 'outbound',
@@ -366,7 +368,7 @@ export async function placeCall(db: DB, cfg: Config, input: PlaceCallInput): Pro
         createdBy: input.actor.userId,
       });
 
-      linkAttemptResult(db, attempt.id, { callId: call.id, provider: 'simulation' });
+      await linkAttemptResult(db, attempt.id, { callId: call.id, provider: 'simulation' });
       const stored = { ...attempt, callId: call.id, provider: 'simulation' };
       return { decision: 'allowed', simulated: true, attempt: stored, call: toCallInfo(call), interactionId: interaction.id };
     });
@@ -382,8 +384,8 @@ export async function placeCall(db: DB, cfg: Config, input: PlaceCallInput): Pro
   if (!telephony || !answerUrl) {
     // Config claims telephony is configured but no adapter is installed: the
     // counter is refunded and the request ledgerved as blocked. Nothing dialled.
-    refundUsage(db, dayKey, 'calls', 1);
-    const { attempt: blockedAttempt } = recordAttempt(db, {
+    await refundUsage(db, dayKey, 'calls', 1);
+    const { attempt: blockedAttempt } = await recordAttempt(db, {
       businessId: lead.id,
       channel,
       purpose,
@@ -403,15 +405,15 @@ export async function placeCall(db: DB, cfg: Config, input: PlaceCallInput): Pro
   // Mirror of the ux_calls_live_per_business index: at most one live outbound
   // call per lead may be in flight. Checked BEFORE dialling so a double-click
   // gets a first-class blocked result instead of a constraint error later.
-  const inflight = db
+  const inflight = (await db
     .prepare(
       `SELECT id FROM calls WHERE business_id = ? AND channel = 'call' AND direction = 'outbound'
          AND status IN ('queued','initiated','ringing','in_progress')`,
     )
-    .get(lead.id) as { id: string } | undefined;
+    .get(lead.id)) as { id: string } | undefined;
   if (inflight) {
-    refundUsage(db, dayKey, 'calls', 1);
-    const { attempt: blockedAttempt } = recordAttempt(db, {
+    await refundUsage(db, dayKey, 'calls', 1);
+    const { attempt: blockedAttempt } = await recordAttempt(db, {
       businessId: lead.id,
       channel,
       purpose,
@@ -436,28 +438,30 @@ export async function placeCall(db: DB, cfg: Config, input: PlaceCallInput): Pro
       statusCallbackUrl: statusUrl,
       metadata: { businessId: lead.id, attemptId: attempt.id },
     });
-    return tx(db, (): PlaceCallResult => {
+    return tx(db, async (): Promise<PlaceCallResult> => {
       const callId = newId('cal');
       const at = nowIso();
-      db.prepare(
-        `INSERT INTO calls (id, attempt_id, business_id, direction, channel, provider, provider_call_id, status,
-           outcome, to_number_e164, recording_enabled, recording_consent, started_at, simulation,
-           counts_against_daily_limit, daily_bucket, cost_state, created_at, updated_at)
-         VALUES (?, ?, ?, 'outbound', 'call', ?, ?, ?, 'unknown', ?, 0, 0, ?, 0, 1, ?, 'unavailable', ?, ?)`,
-      ).run(
-        callId,
-        attempt.id,
-        lead.id,
-        telephony.key,
-        res.providerCallId,
-        mapCallStatus(res.status),
-        lead.phone_e164 as string,
-        at,
-        dayKey,
-        at,
-        at,
-      );
-      const interaction = recordInteraction(db, {
+      await db
+        .prepare(
+          `INSERT INTO calls (id, attempt_id, business_id, direction, channel, provider, provider_call_id, status,
+             outcome, to_number_e164, recording_enabled, recording_consent, started_at, simulation,
+             counts_against_daily_limit, daily_bucket, cost_state, created_at, updated_at)
+           VALUES (?, ?, ?, 'outbound', 'call', ?, ?, ?, 'unknown', ?, 0, 0, ?, 0, 1, ?, 'unavailable', ?, ?)`,
+        )
+        .run(
+          callId,
+          attempt.id,
+          lead.id,
+          telephony.key,
+          res.providerCallId,
+          mapCallStatus(res.status),
+          lead.phone_e164 as string,
+          at,
+          dayKey,
+          at,
+          at,
+        );
+      const interaction = await recordInteraction(db, {
         businessId: lead.id,
         kind: 'call',
         direction: 'outbound',
@@ -467,7 +471,7 @@ export async function placeCall(db: DB, cfg: Config, input: PlaceCallInput): Pro
         simulation: false,
         createdBy: input.actor.userId,
       });
-      linkAttemptResult(db, attempt.id, { callId, provider: telephony.key });
+      await linkAttemptResult(db, attempt.id, { callId, provider: telephony.key });
       const stored = { ...attempt, callId, provider: telephony.key };
       return {
         decision: 'allowed',
@@ -495,30 +499,32 @@ export async function placeCall(db: DB, cfg: Config, input: PlaceCallInput): Pro
     const adapterErr = err instanceof AdapterError ? err : null;
     const detail = adapterErr ? adapterErr.message : err instanceof Error ? err.message : 'unknown provider failure';
     const failureCode = adapterErr ? adapterErr.code : 'provider_error';
-    const callId = tx(db, (): string => {
+    const callId = await tx(db, async (): Promise<string> => {
       const id = newId('cal');
       const at = nowIso();
-      db.prepare(
-        `INSERT INTO calls (id, attempt_id, business_id, direction, channel, provider, provider_call_id, status,
-           outcome, to_number_e164, recording_enabled, recording_consent, started_at, failure_code, failure_detail,
-           simulation, counts_against_daily_limit, daily_bucket, cost_state, created_at, updated_at)
-         VALUES (?, ?, ?, 'outbound', 'call', ?, NULL, 'failed', 'failed', ?, 0, 0, ?, ?, ?, 0, 1, ?, 'unavailable', ?, ?)`,
-      ).run(
-        id,
-        attempt.id,
-        lead.id,
-        telephony.key,
-        lead.phone_e164 ?? '(unknown)',
-        nowIso(),
-        failureCode,
-        detail,
-        dayKey,
-        at,
-        at,
-      );
+      await db
+        .prepare(
+          `INSERT INTO calls (id, attempt_id, business_id, direction, channel, provider, provider_call_id, status,
+             outcome, to_number_e164, recording_enabled, recording_consent, started_at, failure_code, failure_detail,
+             simulation, counts_against_daily_limit, daily_bucket, cost_state, created_at, updated_at)
+           VALUES (?, ?, ?, 'outbound', 'call', ?, NULL, 'failed', 'failed', ?, 0, 0, ?, ?, ?, 0, 1, ?, 'unavailable', ?, ?)`,
+        )
+        .run(
+          id,
+          attempt.id,
+          lead.id,
+          telephony.key,
+          lead.phone_e164 ?? '(unknown)',
+          nowIso(),
+          failureCode,
+          detail,
+          dayKey,
+          at,
+          at,
+        );
       // A provider rejection is NOT contact: kind 'system'/'internal' keeps it
       // in the timeline while making sure it can never evidence a stage change.
-      recordInteraction(db, {
+      await recordInteraction(db, {
         businessId: lead.id,
         kind: 'system',
         direction: 'internal',
@@ -528,7 +534,7 @@ export async function placeCall(db: DB, cfg: Config, input: PlaceCallInput): Pro
         simulation: false,
         createdBy: input.actor.userId,
       });
-      linkAttemptResult(db, attempt.id, { callId: id, provider: telephony.key });
+      await linkAttemptResult(db, attempt.id, { callId: id, provider: telephony.key });
       return id;
     });
     throw new AppError('provider_unavailable', `The telephony provider rejected the call: ${detail}`, {
@@ -573,24 +579,24 @@ export interface SharePortfolioInput {
  * Meta — our preview says which template ran, it does not invent a body.
  */
 export async function sharePortfolio(db: DB, cfg: Config, input: SharePortfolioInput): Promise<SharePortfolioResult> {
-  const lead = loadLead(db, input.businessId);
+  const lead = await loadLead(db, input.businessId);
   const channel: OutreachChannel = 'whatsapp_message';
   const purpose: OutreachPurpose = 'portfolio_share';
   const now = input.now ?? new Date();
 
   // Selection errors are validation errors, not outreach requests: resolve
   // them BEFORE the guard so the ledger only ever holds real action requests.
-  const items = resolveShareableItems(db, input.itemIds);
+  const items = await resolveShareableItems(db, input.itemIds);
 
   if (input.idempotencyKey?.trim()) {
-    const existing = findAttemptByKey(db, input.idempotencyKey.trim());
+    const existing = await findAttemptByKey(db, input.idempotencyKey.trim());
     if (existing) return replayShareResult(db, existing, items);
   }
 
-  const verdict = runGuard(db, cfg, { businessId: lead.id, channel, purpose, respectWindow: false, now });
+  const verdict = await runGuard(db, cfg, { businessId: lead.id, channel, purpose, respectWindow: false, now });
 
   if (!verdict.allowed) {
-    const { attempt } = recordAttempt(db, {
+    const { attempt } = await recordAttempt(db, {
       businessId: lead.id,
       channel,
       purpose,
@@ -618,7 +624,7 @@ export async function sharePortfolio(db: DB, cfg: Config, input: SharePortfolioI
           ? 'this lead has no phone or WhatsApp number'
           : null;
     if (gap) {
-      const { attempt: blockedAttempt } = recordAttempt(db, {
+      const { attempt: blockedAttempt } = await recordAttempt(db, {
         businessId: lead.id,
         channel,
         purpose,
@@ -637,14 +643,14 @@ export async function sharePortfolio(db: DB, cfg: Config, input: SharePortfolioI
     // Mirror of ux_messages_live_per_business: at most one WhatsApp message in
     // flight per lead. Checked before dialling so a double-click gets a
     // first-class blocked result instead of a constraint error.
-    const inflight = db
+    const inflight = (await db
       .prepare(
         `SELECT id FROM messages WHERE business_id = ? AND channel = 'whatsapp_message'
            AND status IN ('queued','accepted','sent')`,
       )
-      .get(lead.id) as { id: string } | undefined;
+      .get(lead.id)) as { id: string } | undefined;
     if (inflight) {
-      const { attempt: blockedAttempt } = recordAttempt(db, {
+      const { attempt: blockedAttempt } = await recordAttempt(db, {
         businessId: lead.id,
         channel,
         purpose,
@@ -679,7 +685,7 @@ export async function sharePortfolio(db: DB, cfg: Config, input: SharePortfolioI
       approval = { ok: false, status: 'UNVERIFIABLE', detail: `Template approval check failed (${detail}).` };
     }
     if (!approval.ok) {
-      const { attempt } = recordAttempt(db, {
+      const { attempt } = await recordAttempt(db, {
         businessId: lead.id,
         channel,
         purpose,
@@ -698,9 +704,9 @@ export async function sharePortfolio(db: DB, cfg: Config, input: SharePortfolioI
 
   // Atomic daily counter, consumed BEFORE the adapter runs (own transaction).
   // A provider failure keeps the consumption: a retry is a new request.
-  const consumed = tx(db, () => tryConsumeUsage(db, dayKey, 'whatsapp_messages', 1));
+  const consumed = await tx(db, () => tryConsumeUsage(db, dayKey, 'whatsapp_messages', 1));
   if (!consumed) {
-    const { attempt } = recordAttempt(db, {
+    const { attempt } = await recordAttempt(db, {
       businessId: lead.id,
       channel,
       purpose,
@@ -716,7 +722,7 @@ export async function sharePortfolio(db: DB, cfg: Config, input: SharePortfolioI
     return { decision: 'blocked', attempt };
   }
 
-  const { attempt } = recordAttempt(db, {
+  const { attempt } = await recordAttempt(db, {
     businessId: lead.id,
     channel,
     purpose,
@@ -726,33 +732,35 @@ export async function sharePortfolio(db: DB, cfg: Config, input: SharePortfolioI
   });
 
   if (verdict.mode === 'simulation') {
-    return tx(db, (): SharePortfolioResult => {
+    return tx(db, async (): Promise<SharePortfolioResult> => {
       const messageId = newId('msg');
       const at = nowIso();
       const preview = portfolioPreview(lead.display_name, items);
-      db.prepare(
-        `INSERT INTO messages (id, attempt_id, business_id, channel, provider, provider_message_id, template_key,
-           purpose, number_used, number_source, body_preview, status, status_source, error_code, error_detail,
-           simulation, counts_against_daily_limit, daily_bucket, cost_minor, cost_currency, cost_state,
-           sent_at, last_status_at, created_at, updated_at)
-         VALUES (?, ?, ?, 'whatsapp_message', 'simulation', NULL, NULL, ?, ?, ?, ?, 'sent', 'simulation', NULL, NULL,
-           1, 1, ?, NULL, NULL, 'unavailable', ?, ?, ?, ?)`,
-      ).run(
-        messageId,
-        attempt.id,
-        lead.id,
-        purpose,
-        numberUsed,
-        numberSource,
-        preview,
-        dayKey,
-        at,
-        at,
-        at,
-        at,
-      );
+      await db
+        .prepare(
+          `INSERT INTO messages (id, attempt_id, business_id, channel, provider, provider_message_id, template_key,
+             purpose, number_used, number_source, body_preview, status, status_source, error_code, error_detail,
+             simulation, counts_against_daily_limit, daily_bucket, cost_minor, cost_currency, cost_state,
+             sent_at, last_status_at, created_at, updated_at)
+           VALUES (?, ?, ?, 'whatsapp_message', 'simulation', NULL, NULL, ?, ?, ?, ?, 'sent', 'simulation', NULL, NULL,
+             1, 1, ?, NULL, NULL, 'unavailable', ?, ?, ?, ?)`,
+        )
+        .run(
+          messageId,
+          attempt.id,
+          lead.id,
+          purpose,
+          numberUsed,
+          numberSource,
+          preview,
+          dayKey,
+          at,
+          at,
+          at,
+          at,
+        );
 
-      const interaction = recordInteraction(db, {
+      const interaction = await recordInteraction(db, {
         businessId: lead.id,
         kind: 'whatsapp_message',
         direction: 'outbound',
@@ -768,7 +776,7 @@ export async function sharePortfolio(db: DB, cfg: Config, input: SharePortfolioI
         createdBy: input.actor.userId,
       });
 
-      linkAttemptResult(db, attempt.id, { messageId, provider: 'simulation' });
+      await linkAttemptResult(db, attempt.id, { messageId, provider: 'simulation' });
       return {
         decision: 'allowed',
         attempt: { ...attempt, messageId, provider: 'simulation' },
@@ -795,34 +803,36 @@ export async function sharePortfolio(db: DB, cfg: Config, input: SharePortfolioI
       languageCode: tpl.language,
       bodyParams: [lead.display_name],
     });
-    return tx(db, (): SharePortfolioResult => {
+    return tx(db, async (): Promise<SharePortfolioResult> => {
       const messageId = newId('msg');
       const at = nowIso();
-      db.prepare(
-        `INSERT INTO messages (id, attempt_id, business_id, channel, provider, provider_message_id, template_key,
-           purpose, number_used, number_source, body_preview, status, status_source, error_code, error_detail,
-           simulation, counts_against_daily_limit, daily_bucket, cost_minor, cost_currency, cost_state,
-           sent_at, last_status_at, created_at, updated_at)
-         VALUES (?, ?, ?, 'whatsapp_message', ?, ?, ?, ?, ?, ?, ?, 'accepted', 'provider_event', NULL, NULL,
-           0, 1, ?, NULL, NULL, 'unavailable', ?, ?, ?, ?)`,
-      ).run(
-        messageId,
-        attempt.id,
-        lead.id,
-        wa.key,
-        res.providerMessageId,
-        tpl.name,
-        purpose,
-        numberUsed,
-        numberSource,
-        livePortfolioPreview(tpl.name, lead.display_name, items.length),
-        dayKey,
-        at,
-        at,
-        at,
-        at,
-      );
-      const interaction = recordInteraction(db, {
+      await db
+        .prepare(
+          `INSERT INTO messages (id, attempt_id, business_id, channel, provider, provider_message_id, template_key,
+             purpose, number_used, number_source, body_preview, status, status_source, error_code, error_detail,
+             simulation, counts_against_daily_limit, daily_bucket, cost_minor, cost_currency, cost_state,
+             sent_at, last_status_at, created_at, updated_at)
+           VALUES (?, ?, ?, 'whatsapp_message', ?, ?, ?, ?, ?, ?, ?, 'accepted', 'provider_event', NULL, NULL,
+             0, 1, ?, NULL, NULL, 'unavailable', ?, ?, ?, ?)`,
+        )
+        .run(
+          messageId,
+          attempt.id,
+          lead.id,
+          wa.key,
+          res.providerMessageId,
+          tpl.name,
+          purpose,
+          numberUsed,
+          numberSource,
+          livePortfolioPreview(tpl.name, lead.display_name, items.length),
+          dayKey,
+          at,
+          at,
+          at,
+          at,
+        );
+      const interaction = await recordInteraction(db, {
         businessId: lead.id,
         kind: 'whatsapp_message',
         direction: 'outbound',
@@ -839,7 +849,7 @@ export async function sharePortfolio(db: DB, cfg: Config, input: SharePortfolioI
         simulation: false,
         createdBy: input.actor.userId,
       });
-      linkAttemptResult(db, attempt.id, { messageId, provider: wa.key });
+      await linkAttemptResult(db, attempt.id, { messageId, provider: wa.key });
       return {
         decision: 'allowed',
         attempt: { ...attempt, messageId, provider: wa.key },
@@ -856,35 +866,37 @@ export async function sharePortfolio(db: DB, cfg: Config, input: SharePortfolioI
     const adapterErr = err instanceof AdapterError ? err : null;
     const detail = adapterErr ? adapterErr.message : err instanceof Error ? err.message : 'unknown provider failure';
     const failureCode = adapterErr ? adapterErr.code : 'provider_error';
-    const messageId = tx(db, (): string => {
+    const messageId = await tx(db, async (): Promise<string> => {
       const id = newId('msg');
       const at = nowIso();
-      db.prepare(
-        `INSERT INTO messages (id, attempt_id, business_id, channel, provider, provider_message_id, template_key,
-           purpose, number_used, number_source, body_preview, status, status_source, error_code, error_detail,
-           simulation, counts_against_daily_limit, daily_bucket, cost_minor, cost_currency, cost_state,
-           sent_at, last_status_at, created_at, updated_at)
-         VALUES (?, ?, ?, 'whatsapp_message', ?, NULL, ?, ?, ?, ?, ?, 'failed', 'none', ?, ?, 0, 1, ?,
-           NULL, NULL, 'unavailable', NULL, NULL, ?, ?)`,
-      ).run(
-        id,
-        attempt.id,
-        lead.id,
-        wa.key,
-        tpl.name,
-        purpose,
-        numberUsed,
-        numberSource,
-        livePortfolioPreview(tpl.name, lead.display_name, items.length),
-        failureCode,
-        detail,
-        dayKey,
-        at,
-        at,
-      );
+      await db
+        .prepare(
+          `INSERT INTO messages (id, attempt_id, business_id, channel, provider, provider_message_id, template_key,
+             purpose, number_used, number_source, body_preview, status, status_source, error_code, error_detail,
+             simulation, counts_against_daily_limit, daily_bucket, cost_minor, cost_currency, cost_state,
+             sent_at, last_status_at, created_at, updated_at)
+           VALUES (?, ?, ?, 'whatsapp_message', ?, NULL, ?, ?, ?, ?, ?, 'failed', 'none', ?, ?, 0, 1, ?,
+             NULL, NULL, 'unavailable', NULL, NULL, ?, ?)`,
+        )
+        .run(
+          id,
+          attempt.id,
+          lead.id,
+          wa.key,
+          tpl.name,
+          purpose,
+          numberUsed,
+          numberSource,
+          livePortfolioPreview(tpl.name, lead.display_name, items.length),
+          failureCode,
+          detail,
+          dayKey,
+          at,
+          at,
+        );
       // Nothing reached the customer: this is bookkeeping, never contact
       // evidence — kind 'system'/'internal' keeps it out of stage changes.
-      recordInteraction(db, {
+      await recordInteraction(db, {
         businessId: lead.id,
         kind: 'system',
         direction: 'internal',
@@ -894,7 +906,7 @@ export async function sharePortfolio(db: DB, cfg: Config, input: SharePortfolioI
         simulation: false,
         createdBy: input.actor.userId,
       });
-      linkAttemptResult(db, attempt.id, { messageId: id, provider: wa.key });
+      await linkAttemptResult(db, attempt.id, { messageId: id, provider: wa.key });
       return id;
     });
     throw new AppError('provider_unavailable', `The WhatsApp provider rejected the message: ${detail}`, {
@@ -904,18 +916,22 @@ export async function sharePortfolio(db: DB, cfg: Config, input: SharePortfolioI
   }
 }
 
-function replayShareResult(db: DB, attempt: OutreachAttempt, items: PortfolioItem[]): SharePortfolioResult {
+async function replayShareResult(
+  db: DB,
+  attempt: OutreachAttempt,
+  items: PortfolioItem[],
+): Promise<SharePortfolioResult> {
   if (attempt.decision === 'blocked') return { decision: 'blocked', attempt };
   const row = attempt.messageId
-    ? (db.prepare('SELECT number_used, simulation FROM messages WHERE id = ?').get(attempt.messageId) as
+    ? ((await db.prepare('SELECT number_used, simulation FROM messages WHERE id = ?').get(attempt.messageId)) as
         | { number_used: string | null; simulation: number }
         | undefined)
     : undefined;
-  const inter = db
+  const inter = (await db
     .prepare(
       `SELECT id FROM interactions WHERE business_id = ? AND kind = 'whatsapp_message' AND json_extract(evidence_json, '$.attemptId') = ?`,
     )
-    .get(attempt.businessId, attempt.id) as { id: string } | undefined;
+    .get(attempt.businessId, attempt.id)) as { id: string } | undefined;
   const simulated = row?.simulation === 1;
   return {
     decision: 'allowed',
@@ -962,13 +978,13 @@ export interface CallSummary {
   endedAt: string | null;
 }
 
-export function listLeadCalls(db: DB, businessId: string, limit = 50): CallSummary[] {
-  const rows = db
+export async function listLeadCalls(db: DB, businessId: string, limit = 50): Promise<CallSummary[]> {
+  const rows = (await db
     .prepare(
       `SELECT id, attempt_id, channel, status, outcome, duration_seconds, simulation, started_at, ended_at
-         FROM calls WHERE business_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?`,
+         FROM calls WHERE business_id = ? ORDER BY created_at DESC, id DESC LIMIT ?`,
     )
-    .all(businessId, limit) as unknown as {
+    .all(businessId, limit)) as {
     id: string;
     attempt_id: string | null;
     channel: string;
@@ -1005,13 +1021,13 @@ export interface MessageSummary {
   sentAt: string | null;
 }
 
-export function listLeadMessages(db: DB, businessId: string, limit = 50): MessageSummary[] {
-  const rows = db
+export async function listLeadMessages(db: DB, businessId: string, limit = 50): Promise<MessageSummary[]> {
+  const rows = (await db
     .prepare(
       `SELECT id, attempt_id, channel, purpose, status, status_source, number_used, body_preview, simulation, sent_at
-         FROM messages WHERE business_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?`,
+         FROM messages WHERE business_id = ? ORDER BY created_at DESC, id DESC LIMIT ?`,
     )
-    .all(businessId, limit) as unknown as {
+    .all(businessId, limit)) as {
     id: string;
     attempt_id: string | null;
     channel: string;

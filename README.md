@@ -144,9 +144,10 @@ covered by automated tests.
 
 ### Automated test coverage
 
-`npm test` runs **573 tests across 87 suites** (unit + integration + API
+`npm test` runs **814 tests across 122 suites** (unit + integration + API
 acceptance), all green. `npm run typecheck` is clean and `npm run doctor`
-exits 0. No test ever touches a real network: adapters receive an injected
+exits 0 (with migration `011_leads_address_coords.sql` still intentionally
+pending). No test ever touches a real network: adapters receive an injected
 transport, and the default registry in the test environment is built from an
 explicit env map (never `process.env`), so local credentials cannot be
 exercised by the suite. The duplex bridge is covered end to end over a real
@@ -260,6 +261,7 @@ Lead discovery
 | `backend/docs/external-dependencies.md` | Every remaining external dependency with its exact owner action (provider accounts, hosting, DNS, GO LIVE) |
 | `backend/docs/deployment.md` | Vercel (frontend) + Railway (backend) topology, deploy sequence, env vars, and the honest current blockage |
 | `backend/docs/cloudyvoice-integration.md` | CloudyVoice SIP integration: what the carrier is, gateway architecture, implemented backend surface, blocked required values, ordered verification path |
+| `backend/docs/osm-local-discovery-guide.md` | PowerShell owner guide for free-first local lead discovery: Geofabrik PBF download → offline extraction → `osm_local` provider → dashboard, plus CSV export/import, ODbL attribution and troubleshooting |
 | `backend/deploy/sip/` | Gateway templates: `contract.md` (authoritative backend ⇄ gateway API), `README.md` (Windows-dev + VPS steps + firewall table), Asterisk/env/systemd `*.sample` files — placeholders only |
 
 ---

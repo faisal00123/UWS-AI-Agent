@@ -3,11 +3,20 @@
  *
  * Confidence tiers (Section 1.10):
  *   1.00  identical normalised phone      -> automatic merge
+ *   0.98  identical record-unique source URL (same source record, e.g. the
+ *         same OSM element page)           -> automatic merge
  *   0.96  identical website host          -> automatic merge
  *   0.92  identical normalised name+city  -> automatic merge
  *   0.75-0.91  fuzzy name match (same city, or phone last-4 overlap)
  *                                      -> flagged for MANUAL REVIEW only
  *   < 0.75 -> treated as distinct
+ *
+ * The source-URL tier only fires for URLs whose last path segment is a pure
+ * number (…/node/101, …/listing/55): such a URL identifies ONE record in
+ * its source, so two live rows carrying it are the same source record —
+ * typically a re-import of an updated extract where the name changed or the
+ * city is missing and the lower tiers cannot match. Shared listing/category
+ * pages (no numeric record id) are never treated as identity matches.
  *
  * Automatic merges never delete anything: the incoming row is retained with
  * `merged_into_id` set, its sources stay attached, and every kept/conflicting
@@ -32,13 +41,18 @@ export interface LeadCandidate {
   contactPersonName: string | null;
   sourceUrl: string | null;
   requirements: string | null;
+  /** Optional evidence-derived fields (Phase 2): carried to the INSERT, not
+   *  used for duplicate MATCHING — address/coords never invent a match. */
+  address?: string | null;
+  latitude?: number | null;
+  longitude?: number | null;
 }
 
 export interface DuplicateMatch {
   businessId: string;
   displayName: string;
   score: number;
-  strategy: 'exact_phone' | 'exact_website' | 'name_city' | 'fuzzy_name';
+  strategy: 'exact_phone' | 'source_record' | 'exact_website' | 'name_city' | 'fuzzy_name';
   matchedFields: { field: string; incoming: string; existing: string }[];
   autoMerge: boolean;
 }
@@ -56,17 +70,38 @@ interface ExistingRow {
 const AUTO_MERGE_THRESHOLD = 0.92;
 const REVIEW_THRESHOLD = 0.75;
 
+/**
+ * A source URL identifies exactly ONE record when its last path segment is a
+ * pure number (`…/node/101`, `…/way/222`, `…/listing/55`): that is the shape
+ * both the offline extractor (OSM element permalinks) and record-based
+ * directories use. Shared listing/category pages (`/category/clinics`,
+ * `/page/2`-style paths without an id, bare hosts) are NOT record-unique and
+ * must never drive an automatic merge — several different businesses can
+ * legitimately share them.
+ */
+function isRecordUniqueSourceUrl(raw: string): boolean {
+  try {
+    const url = new URL(raw);
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
+    const segments = url.pathname.split('/').filter((s) => s !== '');
+    const last = segments[segments.length - 1];
+    return last !== undefined && /^\d+$/.test(last);
+  } catch {
+    return false; // not even a URL -> never an identity match
+  }
+}
+
 /** Find the best duplicate candidate for an incoming lead (live rows only). */
-export function findDuplicate(db: DB, candidate: LeadCandidate): DuplicateMatch | null {
+export async function findDuplicate(db: DB, candidate: LeadCandidate): Promise<DuplicateMatch | null> {
   const matches: DuplicateMatch[] = [];
 
   const liveFilter = 'merged_into_id IS NULL';
   const byId = (row: ExistingRow): ExistingRow => row;
 
   if (candidate.phoneE164) {
-    const row = db
+    const row = (await db
       .prepare(`SELECT id, display_name, normalized_name, city, website_host, phone_e164, email FROM businesses WHERE phone_e164 = ? AND ${liveFilter}`)
-      .get(candidate.phoneE164) as ExistingRow | undefined;
+      .get(candidate.phoneE164)) as ExistingRow | undefined;
     if (row) {
       matches.push({
         businessId: byId(row).id,
@@ -79,10 +114,30 @@ export function findDuplicate(db: DB, candidate: LeadCandidate): DuplicateMatch 
     }
   }
 
+  if (matches.length === 0 && candidate.sourceUrl && isRecordUniqueSourceUrl(candidate.sourceUrl)) {
+    // Same source RECORD (e.g. the same OSM element page re-imported from an
+    // updated extract): the URL identifies one record, so a live row already
+    // carrying it is that record — even when the name changed or the city is
+    // missing and the lower tiers cannot match.
+    const row = (await db
+      .prepare(`SELECT id, display_name, normalized_name, city, website_host, phone_e164, email FROM businesses WHERE source_url = ? AND ${liveFilter}`)
+      .get(candidate.sourceUrl)) as ExistingRow | undefined;
+    if (row) {
+      matches.push({
+        businessId: row.id,
+        displayName: row.display_name,
+        score: 0.98,
+        strategy: 'source_record',
+        matchedFields: [{ field: 'source', incoming: candidate.sourceUrl, existing: candidate.sourceUrl }],
+        autoMerge: true,
+      });
+    }
+  }
+
   if (matches.length === 0 && candidate.websiteHost) {
-    const row = db
+    const row = (await db
       .prepare(`SELECT id, display_name, normalized_name, city, website_host, phone_e164, email FROM businesses WHERE website_host = ? AND ${liveFilter}`)
-      .get(candidate.websiteHost) as ExistingRow | undefined;
+      .get(candidate.websiteHost)) as ExistingRow | undefined;
     if (row) {
       matches.push({
         businessId: row.id,
@@ -99,13 +154,13 @@ export function findDuplicate(db: DB, candidate: LeadCandidate): DuplicateMatch 
     const normName = normalizeName(candidate.displayName);
     const normCity = normalizeCity(candidate.city ?? '');
     if (normName && normCity) {
-      const row = db
+      const row = (await db
         .prepare(
           `SELECT id, display_name, normalized_name, city, website_host, phone_e164, email
              FROM businesses
             WHERE normalized_name = ? AND lower(coalesce(city,'')) = ? AND ${liveFilter}`,
         )
-        .get(normName, normCity) as ExistingRow | undefined;
+        .get(normName, normCity)) as ExistingRow | undefined;
       if (row) {
         matches.push({
           businessId: row.id,
@@ -126,7 +181,7 @@ export function findDuplicate(db: DB, candidate: LeadCandidate): DuplicateMatch 
   if (matches.length === 0) {
     const normName = normalizeName(candidate.displayName);
     const normCity = normalizeCity(candidate.city ?? '');
-    const rows = db
+    const rows = (await db
       .prepare(
         `SELECT id, display_name, normalized_name, city, website_host, phone_e164, email
            FROM businesses
@@ -135,7 +190,7 @@ export function findDuplicate(db: DB, candidate: LeadCandidate): DuplicateMatch 
           ORDER BY discovered_at ASC
           LIMIT 300`,
       )
-      .all(normCity, normCity) as unknown as ExistingRow[];
+      .all(normCity, normCity)) as unknown as ExistingRow[];
 
     let best: DuplicateMatch | null = null;
     for (const row of rows) {
@@ -179,6 +234,9 @@ const MERGE_FIELDS = [
   'display_name',
   'category',
   'city',
+  'address',
+  'latitude',
+  'longitude',
   'website_url',
   'website_host',
   'phone_e164',
@@ -198,11 +256,11 @@ function isEmptyValue(v: unknown): boolean {
  * Fills gaps on the survivor from the incoming row and records every conflict
  * instead of overwriting. The incoming row itself is never modified.
  */
-export function reconcileSurvivor(db: DB, survivorId: string, mergedId: string): MergeOutcome {
-  const survivor = db.prepare('SELECT * FROM businesses WHERE id = ?').get(survivorId) as
+export async function reconcileSurvivor(db: DB, survivorId: string, mergedId: string): Promise<MergeOutcome> {
+  const survivor = (await db.prepare('SELECT * FROM businesses WHERE id = ?').get(survivorId)) as
     | Record<string, unknown>
     | undefined;
-  const incoming = db.prepare('SELECT * FROM businesses WHERE id = ?').get(mergedId) as
+  const incoming = (await db.prepare('SELECT * FROM businesses WHERE id = ?').get(mergedId)) as
     | Record<string, unknown>
     | undefined;
   if (!survivor || !incoming) {
@@ -229,16 +287,16 @@ export function reconcileSurvivor(db: DB, survivorId: string, mergedId: string):
     }
   }
 
-  for (const u of updates) db.prepare(u.sql).run(...(u.params as never[]));
-  db.prepare('UPDATE businesses SET updated_at = ? WHERE id = ?').run(nowIso(), survivorId);
+  for (const u of updates) await db.prepare(u.sql).run(...(u.params as never[]));
+  await db.prepare('UPDATE businesses SET updated_at = ? WHERE id = ?').run(nowIso(), survivorId);
   return { kept, overridden };
 }
 
 /** Record the merge in merge_history + duplicate_candidates + audit. */
-export function recordMerge(db: DB, opts: MergeOptions, outcome: MergeOutcome): string {
+export async function recordMerge(db: DB, opts: MergeOptions, outcome: MergeOutcome): Promise<string> {
   const mergeId = newId('mrg');
   const at = nowIso();
-  db.prepare(
+  await db.prepare(
     `INSERT INTO merge_history
        (id, survivor_id, merged_id, match_score, strategy, kept_values_json, overridden_values_json,
         sources_merged, performed_by, performed_at)
@@ -257,15 +315,15 @@ export function recordMerge(db: DB, opts: MergeOptions, outcome: MergeOutcome): 
 
   // Canonical (a < b) upsert of the duplicate-candidate decision.
   const [a, b] = [opts.survivorId, opts.mergedId].sort() as [string, string];
-  const existing = db
+  const existing = (await db
     .prepare('SELECT id FROM duplicate_candidates WHERE business_id_a = ? AND business_id_b = ?')
-    .get(a, b) as { id: string } | undefined;
+    .get(a, b)) as { id: string } | undefined;
   if (existing) {
-    db.prepare(
+    await db.prepare(
       `UPDATE duplicate_candidates SET status = 'merged', auto_merged = 1, decided_by = ?, decided_at = ?, decision_note = ? WHERE id = ?`,
     ).run(opts.actor.userId, at, opts.reason ?? `auto-merged (${opts.strategy})`, existing.id);
   } else {
-    db.prepare(
+    await db.prepare(
       `INSERT INTO duplicate_candidates (id, business_id_a, business_id_b, match_score, match_fields, status, auto_merged, decided_by, decided_at, decision_note, created_at)
        VALUES (?, ?, ?, ?, ?, 'merged', 1, ?, ?, ?, ?)`,
     ).run(
@@ -281,7 +339,7 @@ export function recordMerge(db: DB, opts: MergeOptions, outcome: MergeOutcome): 
     );
   }
 
-  recordAudit(db, {
+  await recordAudit(db, {
     actorUserId: opts.actor.userId,
     actorLabel: opts.actor.label,
     action: 'lead.merge',
@@ -300,27 +358,27 @@ export function recordMerge(db: DB, opts: MergeOptions, outcome: MergeOutcome): 
 }
 
 /** Flag an uncertain match for manual review (never merged automatically). */
-export function flagForReview(
+export async function flagForReview(
   db: DB,
   incomingId: string,
   match: DuplicateMatch,
   actor: { userId: string | null; label: string },
-): void {
+): Promise<void> {
   const at = nowIso();
   const [a, b] = [incomingId, match.businessId].sort() as [string, string];
-  const existing = db
+  const existing = (await db
     .prepare('SELECT id, status FROM duplicate_candidates WHERE business_id_a = ? AND business_id_b = ?')
-    .get(a, b) as { id: string; status: string } | undefined;
+    .get(a, b)) as { id: string; status: string } | undefined;
   if (!existing) {
-    db.prepare(
+    await db.prepare(
       `INSERT INTO duplicate_candidates (id, business_id_a, business_id_b, match_score, match_fields, status, created_at)
        VALUES (?, ?, ?, ?, ?, 'pending', ?)`,
     ).run(newId('dup'), a, b, match.score, JSON.stringify(match.matchedFields), at);
   }
-  db.prepare(
+  await db.prepare(
     `UPDATE businesses SET duplicate_status = 'pending_review', duplicate_of_id = ?, updated_at = ? WHERE id = ? AND merged_into_id IS NULL`,
   ).run(match.businessId, at, incomingId);
-  recordAudit(db, {
+  await recordAudit(db, {
     actorUserId: actor.userId,
     actorLabel: actor.label as 'owner' | 'staff' | 'system' | 'scheduler',
     action: 'lead.duplicate_flagged',
@@ -332,14 +390,14 @@ export function flagForReview(
 }
 
 /** Manually resolve a pending duplicate. */
-export function resolveDuplicate(
+export async function resolveDuplicate(
   db: DB,
   duplicateId: string,
   decision: 'merge' | 'not_duplicate',
   actor: { userId: string | null; label: 'owner' | 'staff' | 'system' | 'scheduler' },
   note?: string,
-): { survivorId: string; mergedId: string | null } {
-  const row = db.prepare('SELECT * FROM duplicate_candidates WHERE id = ?').get(duplicateId) as
+): Promise<{ survivorId: string; mergedId: string | null }> {
+  const row = (await db.prepare('SELECT * FROM duplicate_candidates WHERE id = ?').get(duplicateId)) as
     | {
         id: string;
         business_id_a: string;
@@ -353,15 +411,15 @@ export function resolveDuplicate(
 
   const at = nowIso();
   if (decision === 'not_duplicate') {
-    db.prepare(
+    await db.prepare(
       `UPDATE duplicate_candidates SET status = 'reviewed_not_duplicate', decided_by = ?, decided_at = ?, decision_note = ? WHERE id = ?`,
     ).run(actor.userId, at, note ?? 'reviewed: distinct businesses', duplicateId);
     for (const id of [row.business_id_a, row.business_id_b]) {
-      db.prepare(
+      await db.prepare(
         `UPDATE businesses SET duplicate_status = 'unique', duplicate_of_id = NULL, updated_at = ? WHERE id = ?`,
       ).run(at, id);
     }
-    recordAudit(db, {
+    await recordAudit(db, {
       actorUserId: actor.userId,
       actorLabel: actor.label,
       action: 'lead.duplicate_rejected',
@@ -374,14 +432,14 @@ export function resolveDuplicate(
   }
 
   // Merge: the older record survives (deterministic), the newer merges into it.
-  const older = db.prepare('SELECT id, discovered_at FROM businesses WHERE id = ?').get(row.business_id_a) as { discovered_at: string };
-  const newer = db.prepare('SELECT id, discovered_at FROM businesses WHERE id = ?').get(row.business_id_b) as { discovered_at: string };
+  const older = (await db.prepare('SELECT id, discovered_at FROM businesses WHERE id = ?').get(row.business_id_a)) as { discovered_at: string };
+  const newer = (await db.prepare('SELECT id, discovered_at FROM businesses WHERE id = ?').get(row.business_id_b)) as { discovered_at: string };
   const survivorId = older.discovered_at <= newer.discovered_at ? row.business_id_a : row.business_id_b;
   const mergedId = survivorId === row.business_id_a ? row.business_id_b : row.business_id_a;
 
-  markMerged(db, survivorId, mergedId);
-  const outcome = reconcileSurvivor(db, survivorId, mergedId);
-  recordMerge(
+  await markMerged(db, survivorId, mergedId);
+  const outcome = await reconcileSurvivor(db, survivorId, mergedId);
+  await recordMerge(
     db,
     { survivorId, mergedId, strategy: 'fuzzy_name', matchScore: row.match_score, actor, reason: note ?? 'manual merge' },
     outcome,
@@ -390,9 +448,9 @@ export function resolveDuplicate(
 }
 
 /** Apply merged_into_id to the incoming row (must happen before value checks). */
-export function markMerged(db: DB, survivorId: string, mergedId: string, reason?: string): void {
+export async function markMerged(db: DB, survivorId: string, mergedId: string, reason?: string): Promise<void> {
   const at = nowIso();
-  db.prepare(
+  await db.prepare(
     `UPDATE businesses
         SET merged_into_id = ?,
             duplicate_status = 'duplicate',

@@ -26,6 +26,7 @@
  * into a stream that could only produce silence or invented speech.
  */
 import { Router } from 'express';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { asyncRoute } from '../types.ts';
 import { AppError } from '../../core/errors.ts';
 import {
@@ -97,7 +98,7 @@ export function webhookRoutes(): Router {
 
   router.post(
     '/whatsapp',
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const adapters = req.ctx.deps.adapters;
       if (!adapters?.whatsapp) {
         throw new AppError('not_found', 'WhatsApp webhooks are not configured');
@@ -125,7 +126,7 @@ export function webhookRoutes(): Router {
             const id = typeof status['id'] === 'string' ? status['id'] : 'unknown';
             const st = typeof status['status'] === 'string' ? status['status'] : 'unknown';
             const ts = typeof status['timestamp'] === 'string' ? status['timestamp'] : hourBucket();
-            const outcome = ingestProviderEvent(
+            const outcome = await ingestProviderEvent(
               req.ctx.deps.db,
               {
                 provider: 'whatsapp_cloud',
@@ -142,7 +143,7 @@ export function webhookRoutes(): Router {
           const messages = (value['messages'] ?? []) as Record<string, unknown>[];
           for (const m of messages) {
             const id = typeof m['id'] === 'string' ? m['id'] : 'unknown';
-            const outcome = ingestProviderEvent(
+            const outcome = await ingestProviderEvent(
               req.ctx.deps.db,
               {
                 provider: 'whatsapp_cloud',
@@ -168,7 +169,7 @@ export function webhookRoutes(): Router {
   // Status callbacks (Twilio POST, form-encoded, signed).
   router.post(
     '/telephony/twilio',
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const adapters = req.ctx.deps.adapters;
       if (!adapters?.telephony) throw new AppError('not_found', 'Telephony webhooks are not configured');
       const params = strParams(req.body);
@@ -188,7 +189,7 @@ export function webhookRoutes(): Router {
       // Timestamp is provider-supplied; without it an hour bucket keeps
       // repeats of the same status idempotent without inventing precision.
       const ts = params['Timestamp'] ?? hourBucket();
-      const outcome = ingestProviderEvent(
+      const outcome = await ingestProviderEvent(
         req.ctx.deps.db,
         {
           provider: 'twilio',
@@ -216,7 +217,7 @@ export function webhookRoutes(): Router {
   // carry a Twilio signature header). Anything else gets the fixed greeting.
   router.get(
     '/telephony/twilio/voice',
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const { adapters, config, db, logger } = req.ctx.deps;
       if (!adapters?.telephony || !adapters.voiceAnswerUrl) {
         throw new AppError('not_found', 'Telephony voice endpoint is not configured');
@@ -233,11 +234,11 @@ export function webhookRoutes(): Router {
       };
       const callSid = query('CallSid');
       const duplexReady =
-        config.duplex.enabled && duplexPorts(adapters.speech, adapters.ai) && callSid !== null;
+        config.duplex.enabled && (await duplexPorts(adapters.speech, adapters.ai)) && callSid !== null;
 
       if (duplexReady && callSid) {
         try {
-          const resolved = resolveCallForAnswer(db, {
+          const resolved = await resolveCallForAnswer(db, {
             callSid,
             from: query('From'),
             to: query('To'),
@@ -269,10 +270,16 @@ function hourBucket(): string {
   return new Date().toISOString().slice(0, 13); // YYYY-MM-DDTHH
 }
 
-/** Constant-time compare for the owner-configured webhook verify token. */
+/**
+ * Constant-time compare for the owner-configured webhook verify token.
+ *
+ * Both sides are hashed to fixed-size SHA-256 digests before comparing, so
+ * neither the LENGTH nor the content of the expected token can be probed:
+ * a plain `a.length !== b.length` early return would leak the length to an
+ * unauthenticated caller.
+ */
 function timingSafeStringEqual(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return diff === 0;
+  const bufA = createHash('sha256').update(a).digest();
+  const bufB = createHash('sha256').update(b).digest();
+  return timingSafeEqual(bufA, bufB);
 }

@@ -46,10 +46,23 @@ const prospectTextBody = z.object({ text: z.string().min(1).max(4000) });
 
 // ~190KB of binary fits the 256kb JSON body limit once base64-encoded (+33%).
 const MAX_AUDIO_B64 = 200_000;
+// These two strings are interpolated into OUTBOUND multipart/HTTP headers by
+// the speech adapters, so any value containing quotes, CR/LF or backslashes
+// (header/field injection) is REJECTED at the boundary — a clean value can
+// never reach a header sink.
+const MIME_RE = /^[\w.+-]+\/[\w.+-]+(\s*;\s*[\w.+-]+=\s*[\w.+-]+)*$/;
 const prospectAudioBody = z.object({
   audioBase64: z.string().min(1).max(MAX_AUDIO_B64),
-  mimeType: z.string().max(80).optional(),
-  filename: z.string().max(120).optional(),
+  mimeType: z
+    .string()
+    .max(80)
+    .refine((s) => MIME_RE.test(s), { message: 'invalid mime type' })
+    .optional(),
+  filename: z
+    .string()
+    .max(120)
+    .refine((s) => !/["\r\n\\/]/.test(s), { message: 'invalid filename' })
+    .optional(),
 });
 
 function mediaDeps(ctx: { deps: AppDeps }): { speech: SpeechPort | null; ai: ConversationPort | null } {
@@ -65,9 +78,9 @@ export function mediaRoutes(_deps: AppDeps): Router {
     '/',
     requireAuth,
     requireCsrf,
-    asyncRoute((req, res) => {
+    asyncRoute(async (req, res) => {
       const body = startBody.parse(req.body);
-      const conversationId = startConversation(req.ctx.deps.db, req.ctx.deps.config, {
+      const conversationId = await startConversation(req.ctx.deps.db, req.ctx.deps.config, {
         businessId: body.businessId,
         callId: body.callId ?? null,
         ...(body.language !== undefined ? { language: body.language } : {}),
@@ -110,7 +123,7 @@ export function mediaRoutes(_deps: AppDeps): Router {
         });
         return;
       }
-      const turn = ingestProspectText(req.ctx.deps.db, id, parsedText.data.text);
+      const turn = await ingestProspectText(req.ctx.deps.db, id, parsedText.data.text);
       res.json({ turn });
     }),
   );
