@@ -36,6 +36,22 @@ const EnvSchema = z.object({
   PORT: intIn(1, 65535).default(3100),
   PUBLIC_BASE_URL: z.string().default('http://localhost:3000'),
   DATABASE_PATH: z.string().min(1).default('./data/uws.sqlite'),
+  /**
+   * Supabase PostgreSQL connection string. When set, the application uses
+   * PostgreSQL exclusively — there is NO fallback to DATABASE_PATH if the
+   * connection fails (a missing expected database must fail loudly).
+   * Never logged, never echoed; only its presence is reported.
+   */
+  DATABASE_URL: z.string().default(''),
+  /** Pooled PostgreSQL connections (free tiers count every connection). */
+  DB_POOL_MAX: intIn(1, 20).default(5),
+  /** Server-side statement timeout (ms) — protects against runaway queries. */
+  DB_STATEMENT_TIMEOUT_MS: intIn(1_000, 120_000).default(15_000),
+  /**
+   * Explicit owner opt-in for creating a NEW database (db:init). Production
+   * refuses to initialise an empty database without this flag.
+   */
+  DB_INIT_CONFIRM: boolish.default(false),
 
   SESSION_SECRET: z.string().default(''),
   SESSION_TTL_HOURS: intIn(1, 24 * 30).default(12),
@@ -68,6 +84,35 @@ const EnvSchema = z.object({
   BACKUP_INTERVAL_HOURS: intIn(1, 48).default(24),
   /** How often a restore test must re-verify the newest backup. */
   RESTORE_TEST_INTERVAL_DAYS: intIn(1, 30).default(7),
+  /**
+   * Cloudflare R2 (S3-compatible) off-site backup target. Backups are
+   * uploaded only when ALL of R2_ACCOUNT_ID / R2_ACCESS_KEY_ID /
+   * R2_SECRET_ACCESS_KEY / R2_BUCKET are present. Values are never logged.
+   */
+  R2_ACCOUNT_ID: z.string().default(''),
+  R2_ACCESS_KEY_ID: z.string().default(''),
+  R2_SECRET_ACCESS_KEY: z.string().default(''),
+  R2_BUCKET: z.string().default(''),
+  /** Optional key prefix inside the bucket (default: uws/backups). */
+  R2_PREFIX: z.string().default('uws/backups'),
+  /** Optional endpoint override; default https://<account>.r2.cloudflarestorage.com */
+  R2_ENDPOINT: z.string().default(''),
+  /**
+   * Bearer secret for the external backup cron trigger endpoint
+   * (POST /api/internal/backup/run). Empty = endpoint disabled.
+   */
+  BACKUP_TRIGGER_SECRET: z.string().default(''),
+
+  // ----------------------------------------------------- monitoring quotas --
+  // App-side limits used by domain/monitoring to evaluate the 70/85/95%
+  // thresholds. Defaults match the FREE tiers (Supabase 500 MB database,
+  // Cloudflare R2 10 GB). Raising these never enables billing by itself.
+  /** Database size quota in MB (warn/urgent/critical at 70/85/95% of it). */
+  DB_SIZE_QUOTA_MB: intIn(1, 100_000).default(500),
+  /** Round-trip budget for a trivial query, in milliseconds. */
+  DB_LATENCY_BUDGET_MS: intIn(10, 60_000).default(500),
+  /** Backup storage quota in MB across local + off-site copies. */
+  BACKUP_STORAGE_QUOTA_MB: intIn(1, 1_000_000).default(10_240),
 
   LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error', 'silent']).default('info'),
   LOG_REDACT: boolish.default(true),
@@ -108,6 +153,7 @@ const EnvSchema = z.object({
 
   DISCOVERY_PROVIDER: z.string().default(''),
   DISCOVERY_API_KEY: z.string().default(''),
+  GEOAPIFY_API_KEY: z.string().default(''),
   // Optional self-hosted Overpass instance (Phase 12); empty = the public
   // overpass-api.de instance. Not a secret — it is a URL, but it is env-only
   // configuration like everything else and never echoed in responses. The
@@ -190,6 +236,12 @@ export interface Config {
   port: number;
   publicBaseUrl: string;
   databasePath: string;
+  /** Supabase PostgreSQL URL ('' = SQLite mode at databasePath). */
+  databaseUrl: string;
+  dbPoolMax: number;
+  dbStatementTimeoutMs: number;
+  /** Owner opt-in required to initialise a brand-new production database. */
+  dbInitConfirm: boolean;
   sessionSecret: string;
   sessionTtlHours: number;
   operatingModeSeed: 'simulation' | 'live';
@@ -207,6 +259,25 @@ export interface Config {
     passphrase: string;
     intervalHours: number;
     restoreTestDays: number;
+    /** Cloudflare R2 off-site target (values never logged/echoed). */
+    r2: {
+      accountId: string;
+      accessKeyId: string;
+      secretAccessKey: string;
+      bucket: string;
+      prefix: string;
+      endpoint: string;
+      /** True only when every required R2 credential is present. */
+      configured: boolean;
+    };
+    /** Secret for the external cron trigger endpoint ('' = disabled). */
+    triggerSecret: string;
+  };
+  /** App-side monitoring quotas (free-tier defaults; see env comments). */
+  monitoring: {
+    dbSizeQuotaBytes: number;
+    dbLatencyBudgetMs: number;
+    backupStorageQuotaBytes: number;
   };
   logLevel: 'debug' | 'info' | 'warn' | 'error' | 'silent';
   logRedact: boolean;
@@ -260,6 +331,22 @@ function providerStatus(
   else if (present.length === 0) state = 'unconfigured';
   else state = 'partial';
   return { key, label, state, present, missing, features, requiredSetup };
+}
+
+/**
+ * Discovery providers that need NO API key (public/local data): Overpass
+ * (free public API) and osm_local (a local file on this machine). Requiring
+ * DISCOVERY_API_KEY for either would report a perfectly functional setup as
+ * `partial`, so the key requirement is provider-aware.
+ */
+function isKeylessDiscovery(env: Env): boolean {
+  const provider = (env['DISCOVERY_PROVIDER'] ?? '').trim().toLowerCase();
+  return provider === 'overpass' || provider === 'osm_local';
+}
+
+function isGeoapifyDiscovery(env: Env): boolean {
+  const provider = (env['DISCOVERY_PROVIDER'] ?? '').trim().toLowerCase();
+  return provider === 'geoapify';
 }
 
 export function loadConfig(env: Env = process.env): Config {
@@ -342,21 +429,33 @@ export function loadConfig(env: Env = process.env): Config {
       ['WhatsApp Business account + approved template', 'valid credentials in .env', 'app secret + webhook verify token for callbacks'],
     ),
     // Phase 12: OpenStreetMap/Overpass discovery needs NO API key (public
-    // data). Requiring DISCOVERY_API_KEY for it would report a perfectly
-    // functional setup as "partial", so the requirement is provider-aware.
+    // data), and the offline osm_local provider (Geofabrik extraction,
+    // Phase 3) reads a local file — also keyless. Requiring
+    // DISCOVERY_API_KEY for them would report a perfectly functional setup
+    // as "partial", so the requirement is provider-aware.
     providerStatus(
       'discovery',
       'Lead discovery',
       env,
-      (env['DISCOVERY_PROVIDER'] ?? '').trim().toLowerCase() === 'overpass'
+      isKeylessDiscovery(env)
         ? ['DISCOVERY_PROVIDER']
-        : ['DISCOVERY_PROVIDER', 'DISCOVERY_API_KEY'],
-      (env['DISCOVERY_PROVIDER'] ?? '').trim().toLowerCase() === 'overpass'
-        ? ['public OpenStreetMap lead search (free, no key)']
-        : ['public web/directory lead search'],
-      (env['DISCOVERY_PROVIDER'] ?? '').trim().toLowerCase() === 'overpass'
-        ? ['OpenStreetMap data via the free Overpass API']
-        : ['Approved search or directory API key'],
+        : isGeoapifyDiscovery(env)
+          ? ['DISCOVERY_PROVIDER', 'GEOAPIFY_API_KEY']
+          : ['DISCOVERY_PROVIDER', 'DISCOVERY_API_KEY'],
+      (env['DISCOVERY_PROVIDER'] ?? '').trim().toLowerCase() === 'osm_local'
+        ? ['offline OpenStreetMap lead search from a local dataset (free, no key, no network)']
+        : isGeoapifyDiscovery(env)
+          ? ['Geoapify Places API lead search (paid tier, quota-protected) via GEOAPIFY_API_KEY']
+          : isKeylessDiscovery(env)
+            ? ['public OpenStreetMap lead search (free, no key)']
+            : ['public web/directory lead search'],
+      (env['DISCOVERY_PROVIDER'] ?? '').trim().toLowerCase() === 'osm_local'
+        ? ['Extracted NDJSON dataset on this machine (npm run extract:osm)']
+        : isGeoapifyDiscovery(env)
+          ? ['Geoapify Places API (key via GEOAPIFY_API_KEY env var)']
+          : isKeylessDiscovery(env)
+            ? ['OpenStreetMap data via the free Overpass API']
+            : ['Approved search or directory API key'],
     ),
     providerStatus(
       'ai',
@@ -409,6 +508,10 @@ export function loadConfig(env: Env = process.env): Config {
     port: e.PORT,
     publicBaseUrl: e.PUBLIC_BASE_URL.replace(/\/+$/, ''),
     databasePath: e.DATABASE_PATH,
+    databaseUrl: e.DATABASE_URL.trim(),
+    dbPoolMax: e.DB_POOL_MAX,
+    dbStatementTimeoutMs: e.DB_STATEMENT_TIMEOUT_MS,
+    dbInitConfirm: e.DB_INIT_CONFIRM,
     sessionSecret,
     sessionTtlHours: e.SESSION_TTL_HOURS,
     operatingModeSeed: e.OPERATING_MODE,
@@ -430,6 +533,26 @@ export function loadConfig(env: Env = process.env): Config {
       passphrase: e.BACKUP_PASSPHRASE,
       intervalHours: e.BACKUP_INTERVAL_HOURS,
       restoreTestDays: e.RESTORE_TEST_INTERVAL_DAYS,
+      r2: {
+        accountId: e.R2_ACCOUNT_ID.trim(),
+        accessKeyId: e.R2_ACCESS_KEY_ID.trim(),
+        secretAccessKey: e.R2_SECRET_ACCESS_KEY.trim(),
+        bucket: e.R2_BUCKET.trim(),
+        prefix: e.R2_PREFIX.trim().replace(/^\/+|\/+$/g, ''),
+        endpoint: e.R2_ENDPOINT.trim(),
+        configured: Boolean(
+          e.R2_ACCOUNT_ID.trim() &&
+            e.R2_ACCESS_KEY_ID.trim() &&
+            e.R2_SECRET_ACCESS_KEY.trim() &&
+            e.R2_BUCKET.trim(),
+        ),
+      },
+      triggerSecret: e.BACKUP_TRIGGER_SECRET,
+    },
+    monitoring: {
+      dbSizeQuotaBytes: e.DB_SIZE_QUOTA_MB * 1024 * 1024,
+      dbLatencyBudgetMs: e.DB_LATENCY_BUDGET_MS,
+      backupStorageQuotaBytes: e.BACKUP_STORAGE_QUOTA_MB * 1024 * 1024,
     },
     logLevel: e.LOG_LEVEL,
     logRedact: e.LOG_REDACT,
