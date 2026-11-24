@@ -21,6 +21,7 @@ import { createMockDiscoveryAdapter } from '../mock/index.ts';
 import { createUnconfiguredDiscovery } from './unconfigured.ts';
 import { createOsmLocalDiscoveryAdapter } from './osm-local.ts';
 import { createOverpassDiscoveryAdapter } from './overpass.ts';
+import { createGeoapifyDiscoveryAdapter } from './geoapify.ts';
 
 type Env = Record<string, string | undefined>;
 
