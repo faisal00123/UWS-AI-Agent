@@ -225,7 +225,16 @@ export function createGeoapifyDiscoveryAdapter(opts: {
         }
         return { ok: true, detail: `Geoapify API reachable at ${new URL(url).host} (free count probe)` };
       } catch (err: any) {
-        return { ok: false, detail: `Geoapify API probe failed: ${err.message}` };
+        const category = classifyTransportError(err);
+        const sanitizedMessages: Record<TransportCategory, string> = {
+          timeout: 'Geoapify API probe failed: connection timeout',
+          dns: 'Geoapify API probe failed: DNS resolution failure',
+          tls: 'Geoapify API probe failed: TLS/certificate handshake failure',
+          refused: 'Geoapify API probe failed: connection refused',
+          reset: 'Geoapify API probe failed: connection reset',
+          unknown: `Geoapify API probe failed: ${err.message}`,
+        };
+        return { ok: false, detail: sanitizedMessages[category] };
       }
     },
 
