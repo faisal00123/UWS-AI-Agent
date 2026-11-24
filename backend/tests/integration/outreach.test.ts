@@ -124,7 +124,7 @@ describe('outreach guard & ledger', () => {
   before(() => {
     cfg = loadConfig({ NODE_ENV: 'test', SESSION_SECRET: 'test'.padEnd(48, '0'), DATABASE_PATH: ':memory:' });
     db = openDatabase(':memory:');
-    runMigrations(db);
+    await runMigrations(db);
     enableChannels({ call: true, whatsappMessage: true });
   });
   after(() => db.close());
@@ -286,7 +286,7 @@ describe('simulation calling & transcripts', () => {
   before(() => {
     cfg = loadConfig({ NODE_ENV: 'test', SESSION_SECRET: 'test'.padEnd(48, '0'), DATABASE_PATH: ':memory:' });
     db = openDatabase(':memory:');
-    runMigrations(db);
+    await runMigrations(db);
     enableChannels({ call: true, whatsappMessage: true });
   });
   after(() => db.close());
@@ -446,7 +446,7 @@ describe('portfolio sharing', () => {
   before(() => {
     cfg = loadConfig({ NODE_ENV: 'test', SESSION_SECRET: 'test'.padEnd(48, '0'), DATABASE_PATH: ':memory:' });
     db = openDatabase(':memory:');
-    runMigrations(db);
+    await runMigrations(db);
     enableChannels({ call: true, whatsappMessage: true });
   });
   after(() => db.close());

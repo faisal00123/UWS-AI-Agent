@@ -36,7 +36,7 @@ describe('lead import pipeline', () => {
       LOG_LEVEL: 'silent',
     });
     db = openDatabase(':memory:');
-    runMigrations(db);
+    await runMigrations(db);
   });
   after(() => db.close());
   beforeEach(() => {
@@ -256,7 +256,7 @@ describe('lead import pipeline', () => {
 describe('lead repository', () => {
   before(() => {
     db = openDatabase(':memory:');
-    runMigrations(db);
+    await runMigrations(db);
     cfg = loadConfig({ NODE_ENV: 'test', SESSION_SECRET: 'test'.padEnd(48, '0'), DATABASE_PATH: ':memory:' });
   });
   after(() => db.close());

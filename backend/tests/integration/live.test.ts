@@ -117,7 +117,7 @@ describe('live mode execution', () => {
   before(async () => {
     cfg = loadConfig({ NODE_ENV: 'test', SESSION_SECRET: 'test'.padEnd(48, '0'), DATABASE_PATH: ':memory:', ...LIVE_ENV });
     db = openDatabase(':memory:');
-    runMigrations(db);
+    await runMigrations(db);
     // Phase 11B guardrail: entering live mode requires a VERIFIED telephony
     // onboarding (free connection probe), not merely present credentials.
     // The probe runs on its OWN fake fetch so it never pollutes the dial-call

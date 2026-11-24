@@ -72,7 +72,7 @@ const owner = { userId: null, label: 'owner' as const };
 function freshDb(): { db: DB; cfg: Config } {
   const cfg = loadConfig(TEST_ENV);
   const db = openDatabase(':memory:');
-  runMigrations(db);
+  await runMigrations(db);
   return { db, cfg };
 }
 
@@ -499,7 +499,7 @@ describe('notifications', () => {
   test('NOTIFY_OWNER_EMAIL delivers when the destination setting is empty, and the setting wins when set', async () => {
     const cfg = loadConfig({ ...TEST_ENV, NOTIFY_OWNER_EMAIL: 'fallback@uws.test' });
     const db = openDatabase(':memory:');
-    runMigrations(db);
+    await runMigrations(db);
 
     // Env fallback alone: the email channel opens and delivery uses it.
     const out = notify(db, cfg, { kind: 'test', title: 'Fallback', body: 'x', dedupeKey: 'fb:1' });

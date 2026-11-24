@@ -39,9 +39,9 @@ const owner = { userId: null, label: 'owner' as const };
 
 let cfg: Config;
 
-function freshDb(): DB {
+async function freshDb(): Promise<DB> {
   const db = openDatabase(':memory:');
-  runMigrations(db);
+  await runMigrations(db);
   return db;
 }
 
@@ -102,7 +102,7 @@ describe('Phase 12: discovery runs (OpenStreetMap)', () => {
   });
 
   test('a two-city run creates leads with provenance, dedupe and audit', async () => {
-    const db = freshDb();
+    const db = await freshDb();
     const { registry } = overpassRegistry({
       Karachi: [CLINIC, RESTAURANT],
       Lahore: [SCHOOL, CLINIC_DUP], // CLINIC_DUP = same business identity, other city response
@@ -164,7 +164,7 @@ describe('Phase 12: discovery runs (OpenStreetMap)', () => {
   });
 
   test('autoAnalyze fetches a lead website only through the injected transport', async () => {
-    const db = freshDb();
+    const db = await freshDb();
     const { registry } = overpassRegistry({ Karachi: [CLINIC] });
     const fetched: string[] = [];
     const analyzeFetchOptions: AnalyzeFetchOptions = {
@@ -192,7 +192,7 @@ describe('Phase 12: discovery runs (OpenStreetMap)', () => {
   });
 
   test('a busy city is reported while other cities proceed; all-fail throws honestly', async () => {
-    const db = freshDb();
+    const db = await freshDb();
     const partial = overpassRegistry({ Karachi: [RESTAURANT] }, { fail: { Quetta: 429 } });
     const run = await runDiscovery(
       db,
@@ -216,7 +216,7 @@ describe('Phase 12: discovery runs (OpenStreetMap)', () => {
   });
 
   test('maxPerRun caps creation and the surplus is skipped, not silently dropped', async () => {
-    const db = freshDb();
+    const db = await freshDb();
     setPolicy(db, { maxPerRun: 2 });
     // Two cities, three unique hits, budget of two: the later city's hit is
     // skipped (the run cap is enforced, and the surplus is counted honestly).
@@ -234,7 +234,7 @@ describe('Phase 12: discovery runs (OpenStreetMap)', () => {
   });
 
   test('an existing identical phone auto-merges — discovery never clones a lead', async () => {
-    const db = freshDb();
+    const db = await freshDb();
     const existing = createLead(
       db,
       { displayName: 'Beta Biryani Head Office', city: 'Karachi', phone: '+923214445566' },
@@ -251,7 +251,7 @@ describe('Phase 12: discovery runs (OpenStreetMap)', () => {
   });
 
   test('the integration toggle is authoritative', async () => {
-    const db = freshDb();
+    const db = await freshDb();
     db.prepare(
       `INSERT INTO settings (key, value_json, version, updated_by, updated_at)
        VALUES ('integration_toggles', ?, 1, NULL, ?)
@@ -267,7 +267,7 @@ describe('Phase 12: discovery runs (OpenStreetMap)', () => {
   });
 
   test('an unconfigured provider refuses instead of inventing leads', async () => {
-    const db = freshDb();
+    const db = await freshDb();
     const bare = buildRegistry(loadConfig({ ...BASE_ENV }), {});
     await assert.rejects(
       () => runDiscovery(db, cfg, bare, { cities: ['Karachi'], analyzeFetchOptions: {} }, owner),
@@ -277,7 +277,7 @@ describe('Phase 12: discovery runs (OpenStreetMap)', () => {
   });
 
   test('mock-provider runs are labelled simulated', async () => {
-    const db = freshDb();
+    const db = await freshDb();
     const mock = buildRegistry(loadConfig({ ...BASE_ENV, DISCOVERY_PROVIDER: 'mock' }), {
       ...BASE_ENV,
       DISCOVERY_PROVIDER: 'mock',

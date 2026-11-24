@@ -49,7 +49,7 @@ describe('website analysis', () => {
   before(() => {
     cfg = loadConfig({ NODE_ENV: 'test', SESSION_SECRET: 'test'.padEnd(48, '0'), DATABASE_PATH: ':memory:' });
     db = openDatabase(':memory:');
-    runMigrations(db);
+    await runMigrations(db);
   });
   after(() => db.close());
 
@@ -127,7 +127,7 @@ describe('explainable lead scoring', () => {
   before(() => {
     cfg = loadConfig({ NODE_ENV: 'test', SESSION_SECRET: 'test'.padEnd(48, '0'), DATABASE_PATH: ':memory:' });
     db = openDatabase(':memory:');
-    runMigrations(db);
+    await runMigrations(db);
   });
   after(() => db.close());
 
@@ -198,7 +198,7 @@ describe('contact eligibility gate', () => {
   before(() => {
     cfg = loadConfig({ NODE_ENV: 'test', SESSION_SECRET: 'test'.padEnd(48, '0'), DATABASE_PATH: ':memory:' });
     db = openDatabase(':memory:');
-    runMigrations(db);
+    await runMigrations(db);
   });
   after(() => db.close());
 

@@ -85,7 +85,7 @@ describe('Phase 11B: onboarding, guardrails, unsuppression, media, health', () =
       ...MOCK_ENV,
     });
     db = openDatabase(':memory:');
-    runMigrations(db);
+    await runMigrations(db);
     registry = buildRegistry(cfg, MOCK_ENV);
   });
   after(() => db.close());
