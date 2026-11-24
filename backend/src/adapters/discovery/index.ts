@@ -33,6 +33,17 @@ export function createDiscoveryAdapter(
   opts: DiscoveryAdapterOptions = {},
 ): DiscoveryPort {
   const provider = (env['DISCOVERY_PROVIDER'] ?? '').trim().toLowerCase();
+
+  // If GEOAPIFY_API_KEY is set (non-empty) and this is not a keyless discovery
+  // provider (overpass/osm_local), initialize Geoapify Places API discovery
+  // regardless of the DISCOVERY_PROVIDER value.
+  if (env['GEOAPIFY_API_KEY'] && env['GEOAPIFY_API_KEY'].trim() !== '' && provider !== 'overpass' && provider !== 'osm_local') {
+    return createGeoapifyDiscoveryAdapter({
+      apiKey: env['GEOAPIFY_API_KEY'],
+      ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
+    });
+  }
+
   if (!provider) return createUnconfiguredDiscovery();
 
   switch (provider) {

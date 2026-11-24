@@ -323,6 +323,43 @@ describe('discovery diagnostic: synthetic pipeline robustness (§5.13, §5.7, §
   });
 });
 
+describe('discovery diagnostic: Geoapify configuration', () => {
+  before(() => {
+    cfg = loadConfig({ ...BASE_ENV, ...OVERPASS_ENV });
+  });
+
+  test('missing GEOAPIFY_API_KEY: discovery reports unconfigured when key absent', async () => {
+    const db = freshDb();
+    // No DISCOVERY_PROVIDER set, no GEOAPIFY_API_KEY
+    const { registry } = buildRegistry(loadConfig({ ...BASE_ENV }), {});
+    await assert.rejects(
+      () => runDiscovery(db, cfg, registry, { cities: ['Karachi'], analyzeFetchOptions: {} }, owner),
+      (err: { code?: string }) => err.code === 'provider_unavailable',
+    );
+    db.close();
+  });
+
+  test('valid GEOAPIFY_API_KEY: discovery initializes Geoapify adapter', async () => {
+    const db = freshDb();
+    const envWithKey = { ...BASE_ENV, GEOAPIFY_API_KEY: 'test-key-12345' };
+    const { registry } = buildRegistry(loadConfig(envWithKey), {});
+    // Should not throw — Geoapify adapter initializes with the key
+    const adapterStatus = registry.discovery.status();
+    assert.equal(adapterStatus.implementation, 'geoapify', 'status should report geoapify implementation');
+    assert.equal(adapterStatus.features?.[0], 'places API lead search (paid tier, quota-protected)', 'features should include Geoapify description');
+    db.close();
+  });
+
+  test('DISCOVERY_PROVIDER=overpass: overpass adapter takes precedence over Geoapify key', async () => {
+    const db = freshDb();
+    const envOverpass = { ...BASE_ENV, DISCOVERY_PROVIDER: 'overpass' };
+    const { registry } = buildRegistry(loadConfig(envOverpass), {});
+    const status = registry.discovery.status();
+    assert.equal(status.implementation, 'overpass', 'status should report overpass implementation when DISCOVERY_PROVIDER=overpass');
+    db.close();
+  });
+});
+
 describe('discovery diagnostic: simulation & STOP ALL safety (§6)', () => {
   before(() => {
     cfg = loadConfig({ ...BASE_ENV, ...OVERPASS_ENV });

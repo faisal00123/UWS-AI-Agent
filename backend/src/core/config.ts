@@ -346,7 +346,7 @@ function isKeylessDiscovery(env: Env): boolean {
 
 function isGeoapifyDiscovery(env: Env): boolean {
   const provider = (env['DISCOVERY_PROVIDER'] ?? '').trim().toLowerCase();
-  return provider === 'geoapify';
+  return provider === 'geoapify' || env['GEOAPIFY_API_KEY'] && env['GEOAPIFY_API_KEY'].trim() !== '';
 }
 
 export function loadConfig(env: Env = process.env): Config {
