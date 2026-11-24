@@ -3,6 +3,9 @@
  *
  * `DISCOVERY_PROVIDER` selects the concrete adapter:
  *   mock      - fixture-backed directory search (no network)
+ *   osm_local - OFFLINE search over the locally extracted NDJSON dataset
+ *               (scripts/extract-osm.ts, owner-run from a Geofabrik PBF).
+ *               Keyless: no network, no API key, never parses a raw PBF.
  *   overpass  - real OpenStreetMap search via the free Overpass API (no API
  *               key, no billing). Owner-selected vendor (Phase 12); the only
  *               supported country is Pakistan (country=PK).
@@ -16,6 +19,7 @@ import type { DiscoveryPort } from '../types.ts';
 import type { FetchLike } from '../http.ts';
 import { createMockDiscoveryAdapter } from '../mock/index.ts';
 import { createUnconfiguredDiscovery } from './unconfigured.ts';
+import { createOsmLocalDiscoveryAdapter } from './osm-local.ts';
 import { createOverpassDiscoveryAdapter } from './overpass.ts';
 
 type Env = Record<string, string | undefined>;
@@ -48,6 +52,11 @@ export function createDiscoveryAdapter(
           source: 'mock_directory',
         },
       ]);
+    case 'osm_local':
+      // Offline local dataset: reads only the extracted NDJSON file
+      // (OSM_LOCAL_DATASET or data/osm-leads.ndjson). No network, no key,
+      // and a raw .pbf path is refused inside the adapter.
+      return createOsmLocalDiscoveryAdapter(env);
     case 'overpass': {
       // Real OpenStreetMap search; free, no credentials exist for it at all.
       // Optional fallbacks are tried ONLY after a transport-level failure of
@@ -71,10 +80,23 @@ export function createDiscoveryAdapter(
         ...(fallbacks.length > 0 ? { fallbackEndpoints: fallbacks } : {}),
       });
     }
+    case 'geoapify': {
+      // Geoapify Places API search — requires GEOAPIFY_API_KEY env var.
+      // Searches for businesses by category within a Pakistan administrative area.
+      // Returns auditable leads with stable OSM source URLs.
+      const apiKey = env['GEOAPIFY_API_KEY'];
+      if (!apiKey) {
+        return createUnconfiguredDiscovery();
+      }
+      return createGeoapifyDiscoveryAdapter({
+        apiKey,
+        ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
+      });
+    }
     default:
       // Unknown vendor name: honest unconfigured, never fabricated leads.
       return createUnconfiguredDiscovery();
   }
 }
 
-export const SUPPORTED_DISCOVERY_PROVIDERS = ['mock', 'overpass'] as const;
+export const SUPPORTED_DISCOVERY_PROVIDERS = ['mock', 'osm_local', 'overpass', 'geoapify'] as const;
