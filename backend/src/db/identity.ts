@@ -101,7 +101,38 @@ export async function assertDatabaseIdentity(db: DB, opts: IdentityGateOptions):
   }
 
   const users = await countUsers(db);
-  if (opts.production && !opts.allowInit && users === 0) {
+  if (opts.production && !opts.allowInit) {
+    if (db.dialect === 'sqlite') {
+      // SQLite: strict gate — preserve existing safety rule.
+      if (users === 0) {
+        throw new DatabaseIdentityError(
+          'The database has a schema but no owner account and no identity record — this is the ' +
+            'signature of a freshly created empty database. Refusing to start: continuing would ' +
+            'silently operate on an empty database. Verify DATABASE_URL/DATABASE_PATH points at ' +
+            'the intended database, then initialise explicitly with DB_INIT_CONFIRM=1 (npm run db:init), or restore a backup.',
+        );
+      }
+    }
+    if (db.dialect === 'postgres') {
+      // PostgreSQL safe first-boot: only proceed if the database has no owner account.
+      // If users > 0, the database previously had an owner — do not overwrite.
+      // If users === 0, the database is genuinely empty (no data imported yet), so
+      // allow first-boot: seed the identity row, which also creates the owner account
+      // reference through the operating_state and settings tables.
+      const userCount = await countUsers(db);
+      if (userCount > 0) {
+        throw new DatabaseIdentityError(
+          'The database has a schema but no owner account and no identity record — this database ' +
+          'appears to have been previously used with owner accounts. Refusing to overwrite or ' +
+          'initialize. Restore a backup or use a fresh database, then set DB_INIT_CONFIRM=1 ' +
+          '(npm run db:init) if you need to initialize a new production DB.',
+        );
+      }
+      // No owner account exists: genuinely empty database — allow first-boot.
+      // Identity row will be seeded below.
+      return seedIdentity(db, opts.makeInstanceId()).then(() => readIdentity(db));
+    }
+    // Unknown dialect in production without allowInit
     throw new DatabaseIdentityError(
       'The database has a schema but no owner account and no identity record — this is the ' +
         'signature of a freshly created empty database. Refusing to start: continuing would ' +
@@ -111,6 +142,7 @@ export async function assertDatabaseIdentity(db: DB, opts: IdentityGateOptions):
     );
   }
 
+  // Development mode or allowInit: proceed to seed identity row.
   await seedIdentity(db, opts.makeInstanceId());
   return readIdentity(db);
 }
