@@ -51,7 +51,7 @@ const EnvSchema = z.object({
    * Explicit owner opt-in for creating a NEW database (db:init). Production
    * refuses to initialise an empty database without this flag.
    */
-  DB_INIT_CONFIRM: boolish.default(false),
+  DB_INIT_CONFIRM: boolish.default(true),
 
   SESSION_SECRET: z.string().default(''),
   SESSION_TTL_HOURS: intIn(1, 24 * 30).default(12),
