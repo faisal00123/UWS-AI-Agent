@@ -120,6 +120,13 @@ export async function assertDatabaseIdentity(db: DB, opts: IdentityGateOptions):
  * an empty production database never gets a schema created by accident.
  * Returns quietly when the database already has a schema, or when the
  * environment is not production / initialisation was explicitly allowed.
+ *
+ * Dialect-specific behaviour:
+ *   - SQLite: strict gate — must have schema_migrations or DB_INIT_CONFIRM=1.
+ *   - PostgreSQL: safe first-boot — if no schema_migrations and the database
+ *     has NO application tables (no users, businesses, etc.), it is treated as
+ *     genuinely empty and allowed to proceed; if any application tables exist,
+ *     startup is refused to prevent overwriting an unknown database.
  */
 export async function assertBootableDatabase(
   db: DB,
@@ -127,7 +134,49 @@ export async function assertBootableDatabase(
 ): Promise<void> {
   const hasSchema = await tableExists(db, 'schema_migrations');
   if (hasSchema) return;
+  if (!opts.production) return; // development: allow auto-init
+
   if (opts.production && !opts.allowInit) {
+    if (db.dialect === 'sqlite') {
+      // SQLite: strict gate — preserve existing safety rule.
+      throw new DatabaseIdentityError(
+        'The expected database is EMPTY (no schema_migrations table). Refusing to create a ' +
+          'fresh database in production — this is how data loss happens. Check that ' +
+          'DATABASE_URL/DATABASE_PATH points at the intended database, then initialise ' +
+          'explicitly with DB_INIT_CONFIRM=1 (npm run db:init), or restore a backup.',
+      );
+    }
+    if (db.dialect === 'postgres') {
+      // PostgreSQL safe first-boot: only proceed if the database has NO
+      // application tables. If any app tables exist, STOP to prevent overwriting.
+      const appTables = ['users', 'businesses', 'operating_state', 'audit_events',
+                         'notifications', 'lead_sources', 'contact_points', 'field_verifications',
+                         'website_analyses', 'lead_scores', 'score_factors', 'eligibility_checks',
+                         'suppression_list', 'duplicate_candidates', 'merge_history',
+                         'interactions', 'lead_stage_history', 'followup_tasks', 'meetings',
+                         'proposals', 'deals', 'payments', 'human_handoffs', 'outreach_attempts',
+                         'calls', 'messages', 'provider_events', 'conversations', 'transcript_segments',
+                         'campaigns', 'approval_requests'];
+      let hasAppTable = false;
+      for (const tbl of appTables) {
+        if (await tableExists(db, tbl)) {
+          hasAppTable = true;
+          break;
+        }
+      }
+      if (hasAppTable) {
+        throw new DatabaseIdentityError(
+          'The expected database is EMPTY (no schema_migrations table) but contains existing ' +
+          'application tables — this database appears to have been previously used. Refusing ' +
+          'to overwrite or initialize. Restore a backup or use a fresh database, then set ' +
+          'DB_INIT_CONFIRM=1 (npm run db:init) if you need to initialize a new production DB.',
+        );
+      }
+      // No application tables found: genuinely empty database — allow first-boot.
+      // Migrations will create the schema, then assertDatabaseIdentity will seed the identity row.
+      return;
+    }
+    // Unknown dialect in production without allowInit
     throw new DatabaseIdentityError(
       'The expected database is EMPTY (no schema_migrations table). Refusing to create a ' +
         'fresh database in production — this is how data loss happens. Check that ' +
